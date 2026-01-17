@@ -49,6 +49,10 @@ temp/
 *.wav
 *.mp3
 
+# Environment files
+.env
+.env*
+
 # OS
 .DS_Store
 Thumbs.db

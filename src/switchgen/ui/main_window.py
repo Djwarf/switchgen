@@ -100,20 +100,42 @@ class MainWindow(Adw.ApplicationWindow):
         scroll.set_child(box)
 
         # WORKFLOW selector (first - drives everything else)
-        box.append(self._label("WORKFLOW"))
+        workflow_label = self._label("WORKFLOW")
+        workflow_label.set_tooltip_text(
+            "Choose what you want to create:\n"
+            "• Text to Image: Generate from a text description\n"
+            "• Image to Image: Transform an existing image\n"
+            "• Inpainting: Edit parts of an image\n"
+            "• Audio: Generate music or sound effects\n"
+            "• 3D Novel View: Rotate around an object"
+        )
+        box.append(workflow_label)
         workflow_names = [WORKFLOW_SPECS[wt].name for wt in WorkflowType]
         self.workflow_dropdown = Gtk.DropDown.new_from_strings(workflow_names)
         self.workflow_dropdown.connect("notify::selected", self._on_workflow_changed)
         box.append(self.workflow_dropdown)
 
         # MODEL selector (filtered by workflow)
-        box.append(self._label("MODEL"))
+        model_label = self._label("MODEL")
+        model_label.set_tooltip_text(
+            "Choose which AI model to use.\n"
+            "Different models have different styles and capabilities.\n"
+            "• SD 1.5: Fast, works on most GPUs (4GB+)\n"
+            "• SDXL: Higher quality, needs 8GB+ VRAM\n"
+            "Download models using the button in the header bar."
+        )
+        box.append(model_label)
         self.model_dropdown = Gtk.DropDown.new_from_strings(["Loading..."])
         box.append(self.model_dropdown)
 
         # INPUT IMAGE (for img2img, inpaint, 3d)
         self.input_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.input_box.append(self._label("INPUT IMAGE"))
+        input_label = self._label("INPUT IMAGE")
+        input_label.set_tooltip_text(
+            "Select an image to use as a starting point.\n"
+            "The AI will transform this image based on your prompt."
+        )
+        self.input_box.append(input_label)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.input_label = Gtk.Label(label="None", xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
         row.append(self.input_label)
@@ -126,7 +148,14 @@ class MainWindow(Adw.ApplicationWindow):
 
         # MASK IMAGE (for inpaint only)
         self.mask_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.mask_box.append(self._label("MASK"))
+        mask_label = self._label("MASK")
+        mask_label.set_tooltip_text(
+            "Select a mask image.\n"
+            "White areas = regions to regenerate\n"
+            "Black areas = regions to keep unchanged\n"
+            "Create masks in any image editor."
+        )
+        self.mask_box.append(mask_label)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.mask_label = Gtk.Label(label="None", xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
         row.append(self.mask_label)
@@ -139,7 +168,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         # PROMPT (hidden for 3D)
         self.prompt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.prompt_box.append(self._label("PROMPT"))
+        prompt_label = self._label("PROMPT")
+        prompt_label.set_tooltip_text(
+            "Describe what you want to generate.\n\n"
+            "Tips for better results:\n"
+            "• Be specific: 'golden retriever puppy' not just 'dog'\n"
+            "• Add style: 'oil painting', 'photograph', 'anime'\n"
+            "• Describe quality: 'detailed', 'high resolution'\n"
+            "• Use commas to separate concepts"
+        )
+        self.prompt_box.append(prompt_label)
         self.prompt_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.prompt_view.set_size_request(-1, 80)
         frame = Gtk.Frame()
@@ -149,7 +187,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         # NEGATIVE (hidden for 3D)
         self.neg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.neg_box.append(self._label("NEGATIVE"))
+        neg_label = self._label("NEGATIVE")
+        neg_label.set_tooltip_text(
+            "Describe what you DON'T want in the image.\n\n"
+            "Common negatives:\n"
+            "• 'blurry, low quality, distorted'\n"
+            "• 'text, watermark, signature'\n"
+            "• 'extra fingers, deformed hands'\n"
+            "Leave empty if unsure - it's optional."
+        )
+        self.neg_box.append(neg_label)
         self.neg_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.neg_view.set_size_request(-1, 50)
         frame = Gtk.Frame()
@@ -164,6 +211,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Size (text2img only)
         self.size_label = Gtk.Label(label="Size", xalign=0)
+        self.size_label.set_tooltip_text(
+            "Output image dimensions in pixels.\n"
+            "• SD 1.5: Best at 512×512\n"
+            "• SDXL: Best at 1024×1024\n"
+            "Larger sizes need more VRAM and time."
+        )
         grid.attach(self.size_label, 0, row_idx, 1, 1)
         size_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.width_spin = Gtk.SpinButton.new_with_range(256, 2048, 64)
@@ -178,27 +231,52 @@ class MainWindow(Adw.ApplicationWindow):
         row_idx += 1
 
         # Steps
-        grid.attach(Gtk.Label(label="Steps", xalign=0), 0, row_idx, 1, 1)
+        steps_label = Gtk.Label(label="Steps", xalign=0)
+        steps_label.set_tooltip_text(
+            "Number of denoising iterations.\n"
+            "• 15-25: Fast, good for testing\n"
+            "• 25-40: Better quality\n"
+            "• 40+: Diminishing returns\n"
+            "More steps = slower generation."
+        )
+        grid.attach(steps_label, 0, row_idx, 1, 1)
         self.steps_spin = Gtk.SpinButton.new_with_range(1, 150, 1)
         self.steps_spin.set_value(20)
+        self.steps_spin.set_tooltip_text("Start with 20, increase for more detail")
         grid.attach(self.steps_spin, 1, row_idx, 1, 1)
         row_idx += 1
 
         # CFG
         self.cfg_label = Gtk.Label(label="CFG", xalign=0)
+        self.cfg_label.set_tooltip_text(
+            "Classifier-Free Guidance scale.\n"
+            "Controls how closely the AI follows your prompt.\n"
+            "• 1-5: Creative, may ignore prompt\n"
+            "• 7-8: Balanced (recommended)\n"
+            "• 10+: Strict, can look artificial"
+        )
         grid.attach(self.cfg_label, 0, row_idx, 1, 1)
         self.cfg_spin = Gtk.SpinButton.new_with_range(1.0, 30.0, 0.5)
         self.cfg_spin.set_value(7.0)
         self.cfg_spin.set_digits(1)
+        self.cfg_spin.set_tooltip_text("7.0 is a good starting point")
         grid.attach(self.cfg_spin, 1, row_idx, 1, 1)
         row_idx += 1
 
         # Denoise (img2img, inpaint)
         self.denoise_label = Gtk.Label(label="Denoise", xalign=0)
+        self.denoise_label.set_tooltip_text(
+            "How much to change the input image.\n"
+            "• 0.0: No change (useless)\n"
+            "• 0.3-0.5: Subtle changes, keeps structure\n"
+            "• 0.7-0.8: Significant changes\n"
+            "• 1.0: Complete regeneration"
+        )
         grid.attach(self.denoise_label, 0, row_idx, 1, 1)
         self.denoise_spin = Gtk.SpinButton.new_with_range(0.0, 1.0, 0.05)
         self.denoise_spin.set_value(0.75)
         self.denoise_spin.set_digits(2)
+        self.denoise_spin.set_tooltip_text("0.75 balances creativity and consistency")
         grid.attach(self.denoise_spin, 1, row_idx, 1, 1)
         self.denoise_label.set_visible(False)
         self.denoise_spin.set_visible(False)
@@ -206,10 +284,15 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Duration (audio)
         self.duration_label = Gtk.Label(label="Duration (s)", xalign=0)
+        self.duration_label.set_tooltip_text(
+            "Length of audio to generate in seconds.\n"
+            "Longer durations take more time and VRAM."
+        )
         grid.attach(self.duration_label, 0, row_idx, 1, 1)
         self.duration_spin = Gtk.SpinButton.new_with_range(1.0, 60.0, 1.0)
         self.duration_spin.set_value(30.0)
         self.duration_spin.set_digits(0)
+        self.duration_spin.set_tooltip_text("Start with 10-30 seconds")
         grid.attach(self.duration_spin, 1, row_idx, 1, 1)
         self.duration_label.set_visible(False)
         self.duration_spin.set_visible(False)
@@ -217,9 +300,16 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Elevation (3D)
         self.elev_label = Gtk.Label(label="Elevation", xalign=0)
+        self.elev_label.set_tooltip_text(
+            "Camera angle up/down from the object.\n"
+            "• Positive: Looking down at object\n"
+            "• Negative: Looking up at object\n"
+            "• 0: Eye level"
+        )
         grid.attach(self.elev_label, 0, row_idx, 1, 1)
         self.elev_spin = Gtk.SpinButton.new_with_range(-90, 90, 5)
         self.elev_spin.set_value(0)
+        self.elev_spin.set_tooltip_text("Vertical camera angle in degrees")
         grid.attach(self.elev_spin, 1, row_idx, 1, 1)
         self.elev_label.set_visible(False)
         self.elev_spin.set_visible(False)
@@ -227,17 +317,33 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Azimuth (3D)
         self.azim_label = Gtk.Label(label="Azimuth", xalign=0)
+        self.azim_label.set_tooltip_text(
+            "Camera rotation around the object.\n"
+            "• 0: Same angle as input\n"
+            "• 90: Right side view\n"
+            "• -90: Left side view\n"
+            "• 180: Back view"
+        )
         grid.attach(self.azim_label, 0, row_idx, 1, 1)
         self.azim_spin = Gtk.SpinButton.new_with_range(-180, 180, 5)
         self.azim_spin.set_value(0)
+        self.azim_spin.set_tooltip_text("Horizontal camera angle in degrees")
         grid.attach(self.azim_spin, 1, row_idx, 1, 1)
         self.azim_label.set_visible(False)
         self.azim_spin.set_visible(False)
         row_idx += 1
 
         # Seed
-        grid.attach(Gtk.Label(label="Seed", xalign=0), 0, row_idx, 1, 1)
+        seed_label = Gtk.Label(label="Seed", xalign=0)
+        seed_label.set_tooltip_text(
+            "Random number that determines the output.\n"
+            "• Empty/Random: Different result each time\n"
+            "• Same seed + same settings = same image\n"
+            "Use this to recreate or refine results."
+        )
+        grid.attach(seed_label, 0, row_idx, 1, 1)
         self.seed_entry = Gtk.Entry(placeholder_text="Random")
+        self.seed_entry.set_tooltip_text("Leave empty for random, or enter a number to reproduce results")
         grid.attach(self.seed_entry, 1, row_idx, 1, 1)
 
         box.append(grid)
@@ -250,6 +356,15 @@ class MainWindow(Adw.ApplicationWindow):
         box.set_margin_end(12)
         box.set_margin_top(12)
         box.set_margin_bottom(12)
+
+        # Info banner for no models
+        self.info_banner = Adw.Banner(
+            title="No models installed. Click the download button to get started.",
+            button_label="Download Models",
+            revealed=False,
+        )
+        self.info_banner.connect("button-clicked", self._on_download_models_clicked)
+        box.append(self.info_banner)
 
         # Preview
         frame = Gtk.Frame(vexpand=True)
@@ -415,6 +530,9 @@ class MainWindow(Adw.ApplicationWindow):
         # Get model
         idx = self.model_dropdown.get_selected()
         if idx >= len(self._filtered_checkpoints):
+            # No valid model selected - show banner
+            self.info_banner.set_title("Please download a model first to generate images.")
+            self.info_banner.set_revealed(True)
             return
         checkpoint = self._filtered_checkpoints[idx]
 
@@ -544,9 +662,14 @@ class MainWindow(Adw.ApplicationWindow):
     def _reset_ui(self) -> None:
         """Reset UI after generation."""
         self._generating = False
-        self.generate_btn.set_sensitive(True)
-        self.generate_btn.set_label("GENERATE")
         self.progress_bar.set_visible(False)
+        # Only re-enable if we have models
+        if self._all_checkpoints:
+            self.generate_btn.set_sensitive(True)
+            self.generate_btn.set_label("GENERATE")
+        else:
+            self.generate_btn.set_sensitive(False)
+            self.generate_btn.set_label("No Models")
 
     # =========================================================================
     # Model Download
@@ -556,7 +679,26 @@ class MainWindow(Adw.ApplicationWindow):
         """Open the model download dialog."""
         config = get_config()
         dialog = ModelDownloadDialog(config.paths.models_dir)
+        dialog.connect("closed", self._on_download_dialog_closed)
         dialog.present(self)
+
+    def _refresh_models(self) -> None:
+        """Refresh the model list after downloading."""
+        # Re-scan for checkpoints
+        self._all_checkpoints = get_available_checkpoints()
+
+        # Update workflow dropdown to refresh filtered models
+        self._on_workflow_changed(self.workflow_dropdown, None)
+
+        # Update UI based on whether we now have models
+        if self._all_checkpoints:
+            self.generate_btn.set_sensitive(True)
+            self.generate_btn.set_label("GENERATE")
+            self.info_banner.set_revealed(False)
+        else:
+            self.generate_btn.set_sensitive(False)
+            self.generate_btn.set_label("No Models")
+            self.info_banner.set_revealed(True)
 
     # =========================================================================
     # Initialization
@@ -575,10 +717,35 @@ class MainWindow(Adw.ApplicationWindow):
         """ComfyUI ready."""
         # Trigger workflow change to filter models
         self._on_workflow_changed(self.workflow_dropdown, None)
-        self.generate_btn.set_sensitive(True)
-        self.generate_btn.set_label("GENERATE")
         self._update_vram()
+
+        # Check if any models are available
+        if not self._all_checkpoints:
+            # No models installed - show banner, keep button disabled
+            self.generate_btn.set_sensitive(False)
+            self.generate_btn.set_label("No Models")
+            self.info_banner.set_revealed(True)
+            # Auto-open download dialog on first launch with no models
+            GLib.idle_add(self._show_welcome_download_dialog)
+        else:
+            # Models available - enable generate
+            self.generate_btn.set_sensitive(True)
+            self.generate_btn.set_label("GENERATE")
+            self.info_banner.set_revealed(False)
+
         return False
+
+    def _show_welcome_download_dialog(self) -> bool:
+        """Show download dialog for first-time users with no models."""
+        config = get_config()
+        dialog = ModelDownloadDialog(config.paths.models_dir)
+        dialog.connect("closed", self._on_download_dialog_closed)
+        dialog.present(self)
+        return False
+
+    def _on_download_dialog_closed(self, dialog) -> None:
+        """Handle download dialog being closed - refresh model list."""
+        self._refresh_models()
 
     def _on_error(self, error: str) -> bool:
         """ComfyUI error."""
