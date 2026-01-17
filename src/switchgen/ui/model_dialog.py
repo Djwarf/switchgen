@@ -3,6 +3,10 @@
 from pathlib import Path
 from typing import Optional
 
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
+
 try:
     import gi
     gi.require_version('Gtk', '4.0')
@@ -342,8 +346,14 @@ class ModelDownloadDialog(Adw.Dialog):
         # Check disk space
         if not self.downloader.check_disk_space(model.size_mb):
             free_mb, _ = self.downloader.get_disk_space_mb()
+            logger.warning(
+                "Insufficient disk space for %s (need=%dMB, free=%.0fMB)",
+                model.name, model.size_mb, free_mb
+            )
             self._show_error(f"Not enough disk space.\nNeed {model.size_mb} MB, have {free_mb:.0f} MB free.")
             return
+
+        logger.info("Download initiated (model=%s, size=%dMB)", model.name, model.size_mb)
 
         # Disable all download buttons
         for btn in self._download_buttons.values():
@@ -374,8 +384,10 @@ class ModelDownloadDialog(Adw.Dialog):
         self.progress_box.set_visible(False)
 
         if result.success:
+            logger.info("Download completed successfully (model=%s, path=%s)", result.model_id, result.path)
             self.progress_label.set_label(f"Downloaded successfully!")
         else:
+            logger.error("Download failed (model=%s): %s", result.model_id, result.error)
             self._show_error(f"Download failed: {result.error}")
 
         # Refresh status and re-enable buttons
@@ -391,6 +403,7 @@ class ModelDownloadDialog(Adw.Dialog):
 
     def _show_error(self, message: str):
         """Show an error message."""
+        logger.error("UI error shown: %s", message)
         dialog = Adw.AlertDialog(
             heading="Error",
             body=message,

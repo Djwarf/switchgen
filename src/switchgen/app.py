@@ -6,6 +6,10 @@ This module contains the main application class and launch function.
 import sys
 from typing import Optional
 
+from .core.logging import get_logger
+
+logger = get_logger(__name__)
+
 # Check for GTK4 availability
 try:
     import gi
@@ -13,18 +17,22 @@ try:
     gi.require_version('Adw', '1')
     from gi.repository import Gtk, Adw, GLib, Gio, Gdk
     GTK_AVAILABLE = True
+    logger.debug("GTK4 and Libadwaita loaded successfully")
 except (ImportError, ValueError) as e:
     GTK_AVAILABLE = False
     GTK_ERROR = str(e)
+    logger.error("Failed to load GTK4: %s", GTK_ERROR)
 
 
 def run_app():
     """Run the GTK4 application."""
     if not GTK_AVAILABLE:
+        logger.error("GTK4 not available: %s", GTK_ERROR)
         print(f"Error: GTK4 not available: {GTK_ERROR}")
         print("Install with: sudo pacman -S gtk4 libadwaita python-gobject")
         sys.exit(1)
 
+    logger.info("Starting GTK4 application")
     app = SwitchGenApp()
     return app.run(sys.argv)
 
@@ -46,7 +54,9 @@ class SwitchGenApp(Adw.Application):
 
     def do_activate(self):
         """Called when the application is activated."""
+        logger.debug("Application activated")
         if not self.window:
+            logger.debug("Creating main window")
             from .ui.main_window import MainWindow
             self.window = MainWindow(application=self)
         self.window.present()

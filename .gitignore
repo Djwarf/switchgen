@@ -59,4 +59,4 @@ Thumbs.db
 
 # Test files
 test_*.py
-!tests/test_*.py
+!tests/**/test_*.py

@@ -1,9 +1,12 @@
 """Application configuration."""
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _detect_switchgen_root() -> Path:
@@ -20,6 +23,7 @@ def _detect_comfy_path() -> Path:
     # 1. Primary: Use bundled ComfyUI in vendor/
     bundled_path = switchgen_root / "vendor" / "ComfyUI"
     if bundled_path.exists():
+        logger.debug("Using bundled ComfyUI at %s", bundled_path)
         return bundled_path
 
     # 2. Fallback: Check environment variable (for development)
@@ -27,9 +31,12 @@ def _detect_comfy_path() -> Path:
     if env_path:
         path = Path(env_path)
         if path.exists():
+            logger.info("Using ComfyUI from COMFYUI_PATH: %s", path)
             return path
+        logger.warning("COMFYUI_PATH set but path does not exist: %s", env_path)
 
     # 3. Error: ComfyUI not found
+    logger.error("ComfyUI not found at %s", bundled_path)
     raise RuntimeError(
         f"Bundled ComfyUI not found at {bundled_path}. "
         "Run 'git submodule update --init' to install."
@@ -152,6 +159,11 @@ class Config:
         # TODO: Add JSON/TOML config file loading
         config = cls()
         config.paths.ensure_directories()
+        logger.info(
+            "Configuration loaded: root=%s, comfy=%s",
+            config.paths.switchgen_root,
+            config.paths.comfy_path,
+        )
         return config
 
 
@@ -163,5 +175,6 @@ def get_config() -> Config:
     """Get the global configuration instance."""
     global _config
     if _config is None:
+        logger.debug("Initializing global configuration")
         _config = Config.load()
     return _config
