@@ -1,57 +1,77 @@
 # SwitchGen
 
-A Linux-native image and video generator using ComfyUI as an embedded library, with SwitchSides branding.
+A Linux-native AI image generator with a GTK4 interface. Uses ComfyUI as an embedded library for Stable Diffusion workflows.
 
-## Prerequisites
+## Features
 
-- Python 3.10+
-- GTK4 and libadwaita
-- PyTorch with CUDA support
-- ComfyUI (already installed at `/mnt/storage/repos/ComfyUI`)
+- Text-to-image generation
+- Image-to-image transformation
+- Inpainting with mask support
+- Audio generation (Stable Audio)
+- 3D novel view synthesis (Zero123)
+- Built-in model downloader for HuggingFace models
+- Real-time generation progress
+- VRAM monitoring and cleanup
 
 ## Installation
 
-### 1. Install System Dependencies (Arch Linux)
+### Arch Linux (AUR)
 
 ```bash
-sudo pacman -S gtk4 libadwaita python-gobject
+yay -S switchgen-git
 ```
 
-### 2. Create Python Environment
+### Manual Installation
+
+#### 1. Clone with submodules
 
 ```bash
-cd /mnt/storage/repos/switchgen
+git clone --recursive https://github.com/Djwarf/switchgen.git
+cd switchgen
+```
 
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate
+If already cloned without submodules:
 
-# Install PyTorch (adjust for your CUDA version)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```bash
+git submodule update --init --recursive
+```
 
-# Install SwitchGen dependencies
+#### 2. Install system dependencies
+
+```bash
+# Arch Linux
+sudo pacman -S gtk4 libadwaita python-gobject python-pytorch python-torchvision
+
+# Other distributions
+# Install GTK4, libadwaita, PyGObject, and PyTorch with CUDA support
+```
+
+#### 3. Install Python package
+
+```bash
 pip install -e .
 ```
 
-### 3. Configure ComfyUI Path
-
-The default configuration expects ComfyUI at `/mnt/storage/repos/ComfyUI`. If your installation is elsewhere, update `src/switchgen/core/config.py`.
-
 ## Usage
 
-### Run the GUI
+Launch the application:
 
 ```bash
-source .venv/bin/activate
+switchgen
+```
+
+Or run as a module:
+
+```bash
 python -m switchgen
 ```
 
-### Test Headless Mode
+### First Run
 
-```bash
-source .venv/bin/activate
-python -m switchgen --test
-```
+1. Click the download button in the header bar to open the model manager
+2. Download required models (checkpoints, VAE, CLIP, etc.)
+3. Select a workflow type and checkpoint
+4. Enter a prompt and click Generate
 
 ## Project Structure
 
@@ -59,49 +79,92 @@ python -m switchgen --test
 switchgen/
 ├── src/switchgen/
 │   ├── core/
-│   │   ├── comfy_init.py     # ComfyUI 4-subsystem initialization
-│   │   ├── engine.py         # Generation engine with VRAM cleanup
-│   │   ├── queue.py          # Job queuing system
-│   │   ├── workflows.py      # Workflow builder
-│   │   └── config.py         # Configuration
+│   │   ├── comfy_init.py    # ComfyUI initialization
+│   │   ├── config.py        # Path and app configuration
+│   │   ├── downloader.py    # HuggingFace model downloader
+│   │   ├── engine.py        # Generation engine
+│   │   ├── models.py        # Model catalog
+│   │   ├── queue.py         # Job queue system
+│   │   └── workflows.py     # Workflow builders
 │   │
 │   ├── ui/
-│   │   ├── main_window.py    # GTK4 main window
-│   │   └── styles/           # SwitchSides CSS theme
+│   │   ├── main_window.py   # Main GTK4 window
+│   │   ├── model_dialog.py  # Model download dialog
+│   │   └── styles/          # CSS themes
 │   │
 │   └── resources/
-│       └── fonts/            # Crimson Text font
+│       └── fonts/           # Bundled fonts
 │
-├── workflows/                # API-format workflow templates
-├── output/                   # Generated images
-└── temp/                     # Temporary files
+├── vendor/
+│   └── ComfyUI/             # Bundled ComfyUI engine (submodule)
+│
+├── models/                  # Downloaded models
+├── custom_nodes/            # User custom nodes
+├── output/                  # Generated images
+└── temp/                    # Temporary files
 ```
 
-## ComfyUI Integration
+## Supported Workflows
 
-SwitchGen uses ComfyUI as a library by initializing 4 subsystems:
+| Workflow | Description | Required Models |
+|----------|-------------|-----------------|
+| Text2Img | Generate images from text prompts | Checkpoint, VAE |
+| Img2Img | Transform existing images | Checkpoint, VAE |
+| Inpaint | Edit specific regions with masks | Checkpoint, VAE |
+| Audio | Generate audio from text | Stable Audio checkpoint |
+| 3D | Generate novel views of objects | Zero123 checkpoint, CLIP ViT-L |
 
-1. **Path Management** (`folder_paths`) - Configure model directories
-2. **Node Registry** (`nodes`) - Load core and custom nodes
-3. **Execution Engine** (`PromptExecutor`) - Execute workflows via MockServer
-4. **Memory Manager** (`model_management`) - GPU memory handling
+## Model Storage
 
-### Key Features
+Models are stored in the `models/` directory:
 
-- **VRAM Cleanup**: Automatic cleanup after each generation prevents memory leaks
-- **Interrupt Handling**: Graceful Ctrl+C support during generation
-- **Job Queue**: Queue multiple generation requests
-- **Sunshine Support**: Reserves VRAM for streaming encoder
+```
+models/
+├── checkpoints/      # Main model files (.safetensors, .ckpt)
+├── vae/              # VAE models
+├── clip_vision/      # CLIP vision encoders
+├── text_encoders/    # Text encoders (T5, etc.)
+├── controlnet/       # ControlNet models
+├── loras/            # LoRA adapters
+└── upscale_models/   # Upscaling models
+```
 
-## Branding
+## Requirements
 
-SwitchGen uses the SwitchSides brand design:
+- Python 3.10 or later
+- GTK4 and libadwaita
+- PyTorch with CUDA support
+- NVIDIA GPU with 8GB+ VRAM recommended
 
-- **Primary Color**: Deep burgundy `#2e0000`
-- **Background**: Newsprint `#FAFAF8`
-- **Font**: Crimson Text (serif)
-- **Style**: Classical newspaper aesthetic with sharp corners
+## Configuration
+
+The application auto-detects paths. To override:
+
+- Set `COMFYUI_PATH` environment variable to use an external ComfyUI installation
+- Models are stored in `./models/` relative to the application root
+
+## Troubleshooting
+
+### Missing models error
+
+Open the model download dialog and download the required models for your workflow.
+
+### VRAM out of memory
+
+- Close other GPU applications
+- Use smaller image dimensions
+- Try a different checkpoint (some use less VRAM)
+
+### Custom nodes not loading
+
+Place custom node folders in the `custom_nodes/` directory and restart the application.
 
 ## License
 
-MIT
+MIT License. See LICENSE file for details.
+
+## Credits
+
+- ComfyUI by comfyanonymous
+- Stable Diffusion by Stability AI
+- GTK4 and libadwaita by GNOME
