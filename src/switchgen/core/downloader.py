@@ -1,5 +1,6 @@
 """Model download manager using HuggingFace Hub."""
 
+import logging
 import os
 import shutil
 import threading
@@ -7,12 +8,15 @@ from pathlib import Path
 from typing import Callable, Optional
 from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
+
 try:
     from huggingface_hub import hf_hub_download, HfApi
     from huggingface_hub.utils import EntryNotFoundError
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
+    logger.debug("huggingface_hub not available")
 
 from .models import ModelInfo, ModelType, MODEL_CATALOG, is_model_installed
 
@@ -98,6 +102,7 @@ class ModelDownloader:
             DownloadResult with success status and path or error
         """
         if not HF_AVAILABLE:
+            logger.error("huggingface_hub not installed")
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
@@ -107,6 +112,8 @@ class ModelDownloader:
         # Check disk space
         if not self.check_disk_space(model_info.size_mb):
             free_mb, _ = self.get_disk_space_mb()
+            logger.error("Not enough disk space for %s: need %dMB, have %.0fMB",
+                        model_info.name, model_info.size_mb, free_mb)
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
@@ -122,6 +129,9 @@ class ModelDownloader:
 
         self._current_download = model_info.id
         self._cancel_requested = False
+
+        logger.info("Starting download: %s (%dMB) from %s",
+                   model_info.name, model_info.size_mb, model_info.repo_id)
 
         try:
             # Download using huggingface_hub
@@ -152,6 +162,8 @@ class ModelDownloader:
                     speed_bps=0,
                 ))
 
+            logger.info("Download completed: %s -> %s", model_info.name, downloaded_path)
+
             return DownloadResult(
                 success=True,
                 model_id=model_info.id,
@@ -159,12 +171,14 @@ class ModelDownloader:
             )
 
         except EntryNotFoundError:
+            logger.error("Model file not found: %s/%s", model_info.repo_id, model_info.filename)
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
                 error=f"File not found: {model_info.repo_id}/{model_info.filename}"
             )
         except Exception as e:
+            logger.error("Download failed for %s: %s", model_info.name, e, exc_info=True)
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,

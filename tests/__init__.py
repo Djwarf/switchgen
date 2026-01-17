@@ -1,0 +1,1 @@
+"""SwitchGen test suite."""

@@ -4,6 +4,7 @@ ComfyUI's PromptExecutor executes immediately without queueing (Gotcha #4).
 This module provides a simple queue system for managing multiple generation requests.
 """
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from queue import Queue, Empty
@@ -13,6 +14,8 @@ import uuid
 import time
 
 from .engine import GenerationEngine, GenerationResult, ProgressInfo
+
+logger = logging.getLogger(__name__)
 
 
 class JobStatus(Enum):
@@ -84,6 +87,8 @@ class GenerationQueue:
             self._jobs[job.job_id] = job
 
         self._queue.put(job)
+        logger.info("Job queued (job_id=%s, priority=%d, queue_size=%d)",
+                    job.job_id, job.priority, self._queue.qsize())
         return job.job_id
 
     def submit(
@@ -149,6 +154,7 @@ class GenerationQueue:
         if self._running:
             return
 
+        logger.info("Starting queue worker thread")
         self._running = True
         self._worker_thread = Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
@@ -194,6 +200,7 @@ class GenerationQueue:
 
     def _worker(self) -> None:
         """Background worker that processes the queue."""
+        logger.debug("Queue worker started")
         while self._running:
             try:
                 # Get next job with timeout
@@ -201,6 +208,7 @@ class GenerationQueue:
 
                 # Skip cancelled jobs
                 if job.status == JobStatus.CANCELLED:
+                    logger.debug("Skipping cancelled job: %s", job.job_id)
                     continue
 
                 # Process the job
@@ -213,14 +221,18 @@ class GenerationQueue:
                 continue
 
             except Exception as e:
-                print(f"SwitchGen: Queue worker error: {e}")
+                logger.error("Queue worker error: %s", e, exc_info=True)
                 continue
+
+        logger.debug("Queue worker stopped")
 
     def _process_job(self, job: GenerationJob) -> None:
         """Process a single job."""
         self._current_job = job
         job.status = JobStatus.RUNNING
         job.started_at = time.time()
+
+        logger.info("Job started (job_id=%s)", job.job_id)
 
         # Notify job started
         if self.on_job_started:
@@ -239,15 +251,20 @@ class GenerationQueue:
             job.error = result.error
 
         except Exception as e:
+            logger.error("Job execution failed: %s", e, exc_info=True)
             job.status = JobStatus.FAILED
             job.error = str(e)
 
         finally:
             job.completed_at = time.time()
+            elapsed = job.completed_at - job.started_at
             self._current_job = None
 
             # Clear progress callback
             self.engine.set_progress_callback(None)
+
+            logger.info("Job completed (job_id=%s, status=%s, time=%.2fs)",
+                        job.job_id, job.status.name, elapsed)
 
             # Notify completion
             if job.on_complete:

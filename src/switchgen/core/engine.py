@@ -9,10 +9,14 @@ This module handles:
 """
 
 import gc
+import logging
 import signal
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from .comfy_init import (
     get_comfy_context,
@@ -119,6 +123,8 @@ class GenerationEngine:
         if self._initialized:
             return
 
+        logger.info("Initializing generation engine")
+
         # Initialize ComfyUI (handles all gotchas in comfy_init.py)
         ctx = initialize_comfy()
         self._memory_manager = ctx.memory_manager
@@ -139,6 +145,7 @@ class GenerationEngine:
         self._setup_signal_handlers()
 
         self._initialized = True
+        logger.info("Generation engine initialized successfully")
 
     def _setup_signal_handlers(self) -> None:
         """Setup graceful interrupt handling."""
@@ -234,6 +241,9 @@ class GenerationEngine:
 
         self._interrupted = False
         prompt_id = str(uuid.uuid4())
+        start_time = time.time()
+
+        logger.info("Starting generation (prompt_id=%s, nodes=%d)", prompt_id, len(workflow))
 
         if extra_data is None:
             extra_data = {}
@@ -252,6 +262,8 @@ class GenerationEngine:
                     if getattr(cls, 'OUTPUT_NODE', False):
                         execute_outputs.append(node_id)
 
+            logger.debug("Executing workflow with %d output nodes", len(execute_outputs))
+
             # Execute the workflow
             self._executor.execute(
                 workflow,
@@ -262,6 +274,7 @@ class GenerationEngine:
 
             # Check if interrupted
             if self._interrupted:
+                logger.warning("Generation interrupted by user")
                 return GenerationResult(
                     prompt_id=prompt_id,
                     success=False,
@@ -272,6 +285,13 @@ class GenerationEngine:
             # Get captured images from ReturnToApp node (Gotcha #3)
             captured = get_captured_image(capture_id)
 
+            elapsed = time.time() - start_time
+            image_count = captured.shape[0] if captured is not None else 0
+            logger.info(
+                "Generation completed successfully (prompt_id=%s, images=%d, time=%.2fs)",
+                prompt_id, image_count, elapsed
+            )
+
             return GenerationResult(
                 prompt_id=prompt_id,
                 success=True,
@@ -280,6 +300,7 @@ class GenerationEngine:
             )
 
         except KeyboardInterrupt:
+            logger.warning("Generation interrupted by keyboard")
             if self._memory_manager:
                 self._memory_manager.interrupt_current_processing()
             return GenerationResult(
@@ -290,6 +311,7 @@ class GenerationEngine:
             )
 
         except Exception as e:
+            logger.error("Generation failed: %s", e, exc_info=True)
             return GenerationResult(
                 prompt_id=prompt_id,
                 success=False,

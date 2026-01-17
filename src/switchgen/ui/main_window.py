@@ -4,6 +4,10 @@ import os
 import threading
 from typing import Optional
 
+from ..core.logging import get_logger
+
+logger = get_logger(__name__)
+
 try:
     import gi
     gi.require_version('Gtk', '4.0')
@@ -30,6 +34,59 @@ from ..core.config import get_config
 from .model_dialog import ModelDownloadDialog
 
 
+# =============================================================================
+# Presets and Templates for Beginners
+# =============================================================================
+
+# Size presets (width, height, label, tooltip)
+SIZE_PRESETS = {
+    "square": (512, 512, "Square", "1:1 ratio - good for portraits and icons"),
+    "portrait": (512, 768, "Portrait", "2:3 ratio - good for people and characters"),
+    "landscape": (768, 512, "Landscape", "3:2 ratio - good for scenes and environments"),
+    "wide": (896, 512, "Wide", "16:9 ratio - good for wallpapers and banners"),
+}
+
+SIZE_PRESETS_XL = {
+    "square": (1024, 1024, "Square", "1:1 ratio - SDXL native resolution"),
+    "portrait": (832, 1216, "Portrait", "2:3 ratio - good for people and characters"),
+    "landscape": (1216, 832, "Landscape", "3:2 ratio - good for scenes and environments"),
+    "wide": (1344, 768, "Wide", "16:9 ratio - good for wallpapers and banners"),
+}
+
+# Quality presets (steps, cfg, label, tooltip)
+QUALITY_PRESETS = {
+    "fast": (12, 5.0, "Fast", "Quick preview - lower quality but very fast"),
+    "balanced": (20, 7.0, "Balanced", "Good balance of speed and quality (recommended)"),
+    "quality": (35, 7.5, "Quality", "Higher quality - slower but more detailed"),
+}
+
+# Style presets (style suffix to add to prompt)
+STYLE_PRESETS = {
+    "none": ("", "None", "No style modification"),
+    "photo": (", professional photograph, photorealistic, 8k, detailed", "Photorealistic", "Realistic photograph style"),
+    "anime": (", anime style, anime art, vibrant colors, detailed", "Anime", "Japanese anime style"),
+    "oil": (", oil painting, painterly, classical art, brushstrokes", "Oil Painting", "Classical oil painting style"),
+    "digital": (", digital art, concept art, artstation, detailed illustration", "Digital Art", "Modern digital illustration"),
+    "watercolor": (", watercolor painting, soft colors, artistic, delicate", "Watercolor", "Soft watercolor painting style"),
+    "3d": (", 3d render, octane render, unreal engine, realistic lighting", "3D Render", "3D rendered CGI style"),
+}
+
+# Prompt templates by category
+PROMPT_TEMPLATES = {
+    "Portrait": "a portrait of a [person/character], looking at camera, soft lighting, detailed face",
+    "Landscape": "a beautiful landscape of [location], golden hour lighting, scenic view, detailed",
+    "Fantasy": "a fantasy scene with [subject], magical atmosphere, epic lighting, detailed",
+    "Animal": "a [animal] in its natural habitat, wildlife photography, detailed fur/feathers",
+    "Architecture": "an architectural photo of [building type], professional photography, detailed",
+    "Food": "a delicious plate of [food], food photography, appetizing, professional lighting",
+    "Sci-Fi": "a futuristic [subject], science fiction, neon lights, cyberpunk atmosphere",
+    "Nature": "a close-up of [natural subject], macro photography, detailed textures, beautiful",
+}
+
+# Common negative prompt for beginners
+DEFAULT_NEGATIVE = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, signature"
+
+
 class MainWindow(Adw.ApplicationWindow):
     """Main SwitchGen window."""
 
@@ -48,6 +105,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._current_workflow = WorkflowType.TEXT2IMG
         self._input_image_path: Optional[str] = None
         self._mask_image_path: Optional[str] = None
+        self._current_style: str = "none"  # Current style preset
+        self._is_xl_model: bool = False  # Whether current model is SDXL
 
         # Build UI
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -435,6 +494,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self._current_workflow = workflows[idx]
         spec = WORKFLOW_SPECS[self._current_workflow]
+        logger.debug("Workflow changed to %s", self._current_workflow.name)
 
         # Filter models for this workflow
         self._filtered_checkpoints = get_models_for_workflow(
@@ -533,8 +593,10 @@ class MainWindow(Adw.ApplicationWindow):
             # No valid model selected - show banner
             self.info_banner.set_title("Please download a model first to generate images.")
             self.info_banner.set_revealed(True)
+            logger.warning("Generate clicked but no model selected")
             return
         checkpoint = self._filtered_checkpoints[idx]
+        logger.info("Generate clicked (workflow=%s, model=%s)", self._current_workflow.name, checkpoint)
 
         # Get prompts
         buf = self.prompt_view.get_buffer()
@@ -616,6 +678,10 @@ class MainWindow(Adw.ApplicationWindow):
         def on_complete(job: GenerationJob):
             GLib.idle_add(self._on_complete, job)
 
+        logger.info(
+            "Submitting generation (workflow=%s, model=%s, steps=%d, cfg=%.1f, seed=%s)",
+            self._current_workflow.name, checkpoint, steps, cfg, actual_seed
+        )
         self._queue.submit(workflow=workflow, on_progress=on_progress, on_complete=on_complete)
 
     def _update_progress(self, info: ProgressInfo) -> bool:
@@ -627,7 +693,12 @@ class MainWindow(Adw.ApplicationWindow):
         if job.result and job.result.success and job.result.images is not None:
             images = tensor_to_pil(job.result.images)
             if images:
+                logger.info("Generation completed successfully (images=%d)", len(images))
                 self._show_image(images[0])
+            else:
+                logger.warning("Generation completed but no images produced")
+        elif job.result and not job.result.success:
+            logger.error("Generation failed: %s", job.result.error)
         self._reset_ui()
         return False
 
@@ -706,15 +777,19 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _init_comfy(self) -> None:
         """Initialize ComfyUI in background."""
+        logger.info("Initializing ComfyUI...")
         try:
             self._queue = get_queue()
             self._all_checkpoints = get_available_checkpoints()
+            logger.info("ComfyUI initialized (checkpoints=%d)", len(self._all_checkpoints))
             GLib.idle_add(self._on_ready)
         except Exception as e:
+            logger.error("ComfyUI initialization failed: %s", e, exc_info=True)
             GLib.idle_add(self._on_error, str(e))
 
     def _on_ready(self) -> bool:
         """ComfyUI ready."""
+        logger.info("Main window ready")
         # Trigger workflow change to filter models
         self._on_workflow_changed(self.workflow_dropdown, None)
         self._update_vram()
@@ -750,7 +825,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_error(self, error: str) -> bool:
         """ComfyUI error."""
         self.generate_btn.set_label("Error")
-        print(f"ComfyUI error: {error}")
+        logger.error("ComfyUI error: %s", error)
         return False
 
     def _update_vram(self) -> bool:
