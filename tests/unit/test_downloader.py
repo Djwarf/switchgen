@@ -73,6 +73,108 @@ class TestDownloadProgress:
 
         assert progress.total_mb == 10.0
 
+    def test_speed_mbps(self):
+        """speed_mbps should convert bytes/s to MB/s."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=0,
+            total_bytes=1000,
+            speed_bps=1024 * 1024 * 5,  # 5 MB/s
+        )
+
+        assert progress.speed_mbps == 5.0
+
+    def test_eta_seconds_calculation(self):
+        """eta_seconds should calculate remaining time correctly."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=500,
+            total_bytes=1000,
+            speed_bps=100.0,  # 100 bytes/sec, 500 remaining = 5 seconds
+        )
+
+        assert progress.eta_seconds == 5.0
+
+    def test_eta_seconds_zero_speed(self):
+        """eta_seconds should return None when speed is zero."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=500,
+            total_bytes=1000,
+            speed_bps=0.0,
+        )
+
+        assert progress.eta_seconds is None
+
+    def test_eta_formatted_seconds(self):
+        """eta_formatted should show seconds for short times."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=900,
+            total_bytes=1000,
+            speed_bps=10.0,  # 10 seconds remaining
+        )
+
+        assert progress.eta_formatted == "10s"
+
+    def test_eta_formatted_minutes(self):
+        """eta_formatted should show minutes and seconds."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=0,
+            total_bytes=9000,
+            speed_bps=100.0,  # 90 seconds = 1m 30s
+        )
+
+        assert progress.eta_formatted == "1m 30s"
+
+    def test_eta_formatted_hours(self):
+        """eta_formatted should show hours and minutes for long times."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=0,
+            total_bytes=7200,
+            speed_bps=1.0,  # 7200 seconds = 2h 0m
+        )
+
+        assert progress.eta_formatted == "2h 0m"
+
+    def test_eta_formatted_calculating(self):
+        """eta_formatted should show 'calculating...' when speed is zero."""
+        from switchgen.core.downloader import DownloadProgress
+
+        progress = DownloadProgress(
+            model_id="test",
+            downloaded_bytes=0,
+            total_bytes=1000,
+            speed_bps=0.0,
+        )
+
+        assert progress.eta_formatted == "calculating..."
+
+
+class TestDownloadCancelledException:
+    """Tests for DownloadCancelledException."""
+
+    def test_exception_message(self):
+        """Should store the provided message."""
+        from switchgen.core.downloader import DownloadCancelledException
+
+        exc = DownloadCancelledException("User cancelled")
+        assert str(exc) == "User cancelled"
+
 
 class TestDownloadResult:
     """Tests for DownloadResult dataclass."""

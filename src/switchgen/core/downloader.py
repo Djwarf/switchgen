@@ -1,12 +1,14 @@
 """Model download manager using HuggingFace Hub."""
 
 import logging
-import os
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from tqdm.auto import tqdm as tqdm_auto
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,11 @@ except ImportError:
     logger.debug("huggingface_hub not available")
 
 from .models import ModelInfo, ModelType, MODEL_CATALOG, is_model_installed
+
+
+class DownloadCancelledException(Exception):
+    """Raised when a download is cancelled by the user."""
+    pass
 
 
 @dataclass
@@ -44,6 +51,38 @@ class DownloadProgress:
     def total_mb(self) -> float:
         return self.total_bytes / (1024 * 1024)
 
+    @property
+    def speed_mbps(self) -> float:
+        """Speed in MB/s."""
+        return self.speed_bps / (1024 * 1024)
+
+    @property
+    def eta_seconds(self) -> Optional[float]:
+        """Estimated time remaining in seconds."""
+        if self.speed_bps <= 0:
+            return None
+        remaining_bytes = self.total_bytes - self.downloaded_bytes
+        if remaining_bytes <= 0:
+            return 0.0
+        return remaining_bytes / self.speed_bps
+
+    @property
+    def eta_formatted(self) -> str:
+        """Human-readable ETA string."""
+        eta = self.eta_seconds
+        if eta is None:
+            return "calculating..."
+        if eta <= 0:
+            return "done"
+        if eta < 60:
+            return f"{int(eta)}s"
+        elif eta < 3600:
+            return f"{int(eta // 60)}m {int(eta % 60)}s"
+        else:
+            hours = int(eta // 3600)
+            minutes = int((eta % 3600) // 60)
+            return f"{hours}h {minutes}m"
+
 
 @dataclass
 class DownloadResult:
@@ -52,6 +91,55 @@ class DownloadResult:
     model_id: str
     path: Optional[Path] = None
     error: Optional[str] = None
+
+
+class DownloadProgressTqdm(tqdm_auto):
+    """Custom tqdm that reports progress via callback and supports cancellation."""
+
+    def __init__(self, *args, progress_callback=None, model_id=None,
+                 cancel_check=None, **kwargs):
+        self._progress_callback = progress_callback
+        self._model_id = model_id
+        self._cancel_check = cancel_check
+        self._start_time = time.time()
+        self._last_update_time = self._start_time
+        self._last_bytes = 0
+        self._smoothed_speed = 0.0
+        super().__init__(*args, **kwargs)
+
+    def update(self, n=1):
+        """Override update to call progress callback and check cancellation."""
+        # Check for cancellation
+        if self._cancel_check and self._cancel_check():
+            raise DownloadCancelledException("Download cancelled by user")
+
+        super().update(n)
+
+        if self._progress_callback and self.total:
+            current_time = time.time()
+            elapsed = current_time - self._last_update_time
+
+            # Calculate speed (smoothed with exponential moving average)
+            if elapsed >= 0.25:  # Update speed every 250ms
+                bytes_delta = self.n - self._last_bytes
+                instant_speed = bytes_delta / elapsed if elapsed > 0 else 0
+
+                # Smooth the speed with EMA (alpha=0.3 for responsiveness)
+                if self._smoothed_speed == 0:
+                    self._smoothed_speed = instant_speed
+                else:
+                    self._smoothed_speed = 0.3 * instant_speed + 0.7 * self._smoothed_speed
+
+                self._last_update_time = current_time
+                self._last_bytes = self.n
+
+                progress = DownloadProgress(
+                    model_id=self._model_id,
+                    downloaded_bytes=self.n,
+                    total_bytes=self.total,
+                    speed_bps=self._smoothed_speed,
+                )
+                self._progress_callback(progress)
 
 
 class ModelDownloader:
@@ -133,14 +221,29 @@ class ModelDownloader:
         logger.info("Starting download: %s (%dMB) from %s",
                    model_info.name, model_info.size_mb, model_info.repo_id)
 
+        # Create tqdm class factory with bound parameters
+        downloader_self = self
+
+        def create_tqdm_class():
+            class BoundProgressTqdm(DownloadProgressTqdm):
+                def __init__(inner_self, *args, **kwargs):
+                    super().__init__(
+                        *args,
+                        progress_callback=progress_callback,
+                        model_id=model_info.id,
+                        cancel_check=lambda: downloader_self._cancel_requested,
+                        **kwargs
+                    )
+            return BoundProgressTqdm
+
         try:
-            # Download using huggingface_hub
-            # It handles caching, resume, and progress internally
+            # Download using huggingface_hub with custom tqdm
             downloaded_path = hf_hub_download(
                 repo_id=model_info.repo_id,
                 filename=model_info.filename,
                 local_dir=target_dir,
                 local_dir_use_symlinks=False,
+                tqdm_class=create_tqdm_class(),
             )
 
             downloaded_path = Path(downloaded_path)
@@ -170,19 +273,36 @@ class ModelDownloader:
                 path=downloaded_path,
             )
 
+        except DownloadCancelledException:
+            logger.info("Download cancelled: %s", model_info.name)
+            return DownloadResult(
+                success=False,
+                model_id=model_info.id,
+                error="Download cancelled"
+            )
         except EntryNotFoundError:
             logger.error("Model file not found: %s/%s", model_info.repo_id, model_info.filename)
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
-                error=f"File not found: {model_info.repo_id}/{model_info.filename}"
+                error=f"Model not found on HuggingFace. It may have been moved or removed."
             )
         except Exception as e:
             logger.error("Download failed for %s: %s", model_info.name, e, exc_info=True)
+            error_msg = str(e)
+            # Provide helpful guidance for common errors
+            if "401" in error_msg or "unauthorized" in error_msg.lower():
+                error_msg = "Authentication required. This model may need a HuggingFace account."
+            elif "403" in error_msg or "forbidden" in error_msg.lower():
+                error_msg = "Access denied. You may need to accept the model's license on HuggingFace."
+            elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+                error_msg = "Network error. Check your internet connection and try again."
+            elif "resolve" in error_msg.lower() or "dns" in error_msg.lower():
+                error_msg = "Could not connect to HuggingFace. Check your internet connection."
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
-                error=str(e)
+                error=error_msg
             )
         finally:
             self._current_download = None

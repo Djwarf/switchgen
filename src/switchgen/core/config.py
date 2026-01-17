@@ -62,6 +62,10 @@ class PathConfig:
         return self.switchgen_root / "temp"
 
     @property
+    def input_dir(self) -> Path:
+        return self.switchgen_root / "input"
+
+    @property
     def workflows_dir(self) -> Path:
         return self.switchgen_root / "workflows"
 
@@ -100,9 +104,10 @@ class PathConfig:
         return self.switchgen_root / "custom_nodes"
 
     def ensure_directories(self) -> None:
-        """Create output and temp directories if they don't exist."""
+        """Create output, temp, and input directories if they don't exist."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.input_dir.mkdir(parents=True, exist_ok=True)
         self.workflows_dir.mkdir(parents=True, exist_ok=True)
 
 

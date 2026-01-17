@@ -155,11 +155,23 @@ class ModelDownloadDialog(Adw.Dialog):
         self.progress_box.set_visible(False)
         content_box.append(self.progress_box)
 
-        self.progress_label = Gtk.Label(label="", xalign=0)
-        self.progress_box.append(self.progress_label)
+        # Progress info row with cancel button
+        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.progress_box.append(progress_row)
+
+        self.progress_label = Gtk.Label(label="", xalign=0, hexpand=True)
+        progress_row.append(self.progress_label)
+
+        self.cancel_button = Gtk.Button(label="Cancel")
+        self.cancel_button.add_css_class("destructive-action")
+        self.cancel_button.connect("clicked", self._on_cancel_clicked)
+        progress_row.append(self.cancel_button)
 
         self.progress_bar = Gtk.ProgressBar()
         self.progress_box.append(self.progress_bar)
+
+        # Store current download model for retry
+        self._current_download_model: Optional[ModelInfo] = None
 
     def _build_getting_started_section(self, content_box: Gtk.Box, recommended: list[ModelInfo]):
         """Build the Getting Started section for new users."""
@@ -355,14 +367,20 @@ class ModelDownloadDialog(Adw.Dialog):
 
         logger.info("Download initiated (model=%s, size=%dMB)", model.name, model.size_mb)
 
+        # Store current model for retry
+        self._current_download_model = model
+
         # Disable all download buttons
         for btn in self._download_buttons.values():
             btn.set_sensitive(False)
 
-        # Show progress
+        # Show progress with cancel button
         self.progress_box.set_visible(True)
-        self.progress_label.set_label(f"Downloading {model.name}...")
+        self.progress_label.set_label(f"Starting download of {model.name}...")
         self.progress_bar.set_fraction(0)
+        self.cancel_button.set_visible(True)
+        self.cancel_button.set_sensitive(True)
+        self.cancel_button.set_label("Cancel")
 
         # Start async download
         self.downloader.download_async(
@@ -371,42 +389,149 @@ class ModelDownloadDialog(Adw.Dialog):
             complete_callback=lambda r: GLib.idle_add(self._on_complete, r),
         )
 
+    def _on_cancel_clicked(self, button: Gtk.Button):
+        """Handle cancel button click."""
+        logger.info("Download cancel requested")
+        button.set_sensitive(False)
+        button.set_label("Cancelling...")
+        self.progress_label.set_label("Cancelling download...")
+        self.downloader.cancel_download()
+
     def _on_progress(self, progress: DownloadProgress):
         """Handle download progress update."""
         self.progress_bar.set_fraction(progress.progress)
-        self.progress_label.set_label(
-            f"Downloading... {progress.downloaded_mb:.1f} / {progress.total_mb:.1f} MB"
-        )
+
+        # Format: "23.5 / 100.0 MB  |  5.2 MB/s  |  ETA: 1m 30s"
+        if progress.speed_bps > 0:
+            speed_str = f"{progress.speed_mbps:.1f} MB/s"
+            eta_str = progress.eta_formatted
+            self.progress_label.set_label(
+                f"{progress.downloaded_mb:.1f} / {progress.total_mb:.1f} MB  |  "
+                f"{speed_str}  |  ETA: {eta_str}"
+            )
+        else:
+            self.progress_label.set_label(
+                f"{progress.downloaded_mb:.1f} / {progress.total_mb:.1f} MB  |  Starting..."
+            )
         return False
 
     def _on_complete(self, result: DownloadResult):
         """Handle download completion."""
-        self.progress_box.set_visible(False)
-
         if result.success:
             logger.info("Download completed successfully (model=%s, path=%s)", result.model_id, result.path)
-            self.progress_label.set_label(f"Downloaded successfully!")
+            self._show_success()
         else:
             logger.error("Download failed (model=%s): %s", result.model_id, result.error)
-            self._show_error(f"Download failed: {result.error}")
+            if result.error == "Download cancelled":
+                self._show_cancelled()
+            else:
+                self._show_error_with_retry(result.error)
 
-        # Refresh status and re-enable buttons
-        self._refresh_status()
+        return False
 
-        # Re-enable uninstalled model buttons
+    def _show_success(self):
+        """Show success notification that persists briefly."""
+        # Update progress to show completion
+        self.progress_label.set_label("Download complete!")
+        self.progress_bar.set_fraction(1.0)
+        self.cancel_button.set_visible(False)
+
+        # Auto-hide after 2 seconds and refresh
+        def hide_and_refresh():
+            self.progress_box.set_visible(False)
+            self._refresh_status()
+            self._re_enable_buttons()
+            self._current_download_model = None
+            return False
+
+        GLib.timeout_add(2000, hide_and_refresh)
+
+    def _show_cancelled(self):
+        """Show cancelled state briefly."""
+        self.progress_label.set_label("Download cancelled")
+        self.progress_bar.set_fraction(0)
+        self.cancel_button.set_visible(False)
+
+        # Auto-hide after 1.5 seconds
+        def hide_and_reset():
+            self.progress_box.set_visible(False)
+            self._refresh_status()
+            self._re_enable_buttons()
+            self._current_download_model = None
+            return False
+
+        GLib.timeout_add(1500, hide_and_reset)
+
+    def _show_error_with_retry(self, error: str):
+        """Show error message with retry option."""
+        self.progress_box.set_visible(False)
+
+        # Get user-friendly error title and guidance
+        title, guidance = self._get_error_guidance(error)
+
+        dialog = Adw.AlertDialog.new(title, guidance)
+        dialog.add_response("close", "_Close")
+        dialog.add_response("retry", "_Retry")
+        dialog.set_response_appearance("retry", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("retry")
+        dialog.set_close_response("close")
+        dialog.connect("response", self._on_error_dialog_response)
+        dialog.present(self)
+
+    def _on_error_dialog_response(self, dialog, response_id):
+        """Handle error dialog response."""
+        if response_id == "retry" and self._current_download_model:
+            # Retry the download
+            logger.info("Retrying download for %s", self._current_download_model.name)
+            self._on_download_clicked(None, self._current_download_model)
+        else:
+            # Reset UI state
+            self._refresh_status()
+            self._re_enable_buttons()
+            self._current_download_model = None
+
+    def _get_error_guidance(self, error: str) -> tuple[str, str]:
+        """Get user-friendly error title and guidance."""
+        error_lower = error.lower()
+
+        if "disk space" in error_lower or "not enough" in error_lower:
+            return ("Not Enough Storage",
+                    "Free up disk space and try again. Large AI models can "
+                    "require several gigabytes of storage.")
+
+        if "network" in error_lower or "connection" in error_lower or "timeout" in error_lower:
+            return ("Connection Problem",
+                    "Check your internet connection and try again. "
+                    "If the problem persists, the server may be temporarily unavailable.")
+
+        if "authentication" in error_lower or "401" in error:
+            return ("Authentication Required",
+                    "This model requires a HuggingFace account. "
+                    "Visit huggingface.co to create an account and log in.")
+
+        if "access denied" in error_lower or "403" in error or "forbidden" in error_lower:
+            return ("Access Restricted",
+                    "This model requires accepting terms on HuggingFace. "
+                    "Visit the model page on huggingface.co to accept the license.")
+
+        if "not found" in error_lower or "404" in error:
+            return ("Model Not Found",
+                    "The model file could not be found. It may have been moved or removed.")
+
+        # Generic fallback
+        return ("Download Failed", error)
+
+    def _re_enable_buttons(self):
+        """Re-enable download buttons for uninstalled models."""
         for model_id, btn in self._download_buttons.items():
             model = MODEL_CATALOG.get(model_id)
             if model and not is_model_installed(model, self.models_dir):
                 btn.set_sensitive(True)
 
-        return False
-
     def _show_error(self, message: str):
-        """Show an error message."""
+        """Show a simple error message (no retry)."""
         logger.error("UI error shown: %s", message)
-        dialog = Adw.AlertDialog(
-            heading="Error",
-            body=message,
-        )
-        dialog.add_response("ok", "OK")
+        title, guidance = self._get_error_guidance(message)
+        dialog = Adw.AlertDialog.new(title, guidance)
+        dialog.add_response("ok", "_OK")
         dialog.present(self)
