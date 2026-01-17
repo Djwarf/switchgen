@@ -94,6 +94,7 @@ def _configure_paths(config: Config) -> Any:
         "loras": "models/loras",
         "vae": "models/vae",
         "clip": "models/clip",
+        "text_encoders": "models/text_encoders",  # For CLIPLoader (T5, etc.)
         "controlnet": "models/controlnet",
         "embeddings": "models/embeddings",
         "clip_vision": "models/clip_vision",
@@ -111,8 +112,9 @@ def _configure_paths(config: Config) -> Any:
         else:
             folder_paths.folder_names_and_paths[folder_type] = ([full_path], set())
 
-    # Set output and temp directories
+    # Set output, input, and temp directories
     folder_paths.set_output_directory(str(config.paths.output_dir))
+    folder_paths.set_input_directory(str(config.paths.input_dir))
     folder_paths.set_temp_directory(str(config.paths.temp_dir))
 
     # Custom nodes path
