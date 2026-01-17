@@ -13,10 +13,33 @@ authors = [
     { name = "SwitchSides" }
 ]
 dependencies = [
+    # SwitchGen UI
     "PyGObject>=3.42",
-    "Pillow>=10.0",
-    "psutil>=5.9",
     "huggingface_hub>=0.20.0",
+
+    # ComfyUI core dependencies
+    "torch",
+    "torchsde",
+    "torchvision",
+    "torchaudio",
+    "numpy>=1.25.0",
+    "einops",
+    "transformers>=4.50.3",
+    "tokenizers>=0.13.3",
+    "sentencepiece",
+    "safetensors>=0.4.2",
+    "aiohttp>=3.11.8",
+    "yarl>=1.18.0",
+    "pyyaml",
+    "Pillow>=10.0",
+    "scipy",
+    "tqdm",
+    "psutil>=5.9",
+    "av>=14.2.0",
+
+    # Optional but recommended for full functionality
+    "kornia>=0.7.1",
+    "spandrel",
 ]
 
 [project.optional-dependencies]
