@@ -14,32 +14,26 @@ def _detect_switchgen_root() -> Path:
 
 
 def _detect_comfy_path() -> Path:
-    """Detect ComfyUI path from environment or common locations."""
-    # 1. Check environment variable
+    """Detect ComfyUI path - bundled version or environment override."""
+    switchgen_root = _detect_switchgen_root()
+
+    # 1. Primary: Use bundled ComfyUI in vendor/
+    bundled_path = switchgen_root / "vendor" / "ComfyUI"
+    if bundled_path.exists():
+        return bundled_path
+
+    # 2. Fallback: Check environment variable (for development)
     env_path = os.environ.get("COMFYUI_PATH")
     if env_path:
         path = Path(env_path)
         if path.exists():
             return path
 
-    # 2. Check sibling directory (common development setup)
-    switchgen_root = _detect_switchgen_root()
-    sibling_path = switchgen_root.parent / "ComfyUI"
-    if sibling_path.exists():
-        return sibling_path
-
-    # 3. Check common installation paths
-    common_paths = [
-        Path.home() / "ComfyUI",
-        Path("/opt/ComfyUI"),
-        Path("/usr/local/ComfyUI"),
-    ]
-    for path in common_paths:
-        if path.exists():
-            return path
-
-    # 4. Fallback to sibling (will be created or error later)
-    return sibling_path
+    # 3. Error: ComfyUI not found
+    raise RuntimeError(
+        f"Bundled ComfyUI not found at {bundled_path}. "
+        "Run 'git submodule update --init' to install."
+    )
 
 
 @dataclass
@@ -93,10 +87,10 @@ class PathConfig:
     def embeddings_dir(self) -> Path:
         return self.models_dir / "embeddings"
 
-    # ComfyUI custom nodes (still uses ComfyUI installation)
+    # Custom nodes directory (in SwitchGen root, not ComfyUI)
     @property
     def custom_nodes_dir(self) -> Path:
-        return self.comfy_path / "custom_nodes"
+        return self.switchgen_root / "custom_nodes"
 
     def ensure_directories(self) -> None:
         """Create output and temp directories if they don't exist."""
