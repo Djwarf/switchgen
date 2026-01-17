@@ -6,15 +6,15 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from tqdm.auto import tqdm as tqdm_auto
+import requests
 
 logger = logging.getLogger(__name__)
 
 try:
-    from huggingface_hub import hf_hub_download, HfApi
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub import hf_hub_url, HfApi
+    from huggingface_hub.utils import EntryNotFoundError, build_hf_headers
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
@@ -91,55 +91,6 @@ class DownloadResult:
     model_id: str
     path: Optional[Path] = None
     error: Optional[str] = None
-
-
-class DownloadProgressTqdm(tqdm_auto):
-    """Custom tqdm that reports progress via callback and supports cancellation."""
-
-    def __init__(self, *args, progress_callback=None, model_id=None,
-                 cancel_check=None, **kwargs):
-        self._progress_callback = progress_callback
-        self._model_id = model_id
-        self._cancel_check = cancel_check
-        self._start_time = time.time()
-        self._last_update_time = self._start_time
-        self._last_bytes = 0
-        self._smoothed_speed = 0.0
-        super().__init__(*args, **kwargs)
-
-    def update(self, n=1):
-        """Override update to call progress callback and check cancellation."""
-        # Check for cancellation
-        if self._cancel_check and self._cancel_check():
-            raise DownloadCancelledException("Download cancelled by user")
-
-        super().update(n)
-
-        if self._progress_callback and self.total:
-            current_time = time.time()
-            elapsed = current_time - self._last_update_time
-
-            # Calculate speed (smoothed with exponential moving average)
-            if elapsed >= 0.25:  # Update speed every 250ms
-                bytes_delta = self.n - self._last_bytes
-                instant_speed = bytes_delta / elapsed if elapsed > 0 else 0
-
-                # Smooth the speed with EMA (alpha=0.3 for responsiveness)
-                if self._smoothed_speed == 0:
-                    self._smoothed_speed = instant_speed
-                else:
-                    self._smoothed_speed = 0.3 * instant_speed + 0.7 * self._smoothed_speed
-
-                self._last_update_time = current_time
-                self._last_bytes = self.n
-
-                progress = DownloadProgress(
-                    model_id=self._model_id,
-                    downloaded_bytes=self.n,
-                    total_bytes=self.total,
-                    speed_bps=self._smoothed_speed,
-                )
-                self._progress_callback(progress)
 
 
 class ModelDownloader:
@@ -221,88 +172,146 @@ class ModelDownloader:
         logger.info("Starting download: %s (%dMB) from %s",
                    model_info.name, model_info.size_mb, model_info.repo_id)
 
-        # Create tqdm class factory with bound parameters
-        downloader_self = self
-
-        def create_tqdm_class():
-            class BoundProgressTqdm(DownloadProgressTqdm):
-                def __init__(inner_self, *args, **kwargs):
-                    super().__init__(
-                        *args,
-                        progress_callback=progress_callback,
-                        model_id=model_info.id,
-                        cancel_check=lambda: downloader_self._cancel_requested,
-                        **kwargs
-                    )
-            return BoundProgressTqdm
+        # Use temp file for download, then rename on success
+        temp_path = target_path.with_suffix('.tmp')
 
         try:
-            # Download using huggingface_hub with custom tqdm
-            downloaded_path = hf_hub_download(
+            # Get the download URL from HuggingFace
+            url = hf_hub_url(
                 repo_id=model_info.repo_id,
                 filename=model_info.filename,
-                local_dir=target_dir,
-                local_dir_use_symlinks=False,
-                tqdm_class=create_tqdm_class(),
             )
 
-            downloaded_path = Path(downloaded_path)
+            # Get headers (for authentication if needed)
+            headers = build_hf_headers()
 
-            # Rename if needed
-            if downloaded_path.name != local_filename:
-                if target_path.exists():
-                    target_path.unlink()
-                downloaded_path.rename(target_path)
-                downloaded_path = target_path
+            # Start download with streaming
+            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            response.raise_for_status()
+
+            # Get total size from headers
+            total_size = int(response.headers.get('content-length', 0))
+            if total_size == 0:
+                total_size = model_info.size_mb * 1024 * 1024  # Fallback to catalog size
+
+            # Track progress
+            downloaded = 0
+            start_time = time.time()
+            last_update_time = start_time
+            last_bytes = 0
+            smoothed_speed = 0.0
+            chunk_size = 8192  # 8KB chunks
+
+            with open(temp_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    # Check for cancellation
+                    if self._cancel_requested:
+                        raise DownloadCancelledException("Download cancelled by user")
+
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Update progress every 250ms
+                        current_time = time.time()
+                        elapsed = current_time - last_update_time
+
+                        if elapsed >= 0.25 and progress_callback:
+                            bytes_delta = downloaded - last_bytes
+                            instant_speed = bytes_delta / elapsed if elapsed > 0 else 0
+
+                            # Smooth speed with EMA
+                            if smoothed_speed == 0:
+                                smoothed_speed = instant_speed
+                            else:
+                                smoothed_speed = 0.3 * instant_speed + 0.7 * smoothed_speed
+
+                            last_update_time = current_time
+                            last_bytes = downloaded
+
+                            progress_callback(DownloadProgress(
+                                model_id=model_info.id,
+                                downloaded_bytes=downloaded,
+                                total_bytes=total_size,
+                                speed_bps=smoothed_speed,
+                            ))
+
+            # Rename temp file to final path
+            if target_path.exists():
+                target_path.unlink()
+            temp_path.rename(target_path)
 
             # Final progress update
             if progress_callback:
-                file_size = downloaded_path.stat().st_size
                 progress_callback(DownloadProgress(
                     model_id=model_info.id,
-                    downloaded_bytes=file_size,
-                    total_bytes=file_size,
+                    downloaded_bytes=total_size,
+                    total_bytes=total_size,
                     speed_bps=0,
                 ))
 
-            logger.info("Download completed: %s -> %s", model_info.name, downloaded_path)
+            logger.info("Download completed: %s -> %s", model_info.name, target_path)
 
             return DownloadResult(
                 success=True,
                 model_id=model_info.id,
-                path=downloaded_path,
+                path=target_path,
             )
 
         except DownloadCancelledException:
             logger.info("Download cancelled: %s", model_info.name)
+            # Clean up temp file
+            if temp_path.exists():
+                temp_path.unlink()
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
                 error="Download cancelled"
             )
-        except EntryNotFoundError:
-            logger.error("Model file not found: %s/%s", model_info.repo_id, model_info.filename)
-            return DownloadResult(
-                success=False,
-                model_id=model_info.id,
-                error=f"Model not found on HuggingFace. It may have been moved or removed."
-            )
-        except Exception as e:
-            logger.error("Download failed for %s: %s", model_info.name, e, exc_info=True)
-            error_msg = str(e)
-            # Provide helpful guidance for common errors
-            if "401" in error_msg or "unauthorized" in error_msg.lower():
+        except requests.exceptions.HTTPError as e:
+            logger.error("HTTP error downloading %s: %s", model_info.name, e)
+            if temp_path.exists():
+                temp_path.unlink()
+            status_code = e.response.status_code if e.response else 0
+            if status_code == 401:
                 error_msg = "Authentication required. This model may need a HuggingFace account."
-            elif "403" in error_msg or "forbidden" in error_msg.lower():
+            elif status_code == 403:
                 error_msg = "Access denied. You may need to accept the model's license on HuggingFace."
-            elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
-                error_msg = "Network error. Check your internet connection and try again."
-            elif "resolve" in error_msg.lower() or "dns" in error_msg.lower():
-                error_msg = "Could not connect to HuggingFace. Check your internet connection."
+            elif status_code == 404:
+                error_msg = "Model not found on HuggingFace. It may have been moved or removed."
+            else:
+                error_msg = f"HTTP error {status_code}: {str(e)}"
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
                 error=error_msg
+            )
+        except requests.exceptions.ConnectionError:
+            logger.error("Connection error downloading %s", model_info.name)
+            if temp_path.exists():
+                temp_path.unlink()
+            return DownloadResult(
+                success=False,
+                model_id=model_info.id,
+                error="Network error. Check your internet connection and try again."
+            )
+        except requests.exceptions.Timeout:
+            logger.error("Timeout downloading %s", model_info.name)
+            if temp_path.exists():
+                temp_path.unlink()
+            return DownloadResult(
+                success=False,
+                model_id=model_info.id,
+                error="Download timed out. Try again later."
+            )
+        except Exception as e:
+            logger.error("Download failed for %s: %s", model_info.name, e, exc_info=True)
+            if temp_path.exists():
+                temp_path.unlink()
+            return DownloadResult(
+                success=False,
+                model_id=model_info.id,
+                error=str(e)
             )
         finally:
             self._current_download = None
