@@ -185,6 +185,7 @@ class MainWindow(Adw.ApplicationWindow):
         )
         box.append(model_label)
         self.model_dropdown = Gtk.DropDown.new_from_strings(["Loading..."])
+        self.model_dropdown.connect("notify::selected", self._on_model_changed)
         box.append(self.model_dropdown)
 
         # INPUT IMAGE (for img2img, inpaint, 3d)
@@ -227,6 +228,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         # PROMPT (hidden for 3D)
         self.prompt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        # Prompt header with template dropdown
+        prompt_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         prompt_label = self._label("PROMPT")
         prompt_label.set_tooltip_text(
             "Describe what you want to generate.\n\n"
@@ -236,16 +240,52 @@ class MainWindow(Adw.ApplicationWindow):
             "• Describe quality: 'detailed', 'high resolution'\n"
             "• Use commas to separate concepts"
         )
-        self.prompt_box.append(prompt_label)
+        prompt_header.append(prompt_label)
+        prompt_header.append(Gtk.Box(hexpand=True))  # spacer
+
+        # Template dropdown
+        template_names = ["Templates..."] + list(PROMPT_TEMPLATES.keys())
+        self.template_dropdown = Gtk.DropDown.new_from_strings(template_names)
+        self.template_dropdown.set_tooltip_text("Click to insert a starter prompt template")
+        self.template_dropdown.connect("notify::selected", self._on_template_selected)
+        prompt_header.append(self.template_dropdown)
+        self.prompt_box.append(prompt_header)
+
         self.prompt_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.prompt_view.set_size_request(-1, 80)
+        # Set placeholder-like hint
+        buf = self.prompt_view.get_buffer()
+        buf.set_text("Describe what you want to see...")
+        # GTK4 uses event controllers for focus
+        focus_controller = Gtk.EventControllerFocus()
+        focus_controller.connect("enter", self._on_prompt_focus_enter)
+        self.prompt_view.add_controller(focus_controller)
         frame = Gtk.Frame()
         frame.set_child(self.prompt_view)
         self.prompt_box.append(frame)
+
+        # Style preset buttons
+        style_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        style_box.set_margin_top(4)
+        style_label = Gtk.Label(label="Style:", css_classes=["dim-label"])
+        style_label.set_tooltip_text("Add a style to your image automatically")
+        style_box.append(style_label)
+
+        # Create style dropdown
+        style_names = [STYLE_PRESETS[k][1] for k in STYLE_PRESETS.keys()]
+        self.style_dropdown = Gtk.DropDown.new_from_strings(style_names)
+        self.style_dropdown.set_tooltip_text("Select a style to automatically add to your prompt")
+        self.style_dropdown.connect("notify::selected", self._on_style_changed)
+        style_box.append(self.style_dropdown)
+        self.prompt_box.append(style_box)
+
         box.append(self.prompt_box)
 
         # NEGATIVE (hidden for 3D)
         self.neg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        # Negative header with defaults button
+        neg_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         neg_label = self._label("NEGATIVE")
         neg_label.set_tooltip_text(
             "Describe what you DON'T want in the image.\n\n"
@@ -255,7 +295,15 @@ class MainWindow(Adw.ApplicationWindow):
             "• 'extra fingers, deformed hands'\n"
             "Leave empty if unsure - it's optional."
         )
-        self.neg_box.append(neg_label)
+        neg_header.append(neg_label)
+        neg_header.append(Gtk.Box(hexpand=True))  # spacer
+
+        defaults_btn = Gtk.Button(label="Use Defaults")
+        defaults_btn.set_tooltip_text("Fill with recommended negative prompts")
+        defaults_btn.connect("clicked", self._on_use_default_negative)
+        neg_header.append(defaults_btn)
+        self.neg_box.append(neg_header)
+
         self.neg_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.neg_view.set_size_request(-1, 50)
         frame = Gtk.Frame()
@@ -287,6 +335,37 @@ class MainWindow(Adw.ApplicationWindow):
         size_box.append(self.height_spin)
         self.size_box = size_box
         grid.attach(size_box, 1, row_idx, 1, 1)
+        row_idx += 1
+
+        # Size presets
+        self.size_presets_label = Gtk.Label(label="", xalign=0)
+        grid.attach(self.size_presets_label, 0, row_idx, 1, 1)
+        size_presets_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for key, (w, h, label, tooltip) in SIZE_PRESETS.items():
+            btn = Gtk.Button(label=label)
+            btn.set_tooltip_text(tooltip)
+            btn.connect("clicked", self._on_size_preset_clicked, key)
+            btn.add_css_class("flat")
+            size_presets_box.append(btn)
+        self.size_presets_box = size_presets_box
+        grid.attach(size_presets_box, 1, row_idx, 1, 1)
+        row_idx += 1
+
+        # Quality presets
+        quality_label = Gtk.Label(label="Quality", xalign=0)
+        quality_label.set_tooltip_text("Choose a quality preset to set Steps and CFG automatically")
+        grid.attach(quality_label, 0, row_idx, 1, 1)
+        quality_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for key, (steps, cfg, label, tooltip) in QUALITY_PRESETS.items():
+            btn = Gtk.Button(label=label)
+            btn.set_tooltip_text(tooltip)
+            btn.connect("clicked", self._on_quality_preset_clicked, key)
+            if key == "balanced":
+                btn.add_css_class("suggested-action")
+            else:
+                btn.add_css_class("flat")
+            quality_box.append(btn)
+        grid.attach(quality_box, 1, row_idx, 1, 1)
         row_idx += 1
 
         # Steps
@@ -451,6 +530,37 @@ class MainWindow(Adw.ApplicationWindow):
         scroll.set_child(self.gallery_box)
         box.append(scroll)
 
+        # Tips panel (collapsible)
+        tips_expander = Gtk.Expander(label="Tips for Beginners")
+        tips_expander.set_expanded(False)
+        tips_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        tips_box.set_margin_start(12)
+        tips_box.set_margin_end(12)
+        tips_box.set_margin_top(8)
+        tips_box.set_margin_bottom(8)
+
+        tips = [
+            ("Start Simple", "Begin with short, clear prompts. Add details gradually."),
+            ("Use Presets", "Click Quality presets (Fast/Balanced/Quality) to set good defaults."),
+            ("Try Templates", "Use the Templates dropdown for starter prompts you can customize."),
+            ("Add Style", "Select a Style to automatically enhance your prompt with artistic terms."),
+            ("Iterate", "Generate quickly with 'Fast' preset, then increase quality once you like the result."),
+            ("Save Your Seed", "The Seed number lets you recreate the exact same image later."),
+        ]
+
+        for title, desc in tips:
+            tip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            tip_title = Gtk.Label(label=f"• {title}:", xalign=0, css_classes=["heading"])
+            tip_title.set_size_request(120, -1)
+            tip_row.append(tip_title)
+            tip_desc = Gtk.Label(label=desc, xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
+            tip_desc.set_hexpand(True)
+            tip_row.append(tip_desc)
+            tips_box.append(tip_row)
+
+        tips_expander.set_child(tips_box)
+        box.append(tips_expander)
+
         return box
 
     def _build_bottom_bar(self) -> Gtk.Widget:
@@ -534,6 +644,79 @@ class MainWindow(Adw.ApplicationWindow):
         self.cfg_spin.set_value(spec.default_cfg)
         self.denoise_spin.set_value(spec.default_denoise)
 
+    def _on_model_changed(self, dropdown, _param) -> None:
+        """Handle model selection change - detect XL models and update sizes."""
+        idx = dropdown.get_selected()
+        if idx >= len(self._filtered_checkpoints):
+            return
+
+        model_name = self._filtered_checkpoints[idx].lower()
+        # Detect if this is an SDXL model
+        is_xl = "xl" in model_name or "sdxl" in model_name
+        if is_xl != self._is_xl_model:
+            self._is_xl_model = is_xl
+            # Update to appropriate default size
+            if is_xl:
+                self.width_spin.set_value(1024)
+                self.height_spin.set_value(1024)
+            else:
+                self.width_spin.set_value(512)
+                self.height_spin.set_value(512)
+            logger.debug("Model changed: XL=%s, updated default size", is_xl)
+
+    def _on_size_preset_clicked(self, button, preset_key: str) -> None:
+        """Apply a size preset."""
+        presets = SIZE_PRESETS_XL if self._is_xl_model else SIZE_PRESETS
+        if preset_key in presets:
+            w, h, _, _ = presets[preset_key]
+            self.width_spin.set_value(w)
+            self.height_spin.set_value(h)
+            logger.debug("Size preset applied: %s (%dx%d)", preset_key, w, h)
+
+    def _on_quality_preset_clicked(self, button, preset_key: str) -> None:
+        """Apply a quality preset."""
+        if preset_key in QUALITY_PRESETS:
+            steps, cfg, _, _ = QUALITY_PRESETS[preset_key]
+            self.steps_spin.set_value(steps)
+            self.cfg_spin.set_value(cfg)
+            logger.debug("Quality preset applied: %s (steps=%d, cfg=%.1f)", preset_key, steps, cfg)
+
+    def _on_template_selected(self, dropdown, _param) -> None:
+        """Insert a prompt template."""
+        idx = dropdown.get_selected()
+        if idx == 0:  # "Templates..." placeholder
+            return
+        template_keys = list(PROMPT_TEMPLATES.keys())
+        if idx - 1 < len(template_keys):
+            key = template_keys[idx - 1]
+            template = PROMPT_TEMPLATES[key]
+            buf = self.prompt_view.get_buffer()
+            buf.set_text(template)
+            logger.debug("Template inserted: %s", key)
+        # Reset dropdown to placeholder
+        dropdown.set_selected(0)
+
+    def _on_style_changed(self, dropdown, _param) -> None:
+        """Handle style preset change."""
+        idx = dropdown.get_selected()
+        style_keys = list(STYLE_PRESETS.keys())
+        if idx < len(style_keys):
+            self._current_style = style_keys[idx]
+            logger.debug("Style changed: %s", self._current_style)
+
+    def _on_use_default_negative(self, button) -> None:
+        """Fill negative prompt with defaults."""
+        buf = self.neg_view.get_buffer()
+        buf.set_text(DEFAULT_NEGATIVE)
+        logger.debug("Default negative prompt applied")
+
+    def _on_prompt_focus_enter(self, controller) -> None:
+        """Clear placeholder text when prompt gets focus."""
+        buf = self.prompt_view.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        if text == "Describe what you want to see...":
+            buf.set_text("")
+
     # =========================================================================
     # File Pickers
     # =========================================================================
@@ -601,8 +784,18 @@ class MainWindow(Adw.ApplicationWindow):
         # Get prompts
         buf = self.prompt_view.get_buffer()
         prompt = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        # Clear placeholder text if still there
+        if prompt == "Describe what you want to see...":
+            prompt = ""
         if not prompt.strip():
             prompt = "high quality, detailed"
+
+        # Apply style suffix
+        if self._current_style and self._current_style in STYLE_PRESETS:
+            style_suffix, _, _ = STYLE_PRESETS[self._current_style]
+            if style_suffix:
+                prompt = prompt.rstrip() + style_suffix
+                logger.debug("Style applied: %s", self._current_style)
 
         buf = self.neg_view.get_buffer()
         negative = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
@@ -686,7 +879,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _update_progress(self, info: ProgressInfo) -> bool:
         if info.total_steps > 0:
-            self.progress_bar.set_fraction(info.current_step / info.total_steps)
+            progress = info.current_step / info.total_steps
+            self.progress_bar.set_fraction(progress)
+            # Update button text with progress
+            pct = int(progress * 100)
+            self.generate_btn.set_label(f"Generating... {pct}%")
         return False
 
     def _on_complete(self, job: GenerationJob) -> bool:
