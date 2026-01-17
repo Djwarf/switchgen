@@ -10,23 +10,32 @@ logger = logging.getLogger(__name__)
 
 
 def _detect_switchgen_root() -> Path:
-    """Detect SwitchGen root directory relative to this file."""
+    """Detect SwitchGen root directory relative to this file.
+
+    This is primarily used for development mode where we run from the repo.
+    """
     # This file is at: switchgen/src/switchgen/core/config.py
     # Root is 4 levels up: config.py -> core -> switchgen -> src -> switchgen_root
     return Path(__file__).resolve().parent.parent.parent.parent
 
 
+def _get_data_root() -> Path:
+    """Get the user data directory using XDG Base Directory Specification.
+
+    Returns ~/.local/share/switchgen/ (or XDG_DATA_HOME/switchgen if set).
+    """
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        base = Path(xdg_data_home)
+    else:
+        base = Path.home() / ".local" / "share"
+    return base / "switchgen"
+
+
 def _detect_comfy_path() -> Path:
-    """Detect ComfyUI path - bundled version or environment override."""
-    switchgen_root = _detect_switchgen_root()
+    """Detect ComfyUI path - system install, bundled, or environment override."""
 
-    # 1. Primary: Use bundled ComfyUI in vendor/
-    bundled_path = switchgen_root / "vendor" / "ComfyUI"
-    if bundled_path.exists():
-        logger.debug("Using bundled ComfyUI at %s", bundled_path)
-        return bundled_path
-
-    # 2. Fallback: Check environment variable (for development)
+    # 1. Check environment variable first (highest priority)
     env_path = os.environ.get("COMFYUI_PATH")
     if env_path:
         path = Path(env_path)
@@ -35,44 +44,84 @@ def _detect_comfy_path() -> Path:
             return path
         logger.warning("COMFYUI_PATH set but path does not exist: %s", env_path)
 
-    # 3. Error: ComfyUI not found
-    logger.error("ComfyUI not found at %s", bundled_path)
+    # 2. Check system installation (AUR package installs here)
+    system_path = Path("/usr/share/switchgen/vendor/ComfyUI")
+    if system_path.exists():
+        logger.debug("Using system ComfyUI at %s", system_path)
+        return system_path
+
+    # 3. Check development/bundled location
+    dev_path = _detect_switchgen_root() / "vendor" / "ComfyUI"
+    if dev_path.exists():
+        logger.debug("Using bundled ComfyUI at %s", dev_path)
+        return dev_path
+
+    # 4. Error: ComfyUI not found
+    logger.error("ComfyUI not found in system or development paths")
     raise RuntimeError(
-        f"Bundled ComfyUI not found at {bundled_path}. "
-        "Run 'git submodule update --init' to install."
+        "ComfyUI not found. Expected at:\n"
+        f"  - System: {system_path}\n"
+        f"  - Development: {dev_path}\n"
+        "For development: run 'git submodule update --init'"
     )
+
+
+def _get_effective_data_root() -> Path:
+    """Determine the data root based on installation type.
+
+    - Development mode: Use repo root (if bundled ComfyUI exists)
+    - System install: Use XDG data directory (~/.local/share/switchgen/)
+    """
+    dev_root = _detect_switchgen_root()
+    dev_comfy = dev_root / "vendor" / "ComfyUI"
+
+    if dev_comfy.exists():
+        # Development mode - use repo root for data
+        logger.debug("Development mode: using repo root for data: %s", dev_root)
+        return dev_root
+    else:
+        # System installation - use XDG data directory
+        data_root = _get_data_root()
+        logger.debug("System install: using XDG data root: %s", data_root)
+        return data_root
 
 
 @dataclass
 class PathConfig:
     """Path configuration for ComfyUI and SwitchGen."""
 
-    # ComfyUI installation path (for custom nodes and execution engine)
+    # ComfyUI installation path (for engine and custom nodes)
     comfy_path: Path = field(default_factory=_detect_comfy_path)
 
-    # SwitchGen paths (auto-detected relative to this file)
+    # Data root: where user data lives (models, output, temp, input)
+    # - Development: repo root (e.g., /mnt/storage/repos/switchgen/)
+    # - System install: XDG data dir (e.g., ~/.local/share/switchgen/)
+    data_root: Path = field(default_factory=_get_effective_data_root)
+
+    # Legacy: still needed for some paths
     switchgen_root: Path = field(default_factory=_detect_switchgen_root)
 
+    # User data directories (all under data_root)
     @property
     def output_dir(self) -> Path:
-        return self.switchgen_root / "output"
+        return self.data_root / "output"
 
     @property
     def temp_dir(self) -> Path:
-        return self.switchgen_root / "temp"
+        return self.data_root / "temp"
 
     @property
     def input_dir(self) -> Path:
-        return self.switchgen_root / "input"
+        return self.data_root / "input"
 
     @property
     def workflows_dir(self) -> Path:
-        return self.switchgen_root / "workflows"
+        return self.data_root / "workflows"
 
-    # Model directories (stored in switchgen, not ComfyUI)
+    # Model directories (under data_root/models)
     @property
     def models_dir(self) -> Path:
-        return self.switchgen_root / "models"
+        return self.data_root / "models"
 
     @property
     def checkpoints_dir(self) -> Path:
@@ -98,17 +147,18 @@ class PathConfig:
     def embeddings_dir(self) -> Path:
         return self.models_dir / "embeddings"
 
-    # Custom nodes directory (in SwitchGen root, not ComfyUI)
+    # Custom nodes directory (in ComfyUI installation)
     @property
     def custom_nodes_dir(self) -> Path:
-        return self.switchgen_root / "custom_nodes"
+        return self.comfy_path / "custom_nodes"
 
     def ensure_directories(self) -> None:
-        """Create output, temp, and input directories if they don't exist."""
+        """Create all data directories if they don't exist."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.input_dir.mkdir(parents=True, exist_ok=True)
         self.workflows_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -165,9 +215,9 @@ class Config:
         config = cls()
         config.paths.ensure_directories()
         logger.info(
-            "Configuration loaded: root=%s, comfy=%s",
-            config.paths.switchgen_root,
+            "Configuration loaded: comfy=%s, data=%s",
             config.paths.comfy_path,
+            config.paths.data_root,
         )
         return config
 

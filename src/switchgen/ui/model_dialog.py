@@ -62,6 +62,30 @@ class ModelDownloadDialog(Adw.Dialog):
         header.set_show_end_title_buttons(True)
         main_box.append(header)
 
+        # Progress section - ABOVE scroll area so always visible
+        self.progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.progress_box.set_margin_start(16)
+        self.progress_box.set_margin_end(16)
+        self.progress_box.set_margin_top(8)
+        self.progress_box.set_margin_bottom(8)
+        self.progress_box.set_visible(False)
+        main_box.append(self.progress_box)
+
+        # Progress info row with cancel button
+        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.progress_box.append(progress_row)
+
+        self.progress_label = Gtk.Label(label="", xalign=0, hexpand=True)
+        progress_row.append(self.progress_label)
+
+        self.cancel_button = Gtk.Button(label="Cancel")
+        self.cancel_button.add_css_class("destructive-action")
+        self.cancel_button.connect("clicked", self._on_cancel_clicked)
+        progress_row.append(self.cancel_button)
+
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_box.append(self.progress_bar)
+
         # Scrolled content
         scroll = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -148,27 +172,6 @@ class ModelDownloadDialog(Adw.Dialog):
             for model in models:
                 row = self._create_model_row(model)
                 list_box.append(row)
-
-        # Progress section at bottom
-        self.progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.progress_box.set_margin_top(16)
-        self.progress_box.set_visible(False)
-        content_box.append(self.progress_box)
-
-        # Progress info row with cancel button
-        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.progress_box.append(progress_row)
-
-        self.progress_label = Gtk.Label(label="", xalign=0, hexpand=True)
-        progress_row.append(self.progress_label)
-
-        self.cancel_button = Gtk.Button(label="Cancel")
-        self.cancel_button.add_css_class("destructive-action")
-        self.cancel_button.connect("clicked", self._on_cancel_clicked)
-        progress_row.append(self.cancel_button)
-
-        self.progress_bar = Gtk.ProgressBar()
-        self.progress_box.append(self.progress_bar)
 
         # Store current download model for retry
         self._current_download_model: Optional[ModelInfo] = None
