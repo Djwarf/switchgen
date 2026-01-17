@@ -85,8 +85,8 @@ def _configure_paths(config: Config) -> Any:
     """Configure ComfyUI's folder_paths for model discovery."""
     import folder_paths
 
-    # Models are stored in switchgen's folder, not ComfyUI's
-    models_base = config.paths.switchgen_root
+    # Models are stored in the data root (XDG or repo root depending on install type)
+    models_base = config.paths.data_root
 
     # Model type paths - ComfyUI expects these to be configured
     model_paths = {

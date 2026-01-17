@@ -186,7 +186,9 @@ class ModelDownloader:
             headers = build_hf_headers()
 
             # Start download with streaming
-            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            # Use tuple timeout: (connect_timeout, read_timeout)
+            # Read timeout is per-chunk, not total, so 60s is plenty
+            response = requests.get(url, headers=headers, stream=True, timeout=(30, 60), allow_redirects=True)
             response.raise_for_status()
 
             # Get total size from headers
@@ -200,7 +202,18 @@ class ModelDownloader:
             last_update_time = start_time
             last_bytes = 0
             smoothed_speed = 0.0
-            chunk_size = 8192  # 8KB chunks
+            chunk_size = 1024 * 1024  # 1MB chunks for faster downloads
+
+            logger.info("Download starting: %s (%.1f MB)", model_info.name, total_size / (1024*1024))
+
+            # Initial progress callback
+            if progress_callback:
+                progress_callback(DownloadProgress(
+                    model_id=model_info.id,
+                    downloaded_bytes=0,
+                    total_bytes=total_size,
+                    speed_bps=0,
+                ))
 
             with open(temp_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
@@ -235,6 +248,19 @@ class ModelDownloader:
                                 total_bytes=total_size,
                                 speed_bps=smoothed_speed,
                             ))
+
+            # Verify download completed
+            if not temp_path.exists():
+                raise RuntimeError(f"Download failed: temp file not created at {temp_path}")
+
+            actual_size = temp_path.stat().st_size
+            if actual_size == 0:
+                temp_path.unlink()
+                raise RuntimeError("Download failed: file is empty")
+
+            if total_size > 0 and actual_size < total_size * 0.99:  # Allow 1% tolerance
+                temp_path.unlink()
+                raise RuntimeError(f"Download incomplete: got {actual_size} bytes, expected {total_size}")
 
             # Rename temp file to final path
             if target_path.exists():
