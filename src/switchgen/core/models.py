@@ -17,6 +17,13 @@ class ModelType(Enum):
     UPSCALER = "upscale_models"
 
 
+class QualityTier(Enum):
+    """Quality tier for models."""
+    STARTER = "starter"      # Good for beginners, lower requirements
+    STANDARD = "standard"    # Balanced quality and performance
+    HIGH = "high"           # Best quality, higher requirements
+
+
 @dataclass
 class ModelInfo:
     """Information about a downloadable model."""
@@ -26,9 +33,14 @@ class ModelInfo:
     repo_id: str            # HuggingFace repo (e.g., "openai/clip-vit-large-patch14")
     filename: str           # File in repo to download
     size_mb: int            # Approximate size in MB
-    description: str
+    description: str        # Short description
     local_filename: Optional[str] = None  # Override local filename (default: same as filename)
     required_for: list[str] = field(default_factory=list)  # Workflow types that need it
+    # Beginner-friendly fields
+    vram_gb: float = 4.0    # Minimum VRAM required in GB
+    quality_tier: QualityTier = QualityTier.STANDARD
+    recommended: bool = False  # Show as recommended for beginners
+    tips: str = ""          # Usage tips for beginners
 
     def get_local_filename(self) -> str:
         """Get the filename to use locally."""
@@ -48,8 +60,11 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="model.safetensors",
         local_filename="clip_vit_l.safetensors",
         size_mb=890,
-        description="Vision encoder for 3D workflows (stable_zero123)",
+        description="Required for 3D view generation",
         required_for=["3d"],
+        vram_gb=2.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="This is automatically used by the 3D workflow. Download it along with Stable Zero123.",
     ),
 
     # =========================================================================
@@ -63,12 +78,15 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="model.safetensors",
         local_filename="t5-base.safetensors",
         size_mb=850,
-        description="Text encoder for audio generation (stable-audio)",
+        description="Required for audio generation",
         required_for=["audio"],
+        vram_gb=2.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="This is automatically used by the Audio workflow. Download it along with Stable Audio.",
     ),
 
     # =========================================================================
-    # Checkpoints - SD 1.5
+    # Checkpoints - SD 1.5 (Beginner Friendly)
     # =========================================================================
     "sd15_base": ModelInfo(
         id="sd15_base",
@@ -77,8 +95,12 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stable-diffusion-v1-5/stable-diffusion-v1-5",
         filename="v1-5-pruned-emaonly.safetensors",
         size_mb=4270,
-        description="Base SD 1.5 model for text2img, img2img",
+        description="Best for beginners - fast, low VRAM, great results",
         required_for=["text2img", "img2img"],
+        vram_gb=4.0,
+        quality_tier=QualityTier.STARTER,
+        recommended=True,
+        tips="Start here! Works on most GPUs (4GB+ VRAM). Great for learning prompts and settings. Use 512x512 for best results.",
     ),
     "sd15_inpaint": ModelInfo(
         id="sd15_inpaint",
@@ -87,12 +109,15 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stable-diffusion-v1-5/stable-diffusion-inpainting",
         filename="sd-v1-5-inpainting.ckpt",
         size_mb=4270,
-        description="Inpainting model for filling masked regions",
+        description="Edit parts of images - remove or replace objects",
         required_for=["inpaint"],
+        vram_gb=4.0,
+        quality_tier=QualityTier.STARTER,
+        tips="Use with the Inpainting workflow. Paint white over areas you want to change, then describe what should appear there.",
     ),
 
     # =========================================================================
-    # Checkpoints - SDXL
+    # Checkpoints - SDXL (Higher Quality)
     # =========================================================================
     "sdxl_base": ModelInfo(
         id="sdxl_base",
@@ -101,8 +126,11 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stabilityai/stable-diffusion-xl-base-1.0",
         filename="sd_xl_base_1.0.safetensors",
         size_mb=6940,
-        description="High quality text2img with better prompt following",
+        description="Higher quality images, better text and faces",
         required_for=["text2img"],
+        vram_gb=8.0,
+        quality_tier=QualityTier.HIGH,
+        tips="Produces stunning 1024x1024 images. Needs 8GB+ VRAM. Better at understanding complex prompts and rendering text in images.",
     ),
     "sdxl_refiner": ModelInfo(
         id="sdxl_refiner",
@@ -111,7 +139,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stabilityai/stable-diffusion-xl-refiner-1.0",
         filename="sd_xl_refiner_1.0.safetensors",
         size_mb=6080,
-        description="Refiner for SDXL to improve final quality",
+        description="Optional add-on to enhance SDXL output details",
+        vram_gb=8.0,
+        quality_tier=QualityTier.HIGH,
+        tips="Advanced: Use after SDXL base to add extra detail. Not required for most uses - the base model alone produces great results.",
     ),
 
     # =========================================================================
@@ -124,8 +155,11 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stabilityai/stable-zero123",
         filename="stable_zero123.ckpt",
         size_mb=4900,
-        description="Generate novel 3D views from a single image",
+        description="Create 3D views of objects from a single photo",
         required_for=["3d"],
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Upload a photo of an object (ideally on a plain background) and rotate the camera around it. Also requires CLIP ViT-L model.",
     ),
 
     # =========================================================================
@@ -139,12 +173,15 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="model.safetensors",
         local_filename="stable-audio-open-1.0.safetensors",
         size_mb=4850,
-        description="Generate audio from text descriptions",
+        description="Generate music and sound effects from text",
         required_for=["audio"],
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Describe sounds like 'upbeat electronic music' or 'rain on a window'. Also requires the T5 Base text encoder.",
     ),
 
     # =========================================================================
-    # ControlNet Models (SD 1.5)
+    # ControlNet Models (SD 1.5) - Advanced
     # =========================================================================
     "controlnet_canny": ModelInfo(
         id="controlnet_canny",
@@ -154,7 +191,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="diffusion_pytorch_model.safetensors",
         local_filename="control_v11p_sd15_canny.safetensors",
         size_mb=1450,
-        description="Edge-guided generation using Canny edge detection",
+        description="Guide generation with edge outlines",
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Advanced: Extracts edges from your image and generates new content following those lines. Great for architectural drawings.",
     ),
     "controlnet_depth": ModelInfo(
         id="controlnet_depth",
@@ -164,7 +204,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="diffusion_pytorch_model.safetensors",
         local_filename="control_v11f1p_sd15_depth.safetensors",
         size_mb=1450,
-        description="Depth-guided generation for 3D-aware compositions",
+        description="Guide generation with depth maps",
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Advanced: Preserves the 3D layout of a scene while changing its content. Objects stay the same distance from camera.",
     ),
     "controlnet_openpose": ModelInfo(
         id="controlnet_openpose",
@@ -174,7 +217,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="diffusion_pytorch_model.safetensors",
         local_filename="control_v11p_sd15_openpose.safetensors",
         size_mb=1450,
-        description="Pose-guided generation using skeleton detection",
+        description="Guide generation with body poses",
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Advanced: Detects human poses and generates new people in the same position. Perfect for consistent character poses.",
     ),
     "controlnet_scribble": ModelInfo(
         id="controlnet_scribble",
@@ -184,7 +230,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         filename="diffusion_pytorch_model.safetensors",
         local_filename="control_v11p_sd15_scribble.safetensors",
         size_mb=1450,
-        description="Generate from rough sketches and scribbles",
+        description="Turn rough sketches into detailed images",
+        vram_gb=6.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Advanced: Draw a simple sketch and describe what you want - it fills in all the details while following your drawing.",
     ),
 
     # =========================================================================
@@ -197,7 +246,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="ai-forever/Real-ESRGAN",
         filename="RealESRGAN_x4.pth",
         size_mb=64,
-        description="4x image upscaling with enhanced details",
+        description="Make images 4x larger with enhanced details",
+        vram_gb=2.0,
+        quality_tier=QualityTier.STANDARD,
+        tips="Great for enlarging your generated images for printing or sharing. Small download, big impact!",
     ),
 
     # =========================================================================
@@ -210,7 +262,10 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         repo_id="stabilityai/sdxl-vae",
         filename="sdxl_vae.safetensors",
         size_mb=335,
-        description="VAE for SDXL models with better color reproduction",
+        description="Improves SDXL color accuracy (optional)",
+        vram_gb=1.0,
+        quality_tier=QualityTier.HIGH,
+        tips="Optional upgrade for SDXL. Can reduce color banding in gradients. Most users won't need this.",
     ),
 }
 
@@ -218,6 +273,11 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
 def get_models_by_type(model_type: ModelType) -> list[ModelInfo]:
     """Get all models of a specific type."""
     return [m for m in MODEL_CATALOG.values() if m.type == model_type]
+
+
+def get_recommended_models() -> list[ModelInfo]:
+    """Get models marked as recommended for beginners."""
+    return [m for m in MODEL_CATALOG.values() if m.recommended]
 
 
 def get_required_models(workflow_type: str) -> list[ModelInfo]:

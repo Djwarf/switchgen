@@ -12,10 +12,21 @@ except (ImportError, ValueError):
     pass
 
 from ..core.models import (
-    ModelInfo, ModelType, MODEL_CATALOG,
-    get_models_by_type, is_model_installed,
+    ModelInfo, ModelType, MODEL_CATALOG, QualityTier,
+    get_models_by_type, get_recommended_models, is_model_installed,
 )
 from ..core.downloader import ModelDownloader, DownloadProgress, DownloadResult
+
+
+# Section descriptions for beginners
+SECTION_DESCRIPTIONS = {
+    ModelType.CHECKPOINT: "Main AI models that generate images. You need at least one to get started.",
+    ModelType.VAE: "Optional image quality enhancers. Not needed for beginners.",
+    ModelType.CLIP_VISION: "Required by some specialized workflows like 3D generation.",
+    ModelType.TEXT_ENCODER: "Required by some specialized workflows like audio generation.",
+    ModelType.CONTROLNET: "Advanced tools to guide image generation. Learn the basics first.",
+    ModelType.UPSCALER: "Make your generated images larger without losing quality.",
+}
 
 
 class ModelDownloadDialog(Adw.Dialog):
@@ -71,7 +82,19 @@ class ModelDownloadDialog(Adw.Dialog):
         )
         content_box.append(space_label)
 
-        # Group models by type
+        # =====================================================================
+        # GETTING STARTED SECTION
+        # =====================================================================
+        recommended = get_recommended_models()
+        if recommended:
+            # Check if any recommended models are not installed
+            has_uninstalled = any(not is_model_installed(m, self.models_dir) for m in recommended)
+            if has_uninstalled:
+                self._build_getting_started_section(content_box, recommended)
+
+        # =====================================================================
+        # MODEL SECTIONS BY TYPE
+        # =====================================================================
         type_order = [
             ModelType.CHECKPOINT,
             ModelType.CLIP_VISION,
@@ -86,15 +109,30 @@ class ModelDownloadDialog(Adw.Dialog):
             if not models:
                 continue
 
-            # Section header
+            # Section header with description
             type_name = model_type.value.replace("_", " ").upper()
+            header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            header_box.set_margin_top(12)
+
             header_label = Gtk.Label(
                 label=type_name,
                 xalign=0,
                 css_classes=["heading"],
             )
-            header_label.set_margin_top(8)
-            content_box.append(header_label)
+            header_box.append(header_label)
+
+            # Add section description for beginners
+            if model_type in SECTION_DESCRIPTIONS:
+                desc_label = Gtk.Label(
+                    label=SECTION_DESCRIPTIONS[model_type],
+                    xalign=0,
+                    css_classes=["dim-label"],
+                    wrap=True,
+                    wrap_mode=Pango.WrapMode.WORD_CHAR,
+                )
+                header_box.append(desc_label)
+
+            content_box.append(header_box)
 
             # Model list for this type
             list_box = Gtk.ListBox(
@@ -119,52 +157,160 @@ class ModelDownloadDialog(Adw.Dialog):
         self.progress_bar = Gtk.ProgressBar()
         self.progress_box.append(self.progress_bar)
 
-    def _create_model_row(self, model: ModelInfo) -> Gtk.ListBoxRow:
-        """Create a row for a model."""
+    def _build_getting_started_section(self, content_box: Gtk.Box, recommended: list[ModelInfo]):
+        """Build the Getting Started section for new users."""
+        # Frame with special styling
+        frame = Gtk.Frame()
+        frame.add_css_class("view")
+        frame_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        frame_box.set_margin_start(16)
+        frame_box.set_margin_end(16)
+        frame_box.set_margin_top(16)
+        frame_box.set_margin_bottom(16)
+        frame.set_child(frame_box)
+
+        # Title
+        title = Gtk.Label(
+            label="Getting Started",
+            xalign=0,
+            css_classes=["title-2"],
+        )
+        frame_box.append(title)
+
+        # Welcome text
+        welcome = Gtk.Label(
+            label="Welcome! To generate images, you need to download at least one model. "
+                  "We recommend starting with Stable Diffusion 1.5 - it's fast, works on most computers, "
+                  "and produces great results.",
+            xalign=0,
+            wrap=True,
+            wrap_mode=Pango.WrapMode.WORD_CHAR,
+        )
+        frame_box.append(welcome)
+
+        # Recommended models list
+        list_box = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            css_classes=["boxed-list"],
+        )
+        frame_box.append(list_box)
+
+        for model in recommended:
+            if not is_model_installed(model, self.models_dir):
+                row = self._create_model_row(model, highlight=True)
+                list_box.append(row)
+
+        content_box.append(frame)
+
+    def _create_model_row(self, model: ModelInfo, highlight: bool = False) -> Gtk.ListBoxRow:
+        """Create a row for a model.
+
+        Args:
+            model: The model info
+            highlight: If True, show with emphasis (for recommended section)
+        """
         row = Gtk.ListBoxRow()
 
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         box.set_margin_start(12)
         box.set_margin_end(12)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
         row.set_child(box)
 
         # Info column
-        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         info_box.set_hexpand(True)
         box.append(info_box)
 
+        # Name row with badges
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info_box.append(name_row)
+
         name_label = Gtk.Label(label=model.name, xalign=0)
         name_label.set_css_classes(["heading"])
-        info_box.append(name_label)
+        name_row.append(name_label)
 
+        # Add badges
+        if model.recommended:
+            badge = Gtk.Label(label="Recommended")
+            badge.add_css_class("success")
+            badge.add_css_class("caption")
+            name_row.append(badge)
+
+        if model.quality_tier == QualityTier.HIGH:
+            badge = Gtk.Label(label="High Quality")
+            badge.add_css_class("accent")
+            badge.add_css_class("caption")
+            name_row.append(badge)
+        elif model.quality_tier == QualityTier.STARTER:
+            badge = Gtk.Label(label="Beginner Friendly")
+            badge.add_css_class("caption")
+            name_row.append(badge)
+
+        # Description
         desc_label = Gtk.Label(
             label=model.description,
             xalign=0,
             css_classes=["dim-label"],
-            ellipsize=Pango.EllipsizeMode.END,
+            wrap=True,
+            wrap_mode=Pango.WrapMode.WORD_CHAR,
         )
         info_box.append(desc_label)
 
-        # Size
+        # Tips (if available)
+        if model.tips:
+            tips_label = Gtk.Label(
+                label=model.tips,
+                xalign=0,
+                css_classes=["caption"],
+                wrap=True,
+                wrap_mode=Pango.WrapMode.WORD_CHAR,
+            )
+            tips_label.set_margin_top(4)
+            info_box.append(tips_label)
+
+        # Right side: size, VRAM, status, button
+        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        right_box.set_valign(Gtk.Align.CENTER)
+        box.append(right_box)
+
+        # Size and VRAM info
+        specs_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        specs_box.set_halign(Gtk.Align.END)
+        right_box.append(specs_box)
+
         size_label = Gtk.Label(
-            label=f"{model.size_mb} MB",
-            css_classes=["dim-label"],
+            label=f"{model.size_mb / 1024:.1f} GB" if model.size_mb >= 1024 else f"{model.size_mb} MB",
+            css_classes=["dim-label", "caption"],
         )
-        size_label.set_margin_end(8)
-        box.append(size_label)
+        size_label.set_tooltip_text("Download size")
+        specs_box.append(size_label)
+
+        vram_label = Gtk.Label(
+            label=f"{model.vram_gb:.0f}GB VRAM",
+            css_classes=["dim-label", "caption"],
+        )
+        vram_label.set_tooltip_text("Minimum GPU memory required")
+        specs_box.append(vram_label)
+
+        # Status and button row
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        button_box.set_halign(Gtk.Align.END)
+        right_box.append(button_box)
 
         # Status label
         status_label = Gtk.Label(label="")
         status_label.set_width_chars(10)
-        box.append(status_label)
+        button_box.append(status_label)
         self._status_labels[model.id] = status_label
 
         # Download button
         button = Gtk.Button(label="Download")
         button.connect("clicked", self._on_download_clicked, model)
-        box.append(button)
+        if highlight:
+            button.add_css_class("suggested-action")
+        button_box.append(button)
         self._download_buttons[model.id] = button
 
         return row
