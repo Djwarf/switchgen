@@ -829,21 +829,21 @@ class MainWindow(Adw.ApplicationWindow):
                 checkpoint=checkpoint, prompt=prompt, negative_prompt=negative,
                 width=int(self.width_spin.get_value()),
                 height=int(self.height_spin.get_value()),
-                steps=steps, cfg=cfg, seed=seed, capture_id="main",
+                steps=steps, cfg=cfg, seed=seed, capture_id="default",
             )
         elif self._current_workflow == WorkflowType.IMG2IMG:
             workflow, actual_seed = build_img2img_memory_workflow(
                 checkpoint=checkpoint, image_path=self._input_image_path,
                 prompt=prompt, negative_prompt=negative,
                 denoise=self.denoise_spin.get_value(),
-                steps=steps, cfg=cfg, seed=seed, capture_id="main",
+                steps=steps, cfg=cfg, seed=seed, capture_id="default",
             )
         elif self._current_workflow == WorkflowType.INPAINT:
             workflow, actual_seed = build_inpaint_workflow(
                 checkpoint=checkpoint, image_path=self._input_image_path,
                 mask_path=self._mask_image_path, prompt=prompt, negative_prompt=negative,
                 denoise=self.denoise_spin.get_value(),
-                steps=steps, cfg=cfg, seed=seed, capture_id="main",
+                steps=steps, cfg=cfg, seed=seed, capture_id="default",
             )
         elif self._current_workflow == WorkflowType.AUDIO:
             workflow, actual_seed = build_audio_workflow(
@@ -856,7 +856,7 @@ class MainWindow(Adw.ApplicationWindow):
                 checkpoint=checkpoint, image_path=self._input_image_path,
                 elevation=self.elev_spin.get_value(),
                 azimuth=self.azim_spin.get_value(),
-                steps=steps, cfg=cfg, seed=seed, capture_id="main",
+                steps=steps, cfg=cfg, seed=seed, capture_id="default",
             )
 
         if not workflow:
@@ -887,15 +887,26 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_complete(self, job: GenerationJob) -> bool:
+        logger.info("_on_complete called: result=%s", job.result is not None)
+        if job.result:
+            logger.info("  success=%s, images=%s, error=%s",
+                       job.result.success,
+                       job.result.images is not None,
+                       job.result.error)
         if job.result and job.result.success and job.result.images is not None:
-            images = tensor_to_pil(job.result.images)
-            if images:
-                logger.info("Generation completed successfully (images=%d)", len(images))
-                self._show_image(images[0])
-            else:
-                logger.warning("Generation completed but no images produced")
+            try:
+                images = tensor_to_pil(job.result.images)
+                if images:
+                    logger.info("Generation completed successfully (images=%d)", len(images))
+                    self._show_image(images[0])
+                else:
+                    logger.warning("Generation completed but tensor_to_pil returned empty")
+            except Exception as e:
+                logger.error("Error converting images: %s", e, exc_info=True)
         elif job.result and not job.result.success:
             logger.error("Generation failed: %s", job.result.error)
+        else:
+            logger.warning("No result or images in job")
         self._reset_ui()
         return False
 
