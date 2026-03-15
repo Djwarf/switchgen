@@ -15,17 +15,17 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
 
 from .config import get_config
-
 
 # =============================================================================
 # Workflow Type System
 # =============================================================================
 
+
 class WorkflowType(Enum):
     """Available workflow types."""
+
     TEXT2IMG = "text2img"
     IMG2IMG = "img2img"
     INPAINT = "inpaint"
@@ -36,6 +36,7 @@ class WorkflowType(Enum):
 @dataclass
 class WorkflowSpec:
     """Specification for a workflow type."""
+
     type: WorkflowType
     name: str
     description: str
@@ -112,9 +113,7 @@ WORKFLOW_SPECS: dict[WorkflowType, WorkflowSpec] = {
 }
 
 
-def get_models_for_workflow(
-    all_checkpoints: list[str], wf_type: WorkflowType
-) -> list[str]:
+def get_models_for_workflow(all_checkpoints: list[str], wf_type: WorkflowType) -> list[str]:
     """Filter checkpoints to only those compatible with a workflow type."""
     spec = WORKFLOW_SPECS[wf_type]
     if not spec.compatible_models:
@@ -153,6 +152,7 @@ MAX_SEED = 2**32 - 1
 
 class WorkflowError(Exception):
     """Error in workflow handling."""
+
     pass
 
 
@@ -183,7 +183,7 @@ def ensure_seed(seed: int) -> int:
 class WorkflowManager:
     """Manages workflow templates in API format."""
 
-    def __init__(self, templates_dir: Optional[Path] = None):
+    def __init__(self, templates_dir: Path | None = None):
         if templates_dir is None:
             templates_dir = get_config().paths.workflows_dir
         self.templates_dir = templates_dir
@@ -236,15 +236,12 @@ class WorkflowBuilder:
         self._node_counter += 1
         return str(self._node_counter)
 
-    def add_node(self, class_type: str, inputs: dict, node_id: Optional[str] = None) -> str:
+    def add_node(self, class_type: str, inputs: dict, node_id: str | None = None) -> str:
         """Add a node to the workflow."""
         if node_id is None:
             node_id = self._next_id()
 
-        self._nodes[node_id] = {
-            "class_type": class_type,
-            "inputs": inputs
-        }
+        self._nodes[node_id] = {"class_type": class_type, "inputs": inputs}
         return node_id
 
     def link(self, from_node: str, output_index: int) -> list:
@@ -302,61 +299,53 @@ def build_text2img_workflow(
     builder = WorkflowBuilder()
 
     # 1. Load checkpoint
-    ckpt_id = builder.add_node("CheckpointLoaderSimple", {
-        "ckpt_name": checkpoint
-    })
+    ckpt_id = builder.add_node("CheckpointLoaderSimple", {"ckpt_name": checkpoint})
 
     # 2. CLIP encode positive prompt
-    pos_id = builder.add_node("CLIPTextEncode", {
-        "text": prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    pos_id = builder.add_node("CLIPTextEncode", {"text": prompt, "clip": builder.link(ckpt_id, 1)})
 
     # 3. CLIP encode negative prompt
-    neg_id = builder.add_node("CLIPTextEncode", {
-        "text": negative_prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    neg_id = builder.add_node(
+        "CLIPTextEncode", {"text": negative_prompt, "clip": builder.link(ckpt_id, 1)}
+    )
 
     # 4. Empty latent image
-    latent_id = builder.add_node("EmptyLatentImage", {
-        "width": width,
-        "height": height,
-        "batch_size": batch_size
-    })
+    latent_id = builder.add_node(
+        "EmptyLatentImage", {"width": width, "height": height, "batch_size": batch_size}
+    )
 
     # 5. KSampler
-    sampler_id = builder.add_node("KSampler", {
-        "model": builder.link(ckpt_id, 0),
-        "positive": builder.link(pos_id, 0),
-        "negative": builder.link(neg_id, 0),
-        "latent_image": builder.link(latent_id, 0),
-        "seed": seed,
-        "steps": steps,
-        "cfg": cfg,
-        "sampler_name": sampler,
-        "scheduler": scheduler,
-        "denoise": 1.0
-    })
+    sampler_id = builder.add_node(
+        "KSampler",
+        {
+            "model": builder.link(ckpt_id, 0),
+            "positive": builder.link(pos_id, 0),
+            "negative": builder.link(neg_id, 0),
+            "latent_image": builder.link(latent_id, 0),
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": scheduler,
+            "denoise": 1.0,
+        },
+    )
 
     # 6. VAE Decode
-    decode_id = builder.add_node("VAEDecode", {
-        "samples": builder.link(sampler_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    decode_id = builder.add_node(
+        "VAEDecode", {"samples": builder.link(sampler_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 7. Output node - either SaveImage or ReturnToApp
     if save_to_disk:
-        builder.add_node("SaveImage", {
-            "images": builder.link(decode_id, 0),
-            "filename_prefix": "switchgen"
-        })
+        builder.add_node(
+            "SaveImage", {"images": builder.link(decode_id, 0), "filename_prefix": "switchgen"}
+        )
     else:
         # Use our custom ReturnToApp node for in-memory capture (Gotcha #3)
-        builder.add_node("ReturnToApp", {
-            "images": builder.link(decode_id, 0),
-            "capture_id": capture_id
-        })
+        builder.add_node(
+            "ReturnToApp", {"images": builder.link(decode_id, 0), "capture_id": capture_id}
+        )
 
     return builder.build()
 
@@ -446,64 +435,56 @@ def build_img2img_workflow(
     builder = WorkflowBuilder()
 
     # 1. Load checkpoint
-    ckpt_id = builder.add_node("CheckpointLoaderSimple", {
-        "ckpt_name": checkpoint
-    })
+    ckpt_id = builder.add_node("CheckpointLoaderSimple", {"ckpt_name": checkpoint})
 
     # 2. Load image
-    img_id = builder.add_node("LoadImage", {
-        "image": image_path
-    })
+    img_id = builder.add_node("LoadImage", {"image": image_path})
 
     # 3. VAE Encode
-    encode_id = builder.add_node("VAEEncode", {
-        "pixels": builder.link(img_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    encode_id = builder.add_node(
+        "VAEEncode", {"pixels": builder.link(img_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 4. CLIP encode positive prompt
-    pos_id = builder.add_node("CLIPTextEncode", {
-        "text": prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    pos_id = builder.add_node("CLIPTextEncode", {"text": prompt, "clip": builder.link(ckpt_id, 1)})
 
     # 5. CLIP encode negative prompt
-    neg_id = builder.add_node("CLIPTextEncode", {
-        "text": negative_prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    neg_id = builder.add_node(
+        "CLIPTextEncode", {"text": negative_prompt, "clip": builder.link(ckpt_id, 1)}
+    )
 
     # 6. KSampler with denoise < 1.0
-    sampler_id = builder.add_node("KSampler", {
-        "model": builder.link(ckpt_id, 0),
-        "positive": builder.link(pos_id, 0),
-        "negative": builder.link(neg_id, 0),
-        "latent_image": builder.link(encode_id, 0),
-        "seed": seed,
-        "steps": steps,
-        "cfg": cfg,
-        "sampler_name": sampler,
-        "scheduler": scheduler,
-        "denoise": denoise
-    })
+    sampler_id = builder.add_node(
+        "KSampler",
+        {
+            "model": builder.link(ckpt_id, 0),
+            "positive": builder.link(pos_id, 0),
+            "negative": builder.link(neg_id, 0),
+            "latent_image": builder.link(encode_id, 0),
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": scheduler,
+            "denoise": denoise,
+        },
+    )
 
     # 7. VAE Decode
-    decode_id = builder.add_node("VAEDecode", {
-        "samples": builder.link(sampler_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    decode_id = builder.add_node(
+        "VAEDecode", {"samples": builder.link(sampler_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 8. Output node
     if save_to_disk:
-        builder.add_node("SaveImage", {
-            "images": builder.link(decode_id, 0),
-            "filename_prefix": "switchgen_img2img"
-        })
+        builder.add_node(
+            "SaveImage",
+            {"images": builder.link(decode_id, 0), "filename_prefix": "switchgen_img2img"},
+        )
     else:
-        builder.add_node("ReturnToApp", {
-            "images": builder.link(decode_id, 0),
-            "capture_id": capture_id
-        })
+        builder.add_node(
+            "ReturnToApp", {"images": builder.link(decode_id, 0), "capture_id": capture_id}
+        )
 
     return builder.build()
 
@@ -581,71 +562,64 @@ def build_inpaint_workflow(
     builder = WorkflowBuilder()
 
     # 1. Load checkpoint
-    ckpt_id = builder.add_node("CheckpointLoaderSimple", {
-        "ckpt_name": checkpoint
-    })
+    ckpt_id = builder.add_node("CheckpointLoaderSimple", {"ckpt_name": checkpoint})
 
     # 2. Load image
-    img_id = builder.add_node("LoadImage", {
-        "image": image_path
-    })
+    img_id = builder.add_node("LoadImage", {"image": image_path})
 
     # 3. Load mask
-    mask_id = builder.add_node("LoadImage", {
-        "image": mask_path
-    })
+    mask_id = builder.add_node("LoadImage", {"image": mask_path})
 
     # 4. Convert mask image to mask (use alpha or red channel)
-    mask_convert_id = builder.add_node("ImageToMask", {
-        "image": builder.link(mask_id, 0),
-        "channel": "red"
-    })
+    mask_convert_id = builder.add_node(
+        "ImageToMask", {"image": builder.link(mask_id, 0), "channel": "red"}
+    )
 
     # 5. VAE Encode for Inpaint (handles mask embedding)
-    encode_id = builder.add_node("VAEEncodeForInpaint", {
-        "pixels": builder.link(img_id, 0),
-        "vae": builder.link(ckpt_id, 2),
-        "mask": builder.link(mask_convert_id, 0),
-        "grow_mask_by": grow_mask
-    })
+    encode_id = builder.add_node(
+        "VAEEncodeForInpaint",
+        {
+            "pixels": builder.link(img_id, 0),
+            "vae": builder.link(ckpt_id, 2),
+            "mask": builder.link(mask_convert_id, 0),
+            "grow_mask_by": grow_mask,
+        },
+    )
 
     # 6. CLIP encode positive prompt
-    pos_id = builder.add_node("CLIPTextEncode", {
-        "text": prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    pos_id = builder.add_node("CLIPTextEncode", {"text": prompt, "clip": builder.link(ckpt_id, 1)})
 
     # 7. CLIP encode negative prompt
-    neg_id = builder.add_node("CLIPTextEncode", {
-        "text": negative_prompt,
-        "clip": builder.link(ckpt_id, 1)
-    })
+    neg_id = builder.add_node(
+        "CLIPTextEncode", {"text": negative_prompt, "clip": builder.link(ckpt_id, 1)}
+    )
 
     # 8. KSampler
-    sampler_id = builder.add_node("KSampler", {
-        "model": builder.link(ckpt_id, 0),
-        "positive": builder.link(pos_id, 0),
-        "negative": builder.link(neg_id, 0),
-        "latent_image": builder.link(encode_id, 0),
-        "seed": actual_seed,
-        "steps": steps,
-        "cfg": cfg,
-        "sampler_name": sampler,
-        "scheduler": scheduler,
-        "denoise": denoise
-    })
+    sampler_id = builder.add_node(
+        "KSampler",
+        {
+            "model": builder.link(ckpt_id, 0),
+            "positive": builder.link(pos_id, 0),
+            "negative": builder.link(neg_id, 0),
+            "latent_image": builder.link(encode_id, 0),
+            "seed": actual_seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": scheduler,
+            "denoise": denoise,
+        },
+    )
 
     # 9. VAE Decode
-    decode_id = builder.add_node("VAEDecode", {
-        "samples": builder.link(sampler_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    decode_id = builder.add_node(
+        "VAEDecode", {"samples": builder.link(sampler_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 10. Output
-    builder.add_node("ReturnToApp", {
-        "images": builder.link(decode_id, 0),
-        "capture_id": capture_id
-    })
+    builder.add_node(
+        "ReturnToApp", {"images": builder.link(decode_id, 0), "capture_id": capture_id}
+    )
 
     return builder.build(), actual_seed
 
@@ -682,67 +656,61 @@ def build_audio_workflow(
     output_filename = f"switchgen_audio_{actual_seed}"
 
     # 1. Load checkpoint (audio model + VAE)
-    ckpt_id = builder.add_node("CheckpointLoaderSimple", {
-        "ckpt_name": checkpoint
-    })
+    ckpt_id = builder.add_node("CheckpointLoaderSimple", {"ckpt_name": checkpoint})
 
     # 2. Load T5 text encoder separately (stable-audio uses T5-base)
-    clip_id = builder.add_node("CLIPLoader", {
-        "clip_name": "t5-base.safetensors",
-        "type": "stable_audio"
-    })
+    clip_id = builder.add_node(
+        "CLIPLoader", {"clip_name": "t5-base.safetensors", "type": "stable_audio"}
+    )
 
     # 3. CLIP encode positive prompt (using T5)
-    pos_id = builder.add_node("CLIPTextEncode", {
-        "text": prompt,
-        "clip": builder.link(clip_id, 0)
-    })
+    pos_id = builder.add_node("CLIPTextEncode", {"text": prompt, "clip": builder.link(clip_id, 0)})
 
     # 4. CLIP encode negative prompt (using T5)
-    neg_id = builder.add_node("CLIPTextEncode", {
-        "text": negative_prompt,
-        "clip": builder.link(clip_id, 0)
-    })
+    neg_id = builder.add_node(
+        "CLIPTextEncode", {"text": negative_prompt, "clip": builder.link(clip_id, 0)}
+    )
 
     # 5. Empty audio latent
-    latent_id = builder.add_node("EmptyLatentAudio", {
-        "seconds": seconds,
-        "batch_size": 1
-    })
+    latent_id = builder.add_node("EmptyLatentAudio", {"seconds": seconds, "batch_size": 1})
 
     # 6. Audio conditioning (timing)
-    cond_id = builder.add_node("ConditioningStableAudio", {
-        "positive": builder.link(pos_id, 0),
-        "negative": builder.link(neg_id, 0),
-        "seconds_start": 0.0,
-        "seconds_total": seconds
-    })
+    cond_id = builder.add_node(
+        "ConditioningStableAudio",
+        {
+            "positive": builder.link(pos_id, 0),
+            "negative": builder.link(neg_id, 0),
+            "seconds_start": 0.0,
+            "seconds_total": seconds,
+        },
+    )
 
     # 7. KSampler
-    sampler_id = builder.add_node("KSampler", {
-        "model": builder.link(ckpt_id, 0),
-        "positive": builder.link(cond_id, 0),
-        "negative": builder.link(cond_id, 1),
-        "latent_image": builder.link(latent_id, 0),
-        "seed": actual_seed,
-        "steps": steps,
-        "cfg": cfg,
-        "sampler_name": sampler,
-        "scheduler": scheduler,
-        "denoise": 1.0
-    })
+    sampler_id = builder.add_node(
+        "KSampler",
+        {
+            "model": builder.link(ckpt_id, 0),
+            "positive": builder.link(cond_id, 0),
+            "negative": builder.link(cond_id, 1),
+            "latent_image": builder.link(latent_id, 0),
+            "seed": actual_seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": scheduler,
+            "denoise": 1.0,
+        },
+    )
 
     # 8. VAE Decode Audio
-    decode_id = builder.add_node("VAEDecodeAudio", {
-        "samples": builder.link(sampler_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    decode_id = builder.add_node(
+        "VAEDecodeAudio", {"samples": builder.link(sampler_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 9. Save Audio (outputs to file)
-    builder.add_node("SaveAudio", {
-        "audio": builder.link(decode_id, 0),
-        "filename_prefix": output_filename
-    })
+    builder.add_node(
+        "SaveAudio", {"audio": builder.link(decode_id, 0), "filename_prefix": output_filename}
+    )
 
     return builder.build(), actual_seed
 
@@ -783,63 +751,66 @@ def build_3d_zero123_workflow(
     builder = WorkflowBuilder()
 
     # 1. Load checkpoint (includes CLIP vision)
-    ckpt_id = builder.add_node("CheckpointLoaderSimple", {
-        "ckpt_name": checkpoint
-    })
+    ckpt_id = builder.add_node("CheckpointLoaderSimple", {"ckpt_name": checkpoint})
 
     # 2. Load CLIP Vision model (ViT-L/14 required for stable_zero123)
-    clip_vision_id = builder.add_node("CLIPVisionLoader", {
-        "clip_name": "clip_vit_l.safetensors"  # CLIP ViT-L/14 vision model
-    })
+    clip_vision_id = builder.add_node(
+        "CLIPVisionLoader",
+        {
+            "clip_name": "clip_vit_l.safetensors"  # CLIP ViT-L/14 vision model
+        },
+    )
 
     # 3. Load input image
-    img_id = builder.add_node("LoadImage", {
-        "image": image_path
-    })
+    img_id = builder.add_node("LoadImage", {"image": image_path})
 
     # 4. StableZero123 Conditioning
-    cond_id = builder.add_node("StableZero123_Conditioning", {
-        "clip_vision": builder.link(clip_vision_id, 0),
-        "init_image": builder.link(img_id, 0),
-        "vae": builder.link(ckpt_id, 2),
-        "width": width,
-        "height": height,
-        "batch_size": 1,
-        "elevation": elevation,
-        "azimuth": azimuth
-    })
+    cond_id = builder.add_node(
+        "StableZero123_Conditioning",
+        {
+            "clip_vision": builder.link(clip_vision_id, 0),
+            "init_image": builder.link(img_id, 0),
+            "vae": builder.link(ckpt_id, 2),
+            "width": width,
+            "height": height,
+            "batch_size": 1,
+            "elevation": elevation,
+            "azimuth": azimuth,
+        },
+    )
 
     # 5. KSampler
-    sampler_id = builder.add_node("KSampler", {
-        "model": builder.link(ckpt_id, 0),
-        "positive": builder.link(cond_id, 0),
-        "negative": builder.link(cond_id, 1),
-        "latent_image": builder.link(cond_id, 2),
-        "seed": actual_seed,
-        "steps": steps,
-        "cfg": cfg,
-        "sampler_name": sampler,
-        "scheduler": scheduler,
-        "denoise": 1.0
-    })
+    sampler_id = builder.add_node(
+        "KSampler",
+        {
+            "model": builder.link(ckpt_id, 0),
+            "positive": builder.link(cond_id, 0),
+            "negative": builder.link(cond_id, 1),
+            "latent_image": builder.link(cond_id, 2),
+            "seed": actual_seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": scheduler,
+            "denoise": 1.0,
+        },
+    )
 
     # 6. VAE Decode
-    decode_id = builder.add_node("VAEDecode", {
-        "samples": builder.link(sampler_id, 0),
-        "vae": builder.link(ckpt_id, 2)
-    })
+    decode_id = builder.add_node(
+        "VAEDecode", {"samples": builder.link(sampler_id, 0), "vae": builder.link(ckpt_id, 2)}
+    )
 
     # 7. Output
-    builder.add_node("ReturnToApp", {
-        "images": builder.link(decode_id, 0),
-        "capture_id": capture_id
-    })
+    builder.add_node(
+        "ReturnToApp", {"images": builder.link(decode_id, 0), "capture_id": capture_id}
+    )
 
     return builder.build(), actual_seed
 
 
 # Global workflow manager
-_manager: Optional[WorkflowManager] = None
+_manager: WorkflowManager | None = None
 
 
 def get_workflow_manager() -> WorkflowManager:

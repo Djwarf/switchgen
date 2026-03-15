@@ -1,6 +1,5 @@
 """Unit tests for switchgen.core.queue module."""
 
-import pytest
 import time
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +20,7 @@ class TestJobStatus:
     def test_all_statuses_count(self):
         """Should have exactly 5 status values."""
         from switchgen.core.queue import JobStatus
+
         assert len(JobStatus) == 5
 
 
@@ -53,15 +53,38 @@ class TestGenerationJob:
         # Higher priority job should be "less than" (come first in queue)
         assert high_priority < low_priority
 
-    def test_same_priority_comparison(self, sample_workflow):
-        """Jobs with same priority should not be less than each other."""
+    def test_same_priority_older_first(self, sample_workflow):
+        """Jobs with same priority should order older first (FIFO tiebreaker)."""
         from switchgen.core.queue import GenerationJob
 
         job1 = GenerationJob(workflow=sample_workflow, priority=5)
+        time.sleep(0.01)  # Ensure different created_at
         job2 = GenerationJob(workflow=sample_workflow, priority=5)
 
-        assert not (job1 < job2)
+        # Older job (job1) should come first (be "less than")
+        assert job1 < job2
         assert not (job2 < job1)
+
+    def test_priority_queue_ordering(self, sample_workflow):
+        """PriorityQueue should dequeue higher priority jobs first."""
+        from queue import PriorityQueue
+
+        from switchgen.core.queue import GenerationJob
+
+        pq = PriorityQueue()
+        low = GenerationJob(workflow=sample_workflow, priority=1)
+        mid = GenerationJob(workflow=sample_workflow, priority=5)
+        high = GenerationJob(workflow=sample_workflow, priority=10)
+
+        # Add in arbitrary order
+        pq.put(low)
+        pq.put(high)
+        pq.put(mid)
+
+        # Should come out highest priority first
+        assert pq.get().priority == 10
+        assert pq.get().priority == 5
+        assert pq.get().priority == 1
 
 
 class TestGenerationQueue:
@@ -69,7 +92,7 @@ class TestGenerationQueue:
 
     def test_add_returns_job_id(self, mock_engine, sample_workflow):
         """add should return the job ID."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob
+        from switchgen.core.queue import GenerationJob, GenerationQueue
 
         queue = GenerationQueue(mock_engine)
         job = GenerationJob(workflow=sample_workflow)
@@ -80,7 +103,7 @@ class TestGenerationQueue:
 
     def test_add_increments_queue_size(self, mock_engine, sample_workflow):
         """add should increment queue size."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob
+        from switchgen.core.queue import GenerationJob, GenerationQueue
 
         queue = GenerationQueue(mock_engine)
         initial_size = queue.queue_size
@@ -105,7 +128,7 @@ class TestGenerationQueue:
 
     def test_get_job_returns_job(self, mock_engine, sample_workflow):
         """get_job should return the job for valid ID."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob
+        from switchgen.core.queue import GenerationJob, GenerationQueue
 
         queue = GenerationQueue(mock_engine)
         job = GenerationJob(workflow=sample_workflow)
@@ -127,7 +150,7 @@ class TestGenerationQueue:
 
     def test_cancel_queued_job(self, mock_engine, sample_workflow):
         """cancel should mark queued job as cancelled."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob, JobStatus
+        from switchgen.core.queue import GenerationJob, GenerationQueue, JobStatus
 
         queue = GenerationQueue(mock_engine)
         job = GenerationJob(workflow=sample_workflow)
@@ -150,7 +173,7 @@ class TestGenerationQueue:
 
     def test_clear_cancels_queued_jobs(self, mock_engine, sample_workflow):
         """clear should cancel all queued jobs."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob, JobStatus
+        from switchgen.core.queue import GenerationJob, GenerationQueue, JobStatus
 
         queue = GenerationQueue(mock_engine)
         job1 = GenerationJob(workflow=sample_workflow)
@@ -206,7 +229,7 @@ class TestGenerationQueue:
 
     def test_queue_size_property(self, mock_engine, sample_workflow):
         """queue_size should reflect number of queued jobs."""
-        from switchgen.core.queue import GenerationQueue, GenerationJob
+        from switchgen.core.queue import GenerationJob, GenerationQueue
 
         queue = GenerationQueue(mock_engine)
 
@@ -217,6 +240,31 @@ class TestGenerationQueue:
 
         queue.add(GenerationJob(workflow=sample_workflow))
         assert queue.queue_size == 2
+
+    def test_history_cleanup(self, mock_engine, sample_workflow):
+        """Should purge oldest completed jobs when max_history exceeded."""
+        from switchgen.core.queue import GenerationJob, GenerationQueue, JobStatus
+
+        queue = GenerationQueue(mock_engine, max_history=3)
+
+        # Add 5 jobs and mark them completed
+        jobs = []
+        for i in range(5):
+            job = GenerationJob(workflow=sample_workflow)
+            queue.add(job)
+            job.status = JobStatus.COMPLETED
+            job.completed_at = time.time() + i  # Increasing timestamps
+            jobs.append(job)
+
+        queue._cleanup_history()
+
+        # Should have pruned down to 3
+        assert len(queue._jobs) == 3
+        # The 3 newest should remain
+        remaining_ids = set(queue._jobs.keys())
+        assert jobs[2].job_id in remaining_ids
+        assert jobs[3].job_id in remaining_ids
+        assert jobs[4].job_id in remaining_ids
 
 
 class TestGenerateSyncFunction:
@@ -229,8 +277,9 @@ class TestGenerateSyncFunction:
         mock_engine.execute.return_value = mock_result
 
         # get_engine is imported inside generate_sync, so we patch where it's looked up
-        with patch('switchgen.core.engine.get_engine', return_value=mock_engine):
+        with patch("switchgen.core.engine.get_engine", return_value=mock_engine):
             from switchgen.core.queue import generate_sync
+
             result = generate_sync(sample_workflow)
 
         mock_engine.initialize.assert_called_once()

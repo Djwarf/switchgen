@@ -19,17 +19,18 @@ os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 #    (essential when switching between different image sizes/models)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import sys
 import asyncio
-from pathlib import Path
-from typing import Any, Callable, Optional
+import sys
 import threading
+from collections.abc import Callable
+from typing import Any
 
 from .config import Config, get_config
 
 
 class ComfyInitError(Exception):
     """Error during ComfyUI initialization."""
+
     pass
 
 
@@ -49,7 +50,7 @@ class ComfyContext:
 _captured_images: dict[str, Any] = {}
 _captured_images_lock = threading.Lock()
 
-_comfy_context: Optional[ComfyContext] = None
+_comfy_context: ComfyContext | None = None
 _original_argv: list[str] = []
 
 
@@ -71,7 +72,7 @@ def _hijack_argv() -> list[str]:
 def _restore_argv() -> None:
     """Restore original argv after ComfyUI imports are done."""
     global _original_argv
-    sys.argv = [sys.argv[0]] + _original_argv
+    sys.argv = [sys.argv[0], *_original_argv]
 
 
 def _add_comfy_to_path(config: Config) -> None:
@@ -143,7 +144,7 @@ def _register_custom_output_node() -> None:
                 },
                 "optional": {
                     "capture_id": ("STRING", {"default": "default"}),
-                }
+                },
             }
 
         RETURN_TYPES = ()
@@ -189,7 +190,7 @@ def _load_node_registry(config: Config, load_custom_nodes: bool = True) -> dict:
     if load_custom_nodes:
         try:
             # init_extra_nodes() loads BOTH custom_nodes AND comfy_extras
-            if hasattr(nodes, 'init_extra_nodes'):
+            if hasattr(nodes, "init_extra_nodes"):
                 print("SwitchGen: Loading extra nodes (async)...")
 
                 async def load_nodes():
@@ -241,13 +242,11 @@ def _setup_progress_callback() -> Any:
     we register a callback via comfy.utils.set_progress_bar_global_hook.
     """
     import comfy.utils
+
     return comfy.utils
 
 
-def initialize_comfy(
-    config: Optional[Config] = None,
-    load_custom_nodes: bool = True
-) -> ComfyContext:
+def initialize_comfy(config: Config | None = None, load_custom_nodes: bool = True) -> ComfyContext:
     """Full ComfyUI initialization for headless use.
 
     This handles all critical gotchas:
@@ -296,7 +295,7 @@ def initialize_comfy(
         _hijack_argv()
 
         # Now safe to import comfy modules
-        import comfy.cli_args  # This parses argv, but we've hidden our args
+        import comfy.cli_args  # noqa: F401 (side-effect: parses argv, we've hidden our args)
 
         # Step 2: Configure paths
         print("SwitchGen: Configuring paths...")
@@ -327,12 +326,11 @@ def initialize_comfy(
     except ImportError as e:
         _restore_argv()  # Restore even on error
         raise ComfyInitError(
-            f"Failed to import ComfyUI. Is it installed at {config.paths.comfy_path}? "
-            f"Error: {e}"
-        )
+            f"Failed to import ComfyUI. Is it installed at {config.paths.comfy_path}? Error: {e}"
+        ) from e
     except Exception as e:
         _restore_argv()
-        raise ComfyInitError(f"ComfyUI initialization failed: {e}")
+        raise ComfyInitError(f"ComfyUI initialization failed: {e}") from e
 
 
 def get_comfy_context() -> ComfyContext:
@@ -366,7 +364,7 @@ def clear_progress_callback() -> None:
     ctx.comfy_utils.set_progress_bar_global_hook(None)
 
 
-def get_captured_image(capture_id: str = "default") -> Optional[Any]:
+def get_captured_image(capture_id: str = "default") -> Any | None:
     """Get an image captured by ReturnToApp node.
 
     Args:
@@ -389,6 +387,7 @@ def get_available_checkpoints() -> list[str]:
     """Get list of available checkpoint files."""
     get_comfy_context()  # Ensure initialized
     import folder_paths
+
     return folder_paths.get_filename_list("checkpoints")
 
 
@@ -396,6 +395,7 @@ def get_available_loras() -> list[str]:
     """Get list of available LoRA files."""
     get_comfy_context()
     import folder_paths
+
     return folder_paths.get_filename_list("loras")
 
 
@@ -403,4 +403,5 @@ def get_available_vaes() -> list[str]:
     """Get list of available VAE files."""
     get_comfy_context()
     import folder_paths
+
     return folder_paths.get_filename_list("vae")

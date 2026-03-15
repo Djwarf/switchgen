@@ -1,10 +1,19 @@
 """Application configuration."""
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redefine]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -192,38 +201,178 @@ class GenerationDefaults:
 
 
 @dataclass
+class SessionState:
+    """Persisted session state (restored on startup)."""
+
+    last_workflow: str = "text2img"
+    last_prompt: str = ""
+    last_negative: str = ""
+    last_style: str = "none"
+    window_width: int = 1200
+    window_height: int = 800
+    paned_position: int = 320
+
+
+def _get_config_path() -> Path:
+    """Get the config file path using XDG Base Directory Specification."""
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config:
+        base = Path(xdg_config)
+    else:
+        base = Path.home() / ".config"
+    return base / "switchgen" / "config.toml"
+
+
+@dataclass
 class Config:
     """Main application configuration."""
 
     paths: PathConfig = field(default_factory=PathConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     generation: GenerationDefaults = field(default_factory=GenerationDefaults)
+    session: SessionState = field(default_factory=SessionState)
 
     # Application settings
     app_id: str = "com.switchsides.switchgen"
     app_name: str = "SwitchGen"
 
     # UI settings
-    window_width: int = 1200
-    window_height: int = 800
+    dark_mode: bool = False
 
     @classmethod
-    def load(cls, config_path: Optional[Path] = None) -> "Config":
+    def load(cls, config_path: Path | None = None) -> Config:
         """Load configuration from file or return defaults."""
-        # For now, just return defaults
-        # TODO: Add JSON/TOML config file loading
         config = cls()
+
+        path = config_path or _get_config_path()
+        if tomllib is not None and path.exists():
+            try:
+                with open(path, "rb") as f:
+                    data = tomllib.load(f)
+                _apply_toml(config, data)
+                logger.info("Configuration loaded from %s", path)
+            except Exception as e:
+                logger.warning("Failed to load config from %s: %s", path, e)
+
         config.paths.ensure_directories()
         logger.info(
-            "Configuration loaded: comfy=%s, data=%s",
+            "Configuration: comfy=%s, data=%s",
             config.paths.comfy_path,
             config.paths.data_root,
         )
         return config
 
+    def save(self, config_path: Path | None = None) -> None:
+        """Save non-default configuration to TOML file."""
+        path = config_path or _get_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        lines: list[str] = []
+        defaults = Config()
+
+        # [generation]
+        gen_lines: list[str] = []
+        for attr in ("width", "height", "steps", "cfg", "sampler", "scheduler"):
+            val = getattr(self.generation, attr)
+            if val != getattr(defaults.generation, attr):
+                gen_lines.append(f"{attr} = {_toml_value(val)}")
+        if gen_lines:
+            lines.append("[generation]")
+            lines.extend(gen_lines)
+            lines.append("")
+
+        # [memory]
+        mem_lines: list[str] = []
+        for attr in ("vram_warning_threshold", "vram_critical_threshold"):
+            val = getattr(self.memory, attr)
+            if val != getattr(defaults.memory, attr):
+                mem_lines.append(f"{attr} = {_toml_value(val)}")
+        if mem_lines:
+            lines.append("[memory]")
+            lines.extend(mem_lines)
+            lines.append("")
+
+        # [ui]
+        ui_lines: list[str] = []
+        if self.dark_mode != defaults.dark_mode:
+            ui_lines.append(f"dark_mode = {_toml_value(self.dark_mode)}")
+        if ui_lines:
+            lines.append("[ui]")
+            lines.extend(ui_lines)
+            lines.append("")
+
+        # [session]
+        sess_lines: list[str] = []
+        for attr in (
+            "last_workflow",
+            "last_prompt",
+            "last_negative",
+            "last_style",
+            "window_width",
+            "window_height",
+            "paned_position",
+        ):
+            val = getattr(self.session, attr)
+            if val != getattr(defaults.session, attr):
+                sess_lines.append(f"{attr} = {_toml_value(val)}")
+        if sess_lines:
+            lines.append("[session]")
+            lines.extend(sess_lines)
+            lines.append("")
+
+        path.write_text("\n".join(lines))
+        logger.debug("Configuration saved to %s", path)
+
+
+def _toml_value(val: object) -> str:
+    """Format a Python value as a TOML literal."""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, str):
+        return f'"{val}"'
+    if isinstance(val, float):
+        return f"{val}"
+    if isinstance(val, int):
+        return f"{val}"
+    return f'"{val}"'
+
+
+def _apply_toml(config: Config, data: dict) -> None:
+    """Apply parsed TOML data onto a Config instance."""
+    if "generation" in data:
+        g = data["generation"]
+        for attr in ("width", "height", "steps", "cfg", "sampler", "scheduler"):
+            if attr in g:
+                setattr(config.generation, attr, g[attr])
+
+    if "memory" in data:
+        m = data["memory"]
+        for attr in ("vram_warning_threshold", "vram_critical_threshold"):
+            if attr in m:
+                setattr(config.memory, attr, m[attr])
+
+    if "ui" in data:
+        u = data["ui"]
+        if "dark_mode" in u:
+            config.dark_mode = u["dark_mode"]
+
+    if "session" in data:
+        s = data["session"]
+        for attr in (
+            "last_workflow",
+            "last_prompt",
+            "last_negative",
+            "last_style",
+            "window_width",
+            "window_height",
+            "paned_position",
+        ):
+            if attr in s:
+                setattr(config.session, attr, s[attr])
+
 
 # Global config instance
-_config: Optional[Config] = None
+_config: Config | None = None
 
 
 def get_config() -> Config:

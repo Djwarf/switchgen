@@ -1,9 +1,10 @@
 """Unit tests for switchgen.core.config module."""
 
 import os
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 class TestDetectSwitchgenRoot:
@@ -12,12 +13,14 @@ class TestDetectSwitchgenRoot:
     def test_returns_path(self):
         """Should return a Path object."""
         from switchgen.core.config import _detect_switchgen_root
+
         result = _detect_switchgen_root()
         assert isinstance(result, Path)
 
     def test_path_is_absolute(self):
         """Should return an absolute path."""
         from switchgen.core.config import _detect_switchgen_root
+
         result = _detect_switchgen_root()
         assert result.is_absolute()
 
@@ -27,9 +30,9 @@ class TestDetectComfyPath:
 
     def test_uses_bundled_path_when_exists(self, tmp_switchgen_root):
         """Should use bundled ComfyUI when it exists."""
-        from switchgen.core.config import _detect_comfy_path, _detect_switchgen_root
+        from switchgen.core.config import _detect_comfy_path
 
-        with patch('switchgen.core.config._detect_switchgen_root', return_value=tmp_switchgen_root):
+        with patch("switchgen.core.config._detect_switchgen_root", return_value=tmp_switchgen_root):
             result = _detect_comfy_path()
             assert result == tmp_switchgen_root / "vendor" / "ComfyUI"
 
@@ -46,10 +49,12 @@ class TestDetectComfyPath:
         fake_root.mkdir()
         (fake_root / "vendor").mkdir()
 
-        with patch('switchgen.core.config._detect_switchgen_root', return_value=fake_root):
-            with patch.dict(os.environ, {"COMFYUI_PATH": str(fake_comfy)}):
-                result = _detect_comfy_path()
-                assert result == fake_comfy
+        with (
+            patch("switchgen.core.config._detect_switchgen_root", return_value=fake_root),
+            patch.dict(os.environ, {"COMFYUI_PATH": str(fake_comfy)}),
+        ):
+            result = _detect_comfy_path()
+            assert result == fake_comfy
 
     def test_raises_when_not_found(self, tmp_path):
         """Should raise RuntimeError when ComfyUI not found."""
@@ -59,10 +64,12 @@ class TestDetectComfyPath:
         fake_root.mkdir()
         (fake_root / "vendor").mkdir()
 
-        with patch('switchgen.core.config._detect_switchgen_root', return_value=fake_root):
-            with patch.dict(os.environ, {"COMFYUI_PATH": ""}, clear=True):
-                with pytest.raises(RuntimeError, match="Bundled ComfyUI not found"):
-                    _detect_comfy_path()
+        with (
+            patch("switchgen.core.config._detect_switchgen_root", return_value=fake_root),
+            patch.dict(os.environ, {"COMFYUI_PATH": ""}, clear=True),
+        ):
+            with pytest.raises(RuntimeError, match="Bundled ComfyUI not found"):
+                _detect_comfy_path()
 
 
 class TestPathConfig:
@@ -174,7 +181,7 @@ class TestConfig:
 
     def test_default_app_settings(self):
         """Should have correct default app settings."""
-        from switchgen.core.config import Config, PathConfig, MemoryConfig, GenerationDefaults
+        from switchgen.core.config import Config, GenerationDefaults, MemoryConfig
 
         # Create a minimal config for testing
         config = Config.__new__(Config)
@@ -192,6 +199,62 @@ class TestConfig:
         assert config.window_height == 800
 
 
+class TestConfigPersistence:
+    """Tests for Config save/load round-trip."""
+
+    def test_save_and_load_round_trip(self, tmp_path):
+        """Saving then loading should preserve non-default values."""
+        from switchgen.core.config import Config
+
+        config = Config.__new__(Config)
+        config.paths = MagicMock()
+        config.memory = MagicMock()
+        config.memory.vram_warning_threshold = 0.90
+        config.memory.vram_critical_threshold = 0.95
+        config.generation = MagicMock()
+        config.generation.width = 768
+        config.generation.height = 512
+        config.generation.steps = 30
+        config.generation.cfg = 8.5
+        config.generation.sampler = "dpmpp_2m"
+        config.generation.scheduler = "karras"
+        config.dark_mode = True
+        config.app_id = "com.switchsides.switchgen"
+        config.app_name = "SwitchGen"
+        config.session = MagicMock()
+        config.session.last_workflow = "img2img"
+        config.session.last_prompt = "a cat"
+        config.session.last_negative = "blurry"
+        config.session.last_style = "photo"
+        config.session.window_width = 1400
+        config.session.window_height = 900
+        config.session.paned_position = 400
+
+        config_file = tmp_path / "config.toml"
+        config.save(config_file)
+
+        assert config_file.exists()
+        content = config_file.read_text()
+        assert "width = 768" in content
+        assert 'sampler = "dpmpp_2m"' in content
+        assert "dark_mode = true" in content
+        assert 'last_workflow = "img2img"' in content
+
+    def test_load_nonexistent_returns_defaults(self, tmp_path):
+        """Loading from nonexistent file should return defaults."""
+        from switchgen.core.config import Config
+
+        config_file = tmp_path / "nonexistent.toml"
+
+        with patch("switchgen.core.config.PathConfig") as MockPaths:
+            MockPaths.return_value = MagicMock()
+            config = Config.load(config_file)
+
+        assert config.generation.steps == 20
+        assert config.dark_mode is False
+        assert config.session.last_workflow == "text2img"
+
+
 class TestGetConfig:
     """Tests for get_config singleton function."""
 
@@ -204,7 +267,7 @@ class TestGetConfig:
         config_module._config = None
 
         try:
-            with patch.object(config_module.Config, 'load') as mock_load:
+            with patch.object(config_module.Config, "load") as mock_load:
                 mock_config = MagicMock()
                 mock_load.return_value = mock_config
 
@@ -223,7 +286,7 @@ class TestGetConfig:
         config_module._config = None
 
         try:
-            with patch.object(config_module.Config, 'load') as mock_load:
+            with patch.object(config_module.Config, "load") as mock_load:
                 mock_config = MagicMock()
                 mock_load.return_value = mock_config
 

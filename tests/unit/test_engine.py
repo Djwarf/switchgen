@@ -1,8 +1,9 @@
 """Unit tests for switchgen.core.engine module."""
 
-import pytest
 from unittest.mock import MagicMock, patch
+
 import numpy as np
+import pytest
 
 
 class TestGenerationResult:
@@ -171,7 +172,7 @@ class TestGenerationEngine:
         engine = GenerationEngine()
 
         # Mock get_vram_usage to return specific values
-        with patch.object(engine, 'get_vram_usage', return_value=(500, 1000)):
+        with patch.object(engine, "get_vram_usage", return_value=(500, 1000)):
             result = engine.get_vram_usage_percent()
 
         assert result == 50.0
@@ -182,7 +183,7 @@ class TestGenerationEngine:
 
         engine = GenerationEngine()
 
-        with patch.object(engine, 'get_vram_usage', return_value=(0, 0)):
+        with patch.object(engine, "get_vram_usage", return_value=(0, 0)):
             result = engine.get_vram_usage_percent()
 
         assert result == 0.0
@@ -201,8 +202,8 @@ class TestGenerationEngine:
 
     def test_set_progress_callback(self):
         """set_progress_callback should store callback."""
-        from switchgen.core.engine import GenerationEngine
         from switchgen.core import engine as engine_module
+        from switchgen.core.engine import GenerationEngine
 
         engine = GenerationEngine()
         engine._server = MagicMock()
@@ -210,7 +211,7 @@ class TestGenerationEngine:
         callback = MagicMock()
 
         # Mock the comfy_init functions to avoid ComfyUI dependency
-        with patch.object(engine_module, 'set_comfy_progress_callback'):
+        with patch.object(engine_module, "set_comfy_progress_callback"):
             engine.set_progress_callback(callback)
 
         assert engine._progress_callback == callback
@@ -218,28 +219,29 @@ class TestGenerationEngine:
 
     def test_clear_progress_callback(self):
         """set_progress_callback(None) should clear callback."""
-        from switchgen.core.engine import GenerationEngine
         from switchgen.core import engine as engine_module
+        from switchgen.core.engine import GenerationEngine
 
         engine = GenerationEngine()
         engine._server = MagicMock()
         engine._progress_callback = MagicMock()
 
         # Mock the comfy_init functions to avoid ComfyUI dependency
-        with patch.object(engine_module, 'clear_progress_callback'):
+        with patch.object(engine_module, "clear_progress_callback"):
             engine.set_progress_callback(None)
 
         assert engine._progress_callback is None
 
     def test_cleanup_vram(self):
         """cleanup_vram should call memory manager and gc."""
-        from switchgen.core.engine import GenerationEngine
         import gc
+
+        from switchgen.core.engine import GenerationEngine
 
         engine = GenerationEngine()
         engine._memory_manager = MagicMock()
 
-        with patch.object(gc, 'collect') as mock_gc:
+        with patch.object(gc, "collect") as mock_gc:
             engine.cleanup_vram()
 
         engine._memory_manager.soft_empty_cache.assert_called_once()
@@ -253,7 +255,8 @@ class TestTensorToPil:
     def pil_available(self):
         """Check if PIL is available."""
         try:
-            from PIL import Image
+            from PIL import Image  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -274,8 +277,9 @@ class TestTensorToPil:
         if not pil_available:
             pytest.skip("PIL not available")
 
-        from switchgen.core.engine import tensor_to_pil
         from PIL import Image
+
+        from switchgen.core.engine import tensor_to_pil
 
         # Create a mock tensor (B, H, W, C) in [0, 1] range
         tensor = MagicMock()
@@ -293,8 +297,9 @@ class TestTensorToPil:
         if not pil_available:
             pytest.skip("PIL not available")
 
-        from switchgen.core.engine import tensor_to_pil
         from PIL import Image
+
+        from switchgen.core.engine import tensor_to_pil
 
         # Create numpy array directly
         array = np.random.rand(1, 32, 32, 3)

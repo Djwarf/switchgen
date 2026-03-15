@@ -3,11 +3,11 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
 class ModelType(Enum):
     """Types of models that can be downloaded."""
+
     CHECKPOINT = "checkpoints"
     VAE = "vae"
     CLIP_VISION = "clip_vision"
@@ -19,28 +19,31 @@ class ModelType(Enum):
 
 class QualityTier(Enum):
     """Quality tier for models."""
-    STARTER = "starter"      # Good for beginners, lower requirements
-    STANDARD = "standard"    # Balanced quality and performance
-    HIGH = "high"           # Best quality, higher requirements
+
+    STARTER = "starter"  # Good for beginners, lower requirements
+    STANDARD = "standard"  # Balanced quality and performance
+    HIGH = "high"  # Best quality, higher requirements
 
 
 @dataclass
 class ModelInfo:
     """Information about a downloadable model."""
+
     id: str
     name: str
     type: ModelType
-    repo_id: str            # HuggingFace repo (e.g., "openai/clip-vit-large-patch14")
-    filename: str           # File in repo to download
-    size_mb: int            # Approximate size in MB
-    description: str        # Short description
-    local_filename: Optional[str] = None  # Override local filename (default: same as filename)
+    repo_id: str  # HuggingFace repo (e.g., "openai/clip-vit-large-patch14")
+    filename: str  # File in repo to download
+    size_mb: int  # Approximate size in MB
+    description: str  # Short description
+    local_filename: str | None = None  # Override local filename (default: same as filename)
     required_for: list[str] = field(default_factory=list)  # Workflow types that need it
     # Beginner-friendly fields
-    vram_gb: float = 4.0    # Minimum VRAM required in GB
+    vram_gb: float = 4.0  # Minimum VRAM required in GB
     quality_tier: QualityTier = QualityTier.STANDARD
     recommended: bool = False  # Show as recommended for beginners
-    tips: str = ""          # Usage tips for beginners
+    tips: str = ""  # Usage tips for beginners
+    sha256: str | None = None  # Expected SHA256 hash for download validation
 
     def get_local_filename(self) -> str:
         """Get the filename to use locally."""
@@ -66,7 +69,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="This is automatically used by the 3D workflow. Download it along with Stable Zero123.",
     ),
-
     # =========================================================================
     # Text Encoders
     # =========================================================================
@@ -84,7 +86,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="This is automatically used by the Audio workflow. Download it along with Stable Audio.",
     ),
-
     # =========================================================================
     # Checkpoints - SD 1.5 (Beginner Friendly)
     # =========================================================================
@@ -115,7 +116,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STARTER,
         tips="Use with the Inpainting workflow. Paint white over areas you want to change, then describe what should appear there.",
     ),
-
     # =========================================================================
     # Checkpoints - SDXL (Higher Quality)
     # =========================================================================
@@ -144,7 +144,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.HIGH,
         tips="Advanced: Use after SDXL base to add extra detail. Not required for most uses - the base model alone produces great results.",
     ),
-
     # =========================================================================
     # Checkpoints - 3D
     # =========================================================================
@@ -161,7 +160,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="Upload a photo of an object (ideally on a plain background) and rotate the camera around it. Also requires CLIP ViT-L model.",
     ),
-
     # =========================================================================
     # Checkpoints - Audio
     # =========================================================================
@@ -179,7 +177,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="Describe sounds like 'upbeat electronic music' or 'rain on a window'. Also requires the T5 Base text encoder.",
     ),
-
     # =========================================================================
     # ControlNet Models (SD 1.5) - Advanced
     # =========================================================================
@@ -235,7 +232,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="Advanced: Draw a simple sketch and describe what you want - it fills in all the details while following your drawing.",
     ),
-
     # =========================================================================
     # Upscalers
     # =========================================================================
@@ -251,7 +247,6 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
         quality_tier=QualityTier.STANDARD,
         tips="Great for enlarging your generated images for printing or sharing. Small download, big impact!",
     ),
-
     # =========================================================================
     # VAE Models
     # =========================================================================
@@ -285,7 +280,7 @@ def get_required_models(workflow_type: str) -> list[ModelInfo]:
     return [m for m in MODEL_CATALOG.values() if workflow_type in m.required_for]
 
 
-def get_model_info(model_id: str) -> Optional[ModelInfo]:
+def get_model_info(model_id: str) -> ModelInfo | None:
     """Get model info by ID."""
     return MODEL_CATALOG.get(model_id)
 

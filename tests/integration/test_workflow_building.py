@@ -4,8 +4,6 @@ These tests verify that workflow builders produce valid, complete workflows
 with all required nodes properly connected.
 """
 
-import pytest
-
 
 class TestText2ImgWorkflowIntegration:
     """Integration tests for text2img workflow building."""
@@ -48,12 +46,13 @@ class TestText2ImgWorkflowIntegration:
         node_ids = set(workflow.keys())
 
         for node_id, node in workflow.items():
-            for input_name, input_value in node.get("inputs", {}).items():
+            for _input_name, input_value in node.get("inputs", {}).items():
                 # Check if input is a node reference [node_id, output_index]
                 if isinstance(input_value, list) and len(input_value) == 2:
-                    ref_node_id, output_idx = input_value
-                    assert ref_node_id in node_ids, \
+                    ref_node_id, _output_idx = input_value
+                    assert ref_node_id in node_ids, (
                         f"Node {node_id} references non-existent node {ref_node_id}"
+                    )
 
     def test_checkpoint_name_propagates(self):
         """Checkpoint name should be in CheckpointLoaderSimple inputs."""
@@ -65,8 +64,7 @@ class TestText2ImgWorkflowIntegration:
             prompt="test",
         )
 
-        loader = next(n for n in workflow.values()
-                     if n["class_type"] == "CheckpointLoaderSimple")
+        loader = next(n for n in workflow.values() if n["class_type"] == "CheckpointLoaderSimple")
         assert loader["inputs"]["ckpt_name"] == checkpoint_name
 
     def test_prompt_propagates(self):
@@ -79,8 +77,7 @@ class TestText2ImgWorkflowIntegration:
             prompt=prompt,
         )
 
-        encoders = [n for n in workflow.values()
-                   if n["class_type"] == "CLIPTextEncode"]
+        encoders = [n for n in workflow.values() if n["class_type"] == "CLIPTextEncode"]
         prompts = [e["inputs"]["text"] for e in encoders]
         assert prompt in prompts
 
@@ -95,8 +92,7 @@ class TestText2ImgWorkflowIntegration:
             height=1024,
         )
 
-        latent = next(n for n in workflow.values()
-                     if n["class_type"] == "EmptyLatentImage")
+        latent = next(n for n in workflow.values() if n["class_type"] == "EmptyLatentImage")
         assert latent["inputs"]["width"] == 768
         assert latent["inputs"]["height"] == 1024
 
@@ -114,8 +110,7 @@ class TestText2ImgWorkflowIntegration:
             scheduler="karras",
         )
 
-        sampler = next(n for n in workflow.values()
-                      if n["class_type"] == "KSampler")
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
         assert sampler["inputs"]["steps"] == 30
         assert sampler["inputs"]["cfg"] == 8.5
         assert sampler["inputs"]["seed"] == 99999
@@ -137,8 +132,7 @@ class TestImg2ImgWorkflowIntegration:
             prompt="test",
         )
 
-        loader = next(n for n in workflow.values()
-                     if n["class_type"] == "LoadImage")
+        loader = next(n for n in workflow.values() if n["class_type"] == "LoadImage")
         assert loader["inputs"]["image"] == image_path
 
     def test_has_vae_encode_instead_of_empty_latent(self):
@@ -166,8 +160,7 @@ class TestImg2ImgWorkflowIntegration:
             denoise=0.65,
         )
 
-        sampler = next(n for n in workflow.values()
-                      if n["class_type"] == "KSampler")
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
         assert sampler["inputs"]["denoise"] == 0.65
 
 
@@ -185,8 +178,7 @@ class TestInpaintWorkflowIntegration:
             prompt="test",
         )
 
-        load_nodes = [n for n in workflow.values()
-                     if n["class_type"] == "LoadImage"]
+        load_nodes = [n for n in workflow.values() if n["class_type"] == "LoadImage"]
         paths = {n["inputs"]["image"] for n in load_nodes}
 
         assert "/path/to/image.png" in paths
@@ -219,8 +211,7 @@ class TestInpaintWorkflowIntegration:
             grow_mask=10,
         )
 
-        encode = next(n for n in workflow.values()
-                     if n["class_type"] == "VAEEncodeForInpaint")
+        encode = next(n for n in workflow.values() if n["class_type"] == "VAEEncodeForInpaint")
         assert encode["inputs"]["grow_mask_by"] == 10
 
 
@@ -251,8 +242,7 @@ class TestAudioWorkflowIntegration:
             seconds=45.0,
         )
 
-        latent = next(n for n in workflow.values()
-                     if n["class_type"] == "EmptyLatentAudio")
+        latent = next(n for n in workflow.values() if n["class_type"] == "EmptyLatentAudio")
         assert latent["inputs"]["seconds"] == 45.0
 
     def test_has_t5_encoder(self):
@@ -295,8 +285,7 @@ class TestZero123WorkflowIntegration:
             azimuth=45.0,
         )
 
-        cond = next(n for n in workflow.values()
-                   if n["class_type"] == "StableZero123_Conditioning")
+        cond = next(n for n in workflow.values() if n["class_type"] == "StableZero123_Conditioning")
         assert cond["inputs"]["elevation"] == 15.0
         assert cond["inputs"]["azimuth"] == 45.0
 
@@ -314,8 +303,7 @@ class TestSeedConsistency:
             seed=12345,
         )
 
-        sampler = next(n for n in workflow.values()
-                      if n["class_type"] == "KSampler")
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
         assert sampler["inputs"]["seed"] == seed
         assert seed == 12345
 
@@ -330,14 +318,13 @@ class TestSeedConsistency:
             seed=54321,
         )
 
-        sampler = next(n for n in workflow.values()
-                      if n["class_type"] == "KSampler")
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
         assert sampler["inputs"]["seed"] == seed
         assert seed == 54321
 
     def test_random_seed_is_valid(self):
         """Random seed (-1) should be converted to valid range."""
-        from switchgen.core.workflows import build_text2img_memory_workflow, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, build_text2img_memory_workflow
 
         workflow, seed = build_text2img_memory_workflow(
             checkpoint="test.safetensors",
@@ -347,6 +334,5 @@ class TestSeedConsistency:
 
         assert 0 <= seed <= MAX_SEED
 
-        sampler = next(n for n in workflow.values()
-                      if n["class_type"] == "KSampler")
+        sampler = next(n for n in workflow.values() if n["class_type"] == "KSampler")
         assert sampler["inputs"]["seed"] == seed

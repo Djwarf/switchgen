@@ -5,13 +5,13 @@ This module provides a simple queue system for managing multiple generation requ
 """
 
 import logging
+import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from queue import Queue, Empty
-from threading import Thread, Lock
-from typing import Callable, Optional, Any
-import uuid
-import time
+from queue import Empty, PriorityQueue
+from threading import Lock, Thread
 
 from .engine import GenerationEngine, GenerationResult, ProgressInfo
 
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class JobStatus(Enum):
     """Status of a generation job."""
+
     QUEUED = auto()
     RUNNING = auto()
     COMPLETED = auto()
@@ -35,19 +36,21 @@ class GenerationJob:
     job_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     priority: int = 0  # Higher = more urgent
     status: JobStatus = JobStatus.QUEUED
-    result: Optional[GenerationResult] = None
-    error: Optional[str] = None
+    result: GenerationResult | None = None
+    error: str | None = None
     created_at: float = field(default_factory=time.time)
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
+    started_at: float | None = None
+    completed_at: float | None = None
 
     # Callbacks
-    on_progress: Optional[Callable[[ProgressInfo], None]] = None
-    on_complete: Optional[Callable[["GenerationJob"], None]] = None
+    on_progress: Callable[[ProgressInfo], None] | None = None
+    on_complete: Callable[["GenerationJob"], None] | None = None
 
     def __lt__(self, other: "GenerationJob") -> bool:
-        """For priority queue ordering (higher priority first)."""
-        return self.priority > other.priority
+        """For priority queue ordering (higher priority first, older first on tie)."""
+        if self.priority != other.priority:
+            return self.priority > other.priority
+        return self.created_at < other.created_at
 
 
 class GenerationQueue:
@@ -60,19 +63,20 @@ class GenerationQueue:
     - Job cancellation
     """
 
-    def __init__(self, engine: GenerationEngine):
+    def __init__(self, engine: GenerationEngine, max_history: int = 100):
         self.engine = engine
-        self._queue: Queue[GenerationJob] = Queue()
+        self._queue: PriorityQueue[GenerationJob] = PriorityQueue()
         self._jobs: dict[str, GenerationJob] = {}
         self._jobs_lock = Lock()
         self._running = False
-        self._worker_thread: Optional[Thread] = None
-        self._current_job: Optional[GenerationJob] = None
+        self._worker_thread: Thread | None = None
+        self._current_job: GenerationJob | None = None
+        self._max_history = max_history
 
         # Global callbacks
-        self.on_job_started: Optional[Callable[[GenerationJob], None]] = None
-        self.on_job_completed: Optional[Callable[[GenerationJob], None]] = None
-        self.on_queue_empty: Optional[Callable[[], None]] = None
+        self.on_job_started: Callable[[GenerationJob], None] | None = None
+        self.on_job_completed: Callable[[GenerationJob], None] | None = None
+        self.on_queue_empty: Callable[[], None] | None = None
 
     def add(self, job: GenerationJob) -> str:
         """Add a job to the queue.
@@ -87,16 +91,20 @@ class GenerationQueue:
             self._jobs[job.job_id] = job
 
         self._queue.put(job)
-        logger.info("Job queued (job_id=%s, priority=%d, queue_size=%d)",
-                    job.job_id, job.priority, self._queue.qsize())
+        logger.info(
+            "Job queued (job_id=%s, priority=%d, queue_size=%d)",
+            job.job_id,
+            job.priority,
+            self._queue.qsize(),
+        )
         return job.job_id
 
     def submit(
         self,
         workflow: dict,
         priority: int = 0,
-        on_progress: Optional[Callable[[ProgressInfo], None]] = None,
-        on_complete: Optional[Callable[[GenerationJob], None]] = None,
+        on_progress: Callable[[ProgressInfo], None] | None = None,
+        on_complete: Callable[[GenerationJob], None] | None = None,
     ) -> str:
         """Submit a workflow for generation.
 
@@ -119,7 +127,7 @@ class GenerationQueue:
         )
         return self.add(job)
 
-    def get_job(self, job_id: str) -> Optional[GenerationJob]:
+    def get_job(self, job_id: str) -> GenerationJob | None:
         """Get a job by ID."""
         with self._jobs_lock:
             return self._jobs.get(job_id)
@@ -133,21 +141,24 @@ class GenerationQueue:
         Returns:
             True if job was found and cancelled
         """
+        interrupt_needed = False
         with self._jobs_lock:
             job = self._jobs.get(job_id)
             if not job:
                 return False
 
             if job.status == JobStatus.RUNNING:
-                # Interrupt the running job
-                self.engine.interrupt()
                 job.status = JobStatus.CANCELLED
-                return True
+                interrupt_needed = True
             elif job.status == JobStatus.QUEUED:
                 job.status = JobStatus.CANCELLED
-                return True
+            else:
+                return False
 
-        return False
+        if interrupt_needed:
+            self.engine.interrupt()
+
+        return True
 
     def start(self) -> None:
         """Start the queue worker thread."""
@@ -177,7 +188,7 @@ class GenerationQueue:
         """
         cleared = 0
         with self._jobs_lock:
-            for job_id, job in list(self._jobs.items()):
+            for _job_id, job in list(self._jobs.items()):
                 if job.status == JobStatus.QUEUED:
                     job.status = JobStatus.CANCELLED
                     cleared += 1
@@ -194,7 +205,7 @@ class GenerationQueue:
         return self._running
 
     @property
-    def current_job(self) -> Optional[GenerationJob]:
+    def current_job(self) -> GenerationJob | None:
         """Currently executing job, if any."""
         return self._current_job
 
@@ -228,8 +239,12 @@ class GenerationQueue:
 
     def _process_job(self, job: GenerationJob) -> None:
         """Process a single job."""
-        self._current_job = job
-        job.status = JobStatus.RUNNING
+        with self._jobs_lock:
+            # Check if job was cancelled while queued
+            if job.status == JobStatus.CANCELLED:
+                return
+            self._current_job = job
+            job.status = JobStatus.RUNNING
         job.started_at = time.time()
 
         logger.info("Job started (job_id=%s)", job.job_id)
@@ -257,14 +272,19 @@ class GenerationQueue:
 
         finally:
             job.completed_at = time.time()
-            elapsed = job.completed_at - job.started_at
-            self._current_job = None
+            elapsed = job.completed_at - (job.started_at or job.completed_at)
+            with self._jobs_lock:
+                self._current_job = None
 
             # Clear progress callback
             self.engine.set_progress_callback(None)
 
-            logger.info("Job completed (job_id=%s, status=%s, time=%.2fs)",
-                        job.job_id, job.status.name, elapsed)
+            logger.info(
+                "Job completed (job_id=%s, status=%s, time=%.2fs)",
+                job.job_id,
+                job.status.name,
+                elapsed,
+            )
 
             # Notify completion
             if job.on_complete:
@@ -272,9 +292,27 @@ class GenerationQueue:
             if self.on_job_completed:
                 self.on_job_completed(job)
 
+            # Purge old completed jobs to prevent memory leak
+            self._cleanup_history()
+
+    def _cleanup_history(self) -> None:
+        """Purge oldest completed/failed/cancelled jobs when history exceeds limit."""
+        with self._jobs_lock:
+            if len(self._jobs) <= self._max_history:
+                return
+            finished = [
+                (jid, j)
+                for jid, j in self._jobs.items()
+                if j.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+            ]
+            finished.sort(key=lambda x: x[1].completed_at or 0)
+            to_remove = len(self._jobs) - self._max_history
+            for jid, _ in finished[:to_remove]:
+                del self._jobs[jid]
+
 
 # Global queue instance
-_queue: Optional[GenerationQueue] = None
+_queue: GenerationQueue | None = None
 
 
 def get_queue() -> GenerationQueue:
@@ -285,6 +323,7 @@ def get_queue() -> GenerationQueue:
     global _queue
     if _queue is None:
         from .engine import get_engine
+
         engine = get_engine()
         engine.initialize()
         _queue = GenerationQueue(engine)
@@ -299,6 +338,7 @@ def generate_sync(workflow: dict) -> GenerationResult:
     For testing or simple scripts.
     """
     from .engine import get_engine
+
     engine = get_engine()
     engine.initialize()
     return engine.execute(workflow)

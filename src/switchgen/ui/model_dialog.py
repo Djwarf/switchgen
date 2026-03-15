@@ -1,7 +1,6 @@
 """Model download dialog."""
 
 from pathlib import Path
-from typing import Optional
 
 from ..core.logging import get_logger
 
@@ -9,18 +8,23 @@ logger = get_logger(__name__)
 
 try:
     import gi
-    gi.require_version('Gtk', '4.0')
-    gi.require_version('Adw', '1')
-    from gi.repository import Gtk, Adw, GLib, Pango
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib, Gtk, Pango
 except (ImportError, ValueError):
     pass
 
+from ..core.downloader import DownloadProgress, DownloadResult, ModelDownloader
 from ..core.models import (
-    ModelInfo, ModelType, MODEL_CATALOG, QualityTier,
-    get_models_by_type, get_recommended_models, is_model_installed,
+    MODEL_CATALOG,
+    ModelInfo,
+    ModelType,
+    QualityTier,
+    get_models_by_type,
+    get_recommended_models,
+    is_model_installed,
 )
-from ..core.downloader import ModelDownloader, DownloadProgress, DownloadResult
-
 
 # Section descriptions for beginners
 SECTION_DESCRIPTIONS = {
@@ -104,7 +108,7 @@ class ModelDownloadDialog(Adw.Dialog):
         # Disk space info
         free_mb, total_mb = self.downloader.get_disk_space_mb()
         space_label = Gtk.Label(
-            label=f"Disk space: {free_mb/1024:.1f} GB free of {total_mb/1024:.1f} GB",
+            label=f"Disk space: {free_mb / 1024:.1f} GB free of {total_mb / 1024:.1f} GB",
             xalign=0,
             css_classes=["dim-label"],
         )
@@ -174,7 +178,7 @@ class ModelDownloadDialog(Adw.Dialog):
                 list_box.append(row)
 
         # Store current download model for retry
-        self._current_download_model: Optional[ModelInfo] = None
+        self._current_download_model: ModelInfo | None = None
 
     def _build_getting_started_section(self, content_box: Gtk.Box, recommended: list[ModelInfo]):
         """Build the Getting Started section for new users."""
@@ -199,8 +203,8 @@ class ModelDownloadDialog(Adw.Dialog):
         # Welcome text
         welcome = Gtk.Label(
             label="Welcome! To generate images, you need to download at least one model. "
-                  "We recommend starting with Stable Diffusion 1.5 - it's fast, works on most computers, "
-                  "and produces great results.",
+            "We recommend starting with Stable Diffusion 1.5 - it's fast, works on most computers, "
+            "and produces great results.",
             xalign=0,
             wrap=True,
             wrap_mode=Pango.WrapMode.WORD_CHAR,
@@ -300,7 +304,9 @@ class ModelDownloadDialog(Adw.Dialog):
         right_box.append(specs_box)
 
         size_label = Gtk.Label(
-            label=f"{model.size_mb / 1024:.1f} GB" if model.size_mb >= 1024 else f"{model.size_mb} MB",
+            label=f"{model.size_mb / 1024:.1f} GB"
+            if model.size_mb >= 1024
+            else f"{model.size_mb} MB",
             css_classes=["dim-label", "caption"],
         )
         size_label.set_tooltip_text("Download size")
@@ -363,9 +369,13 @@ class ModelDownloadDialog(Adw.Dialog):
             free_mb, _ = self.downloader.get_disk_space_mb()
             logger.warning(
                 "Insufficient disk space for %s (need=%dMB, free=%.0fMB)",
-                model.name, model.size_mb, free_mb
+                model.name,
+                model.size_mb,
+                free_mb,
             )
-            self._show_error(f"Not enough disk space.\nNeed {model.size_mb} MB, have {free_mb:.0f} MB free.")
+            self._show_error(
+                f"Not enough disk space.\nNeed {model.size_mb} MB, have {free_mb:.0f} MB free."
+            )
             return
 
         logger.info("Download initiated (model=%s, size=%dMB)", model.name, model.size_mb)
@@ -421,7 +431,9 @@ class ModelDownloadDialog(Adw.Dialog):
     def _on_complete(self, result: DownloadResult):
         """Handle download completion."""
         if result.success:
-            logger.info("Download completed successfully (model=%s, path=%s)", result.model_id, result.path)
+            logger.info(
+                "Download completed successfully (model=%s, path=%s)", result.model_id, result.path
+            )
             self._show_success()
         else:
             logger.error("Download failed (model=%s): %s", result.model_id, result.error)
@@ -498,28 +510,38 @@ class ModelDownloadDialog(Adw.Dialog):
         error_lower = error.lower()
 
         if "disk space" in error_lower or "not enough" in error_lower:
-            return ("Not Enough Storage",
-                    "Free up disk space and try again. Large AI models can "
-                    "require several gigabytes of storage.")
+            return (
+                "Not Enough Storage",
+                "Free up disk space and try again. Large AI models can "
+                "require several gigabytes of storage.",
+            )
 
         if "network" in error_lower or "connection" in error_lower or "timeout" in error_lower:
-            return ("Connection Problem",
-                    "Check your internet connection and try again. "
-                    "If the problem persists, the server may be temporarily unavailable.")
+            return (
+                "Connection Problem",
+                "Check your internet connection and try again. "
+                "If the problem persists, the server may be temporarily unavailable.",
+            )
 
         if "authentication" in error_lower or "401" in error:
-            return ("Authentication Required",
-                    "This model requires a HuggingFace account. "
-                    "Visit huggingface.co to create an account and log in.")
+            return (
+                "Authentication Required",
+                "This model requires a HuggingFace account. "
+                "Visit huggingface.co to create an account and log in.",
+            )
 
         if "access denied" in error_lower or "403" in error or "forbidden" in error_lower:
-            return ("Access Restricted",
-                    "This model requires accepting terms on HuggingFace. "
-                    "Visit the model page on huggingface.co to accept the license.")
+            return (
+                "Access Restricted",
+                "This model requires accepting terms on HuggingFace. "
+                "Visit the model page on huggingface.co to accept the license.",
+            )
 
         if "not found" in error_lower or "404" in error:
-            return ("Model Not Found",
-                    "The model file could not be found. It may have been moved or removed.")
+            return (
+                "Model Not Found",
+                "The model file could not be found. It may have been moved or removed.",
+            )
 
         # Generic fallback
         return ("Download Failed", error)

@@ -4,7 +4,6 @@ This module contains the main application class and launch function.
 """
 
 import sys
-from typing import Optional
 
 from .core.logging import get_logger
 
@@ -13,9 +12,11 @@ logger = get_logger(__name__)
 # Check for GTK4 availability
 try:
     import gi
-    gi.require_version('Gtk', '4.0')
-    gi.require_version('Adw', '1')
-    from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: F401 (GLib used at runtime)
+
     GTK_AVAILABLE = True
     logger.debug("GTK4 and Libadwaita loaded successfully")
 except (ImportError, ValueError) as e:
@@ -42,14 +43,14 @@ class SwitchGenApp(Adw.Application):
 
     def __init__(self):
         super().__init__(
-            application_id="com.switchsides.switchgen",
-            flags=Gio.ApplicationFlags.FLAGS_NONE
+            application_id="com.switchsides.switchgen", flags=Gio.ApplicationFlags.FLAGS_NONE
         )
-        self.window: Optional["MainWindow"] = None
+        self.window = None  # MainWindow instance, set in do_activate
 
     def do_startup(self):
         """Called when the application starts."""
         Adw.Application.do_startup(self)
+        self._setup_color_scheme()
         self._load_css()
 
     def do_activate(self):
@@ -58,8 +59,23 @@ class SwitchGenApp(Adw.Application):
         if not self.window:
             logger.debug("Creating main window")
             from .ui.main_window import MainWindow
+
             self.window = MainWindow(application=self)
         self.window.present()
+
+    def _setup_color_scheme(self):
+        """Configure dark/light mode from user config."""
+        from .core.config import get_config
+
+        try:
+            config = get_config()
+            style_manager = Adw.StyleManager.get_default()
+            if config.dark_mode:
+                style_manager.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+            else:
+                style_manager.set_color_scheme(Adw.ColorScheme.PREFER_LIGHT)
+        except Exception as e:
+            logger.debug("Could not set color scheme: %s", e)
 
     def _load_css(self):
         """Load the SwitchSides CSS theme."""
@@ -72,14 +88,13 @@ class SwitchGenApp(Adw.Application):
         display = Gdk.Display.get_default()
         if display:
             Gtk.StyleContext.add_provider_for_display(
-                display,
-                css_provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
 
     def _find_css_path(self):
         """Find the CSS file path."""
         from pathlib import Path
+
         import switchgen
 
         # Try package directory

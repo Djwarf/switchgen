@@ -1,8 +1,6 @@
 """Unit tests for switchgen.core.downloader module."""
 
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 
 class TestDownloadProgress:
@@ -213,7 +211,7 @@ class TestModelDownloader:
 
     def test_is_available(self, tmp_models_dir):
         """is_available should return HF_AVAILABLE status."""
-        from switchgen.core.downloader import ModelDownloader, HF_AVAILABLE
+        from switchgen.core.downloader import HF_AVAILABLE, ModelDownloader
 
         downloader = ModelDownloader(tmp_models_dir)
 
@@ -299,7 +297,7 @@ class TestModelDownloader:
         from switchgen.core.downloader import ModelDownloader
 
         # Mock HF_AVAILABLE as False
-        with patch.object(downloader_module, 'HF_AVAILABLE', False):
+        with patch.object(downloader_module, "HF_AVAILABLE", False):
             dl = ModelDownloader(tmp_models_dir)
             result = dl.download(sample_model_info)
 
@@ -326,13 +324,14 @@ class TestModelDownloaderAsync:
 
     def test_download_async_returns_thread(self, tmp_models_dir, sample_model_info):
         """download_async should return a Thread object."""
-        from switchgen.core.downloader import ModelDownloader
         import threading
+
+        from switchgen.core.downloader import ModelDownloader
 
         downloader = ModelDownloader(tmp_models_dir)
 
         # Mock the download to complete quickly
-        with patch.object(downloader, 'download') as mock_download:
+        with patch.object(downloader, "download") as mock_download:
             mock_download.return_value = MagicMock(success=True)
 
             thread = downloader.download_async(sample_model_info)
@@ -342,7 +341,7 @@ class TestModelDownloaderAsync:
 
     def test_download_async_calls_complete_callback(self, tmp_models_dir, sample_model_info):
         """download_async should call complete_callback when done."""
-        from switchgen.core.downloader import ModelDownloader, DownloadResult
+        from switchgen.core.downloader import DownloadResult, ModelDownloader
 
         downloader = ModelDownloader(tmp_models_dir)
         callback_called = []
@@ -350,7 +349,7 @@ class TestModelDownloaderAsync:
         def on_complete(result):
             callback_called.append(result)
 
-        with patch.object(downloader, 'download') as mock_download:
+        with patch.object(downloader, "download") as mock_download:
             mock_result = DownloadResult(success=True, model_id="test")
             mock_download.return_value = mock_result
 

@@ -1,9 +1,6 @@
 """Unit tests for switchgen.core.workflows module."""
 
 import pytest
-import json
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 
 class TestWorkflowType:
@@ -22,6 +19,7 @@ class TestWorkflowType:
     def test_all_types_count(self):
         """Should have exactly 5 workflow types."""
         from switchgen.core.workflows import WorkflowType
+
         assert len(WorkflowType) == 5
 
 
@@ -98,7 +96,7 @@ class TestGenerateSeed:
 
     def test_within_valid_range(self):
         """Should return a value within valid range."""
-        from switchgen.core.workflows import generate_seed, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, generate_seed
 
         for _ in range(100):
             result = generate_seed()
@@ -110,7 +108,7 @@ class TestEnsureSeed:
 
     def test_negative_generates_random(self):
         """Negative seed should generate random."""
-        from switchgen.core.workflows import ensure_seed, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, ensure_seed
 
         result = ensure_seed(-1)
 
@@ -135,7 +133,7 @@ class TestEnsureSeed:
 
     def test_overflow_wraps(self):
         """Seed exceeding MAX_SEED should wrap."""
-        from switchgen.core.workflows import ensure_seed, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, ensure_seed
 
         result = ensure_seed(MAX_SEED + 1)
 
@@ -143,7 +141,7 @@ class TestEnsureSeed:
 
     def test_large_seed_wraps(self):
         """Very large seed should wrap to valid range."""
-        from switchgen.core.workflows import ensure_seed, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, ensure_seed
 
         large_seed = MAX_SEED * 2 + 100
         result = ensure_seed(large_seed)
@@ -156,7 +154,7 @@ class TestGetWorkflowSpec:
 
     def test_returns_correct_spec(self):
         """Should return correct spec for workflow type."""
-        from switchgen.core.workflows import get_workflow_spec, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_workflow_spec
 
         spec = get_workflow_spec(WorkflowType.TEXT2IMG)
 
@@ -168,7 +166,7 @@ class TestGetModelsForWorkflow:
 
     def test_filters_text2img_models(self):
         """Should filter models for text2img workflow."""
-        from switchgen.core.workflows import get_models_for_workflow, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_models_for_workflow
 
         all_models = ["v1-5-pruned.safetensors", "stable_audio.safetensors", "inpaint.ckpt"]
         result = get_models_for_workflow(all_models, WorkflowType.TEXT2IMG)
@@ -178,7 +176,7 @@ class TestGetModelsForWorkflow:
 
     def test_filters_audio_models(self):
         """Should filter models for audio workflow."""
-        from switchgen.core.workflows import get_models_for_workflow, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_models_for_workflow
 
         all_models = ["v1-5.safetensors", "stable-audio-1.0.safetensors"]
         result = get_models_for_workflow(all_models, WorkflowType.AUDIO)
@@ -187,7 +185,7 @@ class TestGetModelsForWorkflow:
 
     def test_returns_all_if_no_matches(self):
         """Should return all models if no patterns match."""
-        from switchgen.core.workflows import get_models_for_workflow, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_models_for_workflow
 
         all_models = ["custom_model.safetensors"]
         result = get_models_for_workflow(all_models, WorkflowType.TEXT2IMG)
@@ -200,7 +198,7 @@ class TestGetCompatibleWorkflows:
 
     def test_sd15_compatible_with_text2img(self):
         """SD 1.5 model should be compatible with text2img."""
-        from switchgen.core.workflows import get_compatible_workflows, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_compatible_workflows
 
         result = get_compatible_workflows("v1-5-pruned.safetensors")
 
@@ -208,7 +206,7 @@ class TestGetCompatibleWorkflows:
 
     def test_inpaint_model_compatible_with_inpaint(self):
         """Inpaint model should be compatible with inpaint workflow."""
-        from switchgen.core.workflows import get_compatible_workflows, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_compatible_workflows
 
         result = get_compatible_workflows("sd-v1-5-inpainting.ckpt")
 
@@ -216,7 +214,7 @@ class TestGetCompatibleWorkflows:
 
     def test_unknown_model_defaults_to_text2img(self):
         """Unknown model should default to text2img."""
-        from switchgen.core.workflows import get_compatible_workflows, WorkflowType
+        from switchgen.core.workflows import WorkflowType, get_compatible_workflows
 
         result = get_compatible_workflows("completely_unknown_model.safetensors")
 
@@ -316,7 +314,7 @@ class TestWorkflowManager:
 
     def test_load_template_not_found(self, tmp_path):
         """load_template should raise WorkflowError for missing template."""
-        from switchgen.core.workflows import WorkflowManager, WorkflowError
+        from switchgen.core.workflows import WorkflowError, WorkflowManager
 
         manager = WorkflowManager(tmp_path)
 
@@ -392,7 +390,7 @@ class TestBuildText2ImgWorkflow:
 
     def test_seed_is_explicit(self):
         """Seed should be converted to explicit integer."""
-        from switchgen.core.workflows import build_text2img_workflow, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, build_text2img_workflow
 
         result = build_text2img_workflow(
             checkpoint="test.safetensors",
@@ -451,9 +449,9 @@ class TestBuildText2ImgMemoryWorkflow:
 
     def test_returns_actual_seed(self):
         """Should return the actual seed used."""
-        from switchgen.core.workflows import build_text2img_memory_workflow, MAX_SEED
+        from switchgen.core.workflows import MAX_SEED, build_text2img_memory_workflow
 
-        workflow, seed = build_text2img_memory_workflow(
+        _workflow, seed = build_text2img_memory_workflow(
             checkpoint="test.safetensors",
             prompt="test prompt",
             seed=-1,
