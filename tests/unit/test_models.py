@@ -1,8 +1,5 @@
 """Unit tests for switchgen.core.models module."""
 
-import pytest
-from pathlib import Path
-
 
 class TestModelType:
     """Tests for ModelType enum."""
@@ -22,6 +19,7 @@ class TestModelType:
     def test_all_types_count(self):
         """Should have exactly 7 model types."""
         from switchgen.core.models import ModelType
+
         assert len(ModelType) == 7
 
 
@@ -120,7 +118,7 @@ class TestGetModelsByType:
 
     def test_returns_checkpoints(self):
         """Should return only checkpoint models."""
-        from switchgen.core.models import get_models_by_type, ModelType
+        from switchgen.core.models import ModelType, get_models_by_type
 
         result = get_models_by_type(ModelType.CHECKPOINT)
 
@@ -129,7 +127,7 @@ class TestGetModelsByType:
 
     def test_returns_vae(self):
         """Should return only VAE models."""
-        from switchgen.core.models import get_models_by_type, ModelType
+        from switchgen.core.models import ModelType, get_models_by_type
 
         result = get_models_by_type(ModelType.VAE)
 
@@ -137,7 +135,7 @@ class TestGetModelsByType:
 
     def test_returns_controlnet(self):
         """Should return only ControlNet models."""
-        from switchgen.core.models import get_models_by_type, ModelType
+        from switchgen.core.models import ModelType, get_models_by_type
 
         result = get_models_by_type(ModelType.CONTROLNET)
 
@@ -188,7 +186,7 @@ class TestGetModelInfo:
 
     def test_returns_model_for_valid_id(self):
         """Should return ModelInfo for valid ID."""
-        from switchgen.core.models import get_model_info, MODEL_CATALOG
+        from switchgen.core.models import MODEL_CATALOG, get_model_info
 
         # Get first model ID from catalog
         first_id = next(iter(MODEL_CATALOG.keys()))

@@ -2,7 +2,7 @@
 
 import sys
 
-from .core.logging import setup_logging, get_logger
+from .core.logging import get_logger, setup_logging
 
 # Initialize logging before anything else
 setup_logging()
@@ -17,12 +17,14 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         logger.info("Running in test mode")
         from .core.test_headless import run_test
+
         run_test()
         return
 
     # Normal GTK4 application launch
     logger.debug("Launching GTK4 application")
     from .app import run_app
+
     run_app()
 
 

@@ -1,9 +1,8 @@
 """Shared test fixtures for SwitchGen tests."""
 
+from unittest.mock import MagicMock
+
 import pytest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-from dataclasses import dataclass
 
 
 @pytest.fixture
@@ -12,8 +11,15 @@ def tmp_models_dir(tmp_path):
     models_dir = tmp_path / "models"
     models_dir.mkdir()
     # Create subdirectories for each model type
-    for subdir in ["checkpoints", "vae", "clip_vision", "text_encoders",
-                   "loras", "controlnet", "upscale_models"]:
+    for subdir in [
+        "checkpoints",
+        "vae",
+        "clip_vision",
+        "text_encoders",
+        "loras",
+        "controlnet",
+        "upscale_models",
+    ]:
         (models_dir / subdir).mkdir()
     return models_dir
 
@@ -35,6 +41,7 @@ def tmp_switchgen_root(tmp_path):
 def sample_model_info():
     """Create a sample ModelInfo for testing."""
     from switchgen.core.models import ModelInfo, ModelType
+
     return ModelInfo(
         id="test_model",
         name="Test Model",
@@ -51,17 +58,11 @@ def sample_model_info():
 def sample_workflow():
     """Create a sample workflow dict for testing."""
     return {
-        "1": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": "test.safetensors"}
-        },
-        "2": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": "test prompt", "clip": ["1", 1]}
-        },
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "test.safetensors"}},
+        "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "test prompt", "clip": ["1", 1]}},
         "3": {
             "class_type": "EmptyLatentImage",
-            "inputs": {"width": 512, "height": 512, "batch_size": 1}
+            "inputs": {"width": 512, "height": 512, "batch_size": 1},
         },
         "4": {
             "class_type": "KSampler",
@@ -75,9 +76,9 @@ def sample_workflow():
                 "cfg": 7.0,
                 "sampler_name": "euler",
                 "scheduler": "normal",
-                "denoise": 1.0
-            }
-        }
+                "denoise": 1.0,
+            },
+        },
     }
 
 
@@ -86,11 +87,7 @@ def mock_engine():
     """Create a mock GenerationEngine for testing."""
     engine = MagicMock()
     engine.initialize = MagicMock()
-    engine.execute = MagicMock(return_value=MagicMock(
-        success=True,
-        error=None,
-        images=None
-    ))
+    engine.execute = MagicMock(return_value=MagicMock(success=True, error=None, images=None))
     engine.interrupt = MagicMock()
     engine.set_progress_callback = MagicMock()
     return engine
@@ -99,7 +96,7 @@ def mock_engine():
 @pytest.fixture
 def mock_config(tmp_switchgen_root):
     """Create a mock Config with test paths."""
-    from switchgen.core.config import Config, PathConfig, MemoryConfig, GenerationDefaults
+    from switchgen.core.config import Config, GenerationDefaults, MemoryConfig, PathConfig
 
     # Create a PathConfig with mocked path detection
     path_config = PathConfig.__new__(PathConfig)

@@ -4,33 +4,36 @@ import logging
 import shutil
 import threading
 import time
-from pathlib import Path
-from typing import Callable, Optional
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 try:
-    from huggingface_hub import hf_hub_url, HfApi
-    from huggingface_hub.utils import EntryNotFoundError, build_hf_headers
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
     logger.debug("huggingface_hub not available")
 
-from .models import ModelInfo, ModelType, MODEL_CATALOG, is_model_installed
+from .models import MODEL_CATALOG, ModelInfo, is_model_installed
 
 
 class DownloadCancelledException(Exception):
     """Raised when a download is cancelled by the user."""
+
     pass
 
 
 @dataclass
 class DownloadProgress:
     """Progress information for a download."""
+
     model_id: str
     downloaded_bytes: int
     total_bytes: int
@@ -57,7 +60,7 @@ class DownloadProgress:
         return self.speed_bps / (1024 * 1024)
 
     @property
-    def eta_seconds(self) -> Optional[float]:
+    def eta_seconds(self) -> float | None:
         """Estimated time remaining in seconds."""
         if self.speed_bps <= 0:
             return None
@@ -87,10 +90,11 @@ class DownloadProgress:
 @dataclass
 class DownloadResult:
     """Result of a download operation."""
+
     success: bool
     model_id: str
-    path: Optional[Path] = None
-    error: Optional[str] = None
+    path: Path | None = None
+    error: str | None = None
 
 
 class ModelDownloader:
@@ -98,7 +102,7 @@ class ModelDownloader:
 
     def __init__(self, models_dir: Path):
         self.models_dir = models_dir
-        self._current_download: Optional[str] = None
+        self._current_download: str | None = None
         self._cancel_requested = False
 
     def is_available(self) -> bool:
@@ -129,7 +133,7 @@ class ModelDownloader:
     def download(
         self,
         model_info: ModelInfo,
-        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+        progress_callback: Callable[[DownloadProgress], None] | None = None,
     ) -> DownloadResult:
         """Download a model from HuggingFace Hub.
 
@@ -145,18 +149,22 @@ class ModelDownloader:
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
-                error="huggingface_hub not installed. Run: pip install huggingface_hub"
+                error="huggingface_hub not installed. Run: pip install huggingface_hub",
             )
 
         # Check disk space
         if not self.check_disk_space(model_info.size_mb):
             free_mb, _ = self.get_disk_space_mb()
-            logger.error("Not enough disk space for %s: need %dMB, have %.0fMB",
-                        model_info.name, model_info.size_mb, free_mb)
+            logger.error(
+                "Not enough disk space for %s: need %dMB, have %.0fMB",
+                model_info.name,
+                model_info.size_mb,
+                free_mb,
+            )
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
-                error=f"Not enough disk space. Need {model_info.size_mb}MB, have {free_mb:.0f}MB free"
+                error=f"Not enough disk space. Need {model_info.size_mb}MB, have {free_mb:.0f}MB free",
             )
 
         # Prepare target directory
@@ -169,11 +177,15 @@ class ModelDownloader:
         self._current_download = model_info.id
         self._cancel_requested = False
 
-        logger.info("Starting download: %s (%dMB) from %s",
-                   model_info.name, model_info.size_mb, model_info.repo_id)
+        logger.info(
+            "Starting download: %s (%dMB) from %s",
+            model_info.name,
+            model_info.size_mb,
+            model_info.repo_id,
+        )
 
         # Use temp file for download, then rename on success
-        temp_path = target_path.with_suffix('.tmp')
+        temp_path = target_path.with_suffix(".tmp")
 
         try:
             # Get the download URL from HuggingFace
@@ -188,11 +200,13 @@ class ModelDownloader:
             # Start download with streaming
             # Use tuple timeout: (connect_timeout, read_timeout)
             # Read timeout is per-chunk, not total, so 60s is plenty
-            response = requests.get(url, headers=headers, stream=True, timeout=(30, 60), allow_redirects=True)
+            response = requests.get(
+                url, headers=headers, stream=True, timeout=(30, 60), allow_redirects=True
+            )
             response.raise_for_status()
 
             # Get total size from headers
-            total_size = int(response.headers.get('content-length', 0))
+            total_size = int(response.headers.get("content-length", 0))
             if total_size == 0:
                 total_size = model_info.size_mb * 1024 * 1024  # Fallback to catalog size
 
@@ -204,18 +218,22 @@ class ModelDownloader:
             smoothed_speed = 0.0
             chunk_size = 1024 * 1024  # 1MB chunks for faster downloads
 
-            logger.info("Download starting: %s (%.1f MB)", model_info.name, total_size / (1024*1024))
+            logger.info(
+                "Download starting: %s (%.1f MB)", model_info.name, total_size / (1024 * 1024)
+            )
 
             # Initial progress callback
             if progress_callback:
-                progress_callback(DownloadProgress(
-                    model_id=model_info.id,
-                    downloaded_bytes=0,
-                    total_bytes=total_size,
-                    speed_bps=0,
-                ))
+                progress_callback(
+                    DownloadProgress(
+                        model_id=model_info.id,
+                        downloaded_bytes=0,
+                        total_bytes=total_size,
+                        speed_bps=0,
+                    )
+                )
 
-            with open(temp_path, 'wb') as f:
+            with open(temp_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     # Check for cancellation
                     if self._cancel_requested:
@@ -242,12 +260,14 @@ class ModelDownloader:
                             last_update_time = current_time
                             last_bytes = downloaded
 
-                            progress_callback(DownloadProgress(
-                                model_id=model_info.id,
-                                downloaded_bytes=downloaded,
-                                total_bytes=total_size,
-                                speed_bps=smoothed_speed,
-                            ))
+                            progress_callback(
+                                DownloadProgress(
+                                    model_id=model_info.id,
+                                    downloaded_bytes=downloaded,
+                                    total_bytes=total_size,
+                                    speed_bps=smoothed_speed,
+                                )
+                            )
 
             # Verify download completed
             if not temp_path.exists():
@@ -260,7 +280,26 @@ class ModelDownloader:
 
             if total_size > 0 and actual_size < total_size * 0.99:  # Allow 1% tolerance
                 temp_path.unlink()
-                raise RuntimeError(f"Download incomplete: got {actual_size} bytes, expected {total_size}")
+                raise RuntimeError(
+                    f"Download incomplete: got {actual_size} bytes, expected {total_size}"
+                )
+
+            # Validate checksum if available
+            if model_info.sha256:
+                import hashlib
+
+                h = hashlib.sha256()
+                with open(temp_path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                actual_hash = h.hexdigest()
+                if actual_hash != model_info.sha256:
+                    temp_path.unlink()
+                    raise RuntimeError(
+                        f"Checksum mismatch: expected {model_info.sha256[:16]}..., "
+                        f"got {actual_hash[:16]}..."
+                    )
+                logger.debug("Checksum validated for %s", model_info.name)
 
             # Rename temp file to final path
             if target_path.exists():
@@ -269,12 +308,14 @@ class ModelDownloader:
 
             # Final progress update
             if progress_callback:
-                progress_callback(DownloadProgress(
-                    model_id=model_info.id,
-                    downloaded_bytes=total_size,
-                    total_bytes=total_size,
-                    speed_bps=0,
-                ))
+                progress_callback(
+                    DownloadProgress(
+                        model_id=model_info.id,
+                        downloaded_bytes=total_size,
+                        total_bytes=total_size,
+                        speed_bps=0,
+                    )
+                )
 
             logger.info("Download completed: %s -> %s", model_info.name, target_path)
 
@@ -289,11 +330,7 @@ class ModelDownloader:
             # Clean up temp file
             if temp_path.exists():
                 temp_path.unlink()
-            return DownloadResult(
-                success=False,
-                model_id=model_info.id,
-                error="Download cancelled"
-            )
+            return DownloadResult(success=False, model_id=model_info.id, error="Download cancelled")
         except requests.exceptions.HTTPError as e:
             logger.error("HTTP error downloading %s: %s", model_info.name, e)
             if temp_path.exists():
@@ -302,16 +339,14 @@ class ModelDownloader:
             if status_code == 401:
                 error_msg = "Authentication required. This model may need a HuggingFace account."
             elif status_code == 403:
-                error_msg = "Access denied. You may need to accept the model's license on HuggingFace."
+                error_msg = (
+                    "Access denied. You may need to accept the model's license on HuggingFace."
+                )
             elif status_code == 404:
                 error_msg = "Model not found on HuggingFace. It may have been moved or removed."
             else:
-                error_msg = f"HTTP error {status_code}: {str(e)}"
-            return DownloadResult(
-                success=False,
-                model_id=model_info.id,
-                error=error_msg
-            )
+                error_msg = f"HTTP error {status_code}: {e!s}"
+            return DownloadResult(success=False, model_id=model_info.id, error=error_msg)
         except requests.exceptions.ConnectionError:
             logger.error("Connection error downloading %s", model_info.name)
             if temp_path.exists():
@@ -319,34 +354,28 @@ class ModelDownloader:
             return DownloadResult(
                 success=False,
                 model_id=model_info.id,
-                error="Network error. Check your internet connection and try again."
+                error="Network error. Check your internet connection and try again.",
             )
         except requests.exceptions.Timeout:
             logger.error("Timeout downloading %s", model_info.name)
             if temp_path.exists():
                 temp_path.unlink()
             return DownloadResult(
-                success=False,
-                model_id=model_info.id,
-                error="Download timed out. Try again later."
+                success=False, model_id=model_info.id, error="Download timed out. Try again later."
             )
         except Exception as e:
             logger.error("Download failed for %s: %s", model_info.name, e, exc_info=True)
             if temp_path.exists():
                 temp_path.unlink()
-            return DownloadResult(
-                success=False,
-                model_id=model_info.id,
-                error=str(e)
-            )
+            return DownloadResult(success=False, model_id=model_info.id, error=str(e))
         finally:
             self._current_download = None
 
     def download_async(
         self,
         model_info: ModelInfo,
-        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
-        complete_callback: Optional[Callable[[DownloadResult], None]] = None,
+        progress_callback: Callable[[DownloadProgress], None] | None = None,
+        complete_callback: Callable[[DownloadResult], None] | None = None,
     ) -> threading.Thread:
         """Download a model asynchronously.
 
@@ -358,10 +387,22 @@ class ModelDownloader:
         Returns:
             The download thread
         """
+
         def run():
-            result = self.download(model_info, progress_callback)
+            try:
+                result = self.download(model_info, progress_callback)
+            except Exception as e:
+                logger.error("Download thread failed: %s", e, exc_info=True)
+                result = DownloadResult(
+                    success=False,
+                    model_id=model_info.id,
+                    error=str(e),
+                )
             if complete_callback:
-                complete_callback(result)
+                try:
+                    complete_callback(result)
+                except Exception as e:
+                    logger.error("Download complete callback error: %s", e, exc_info=True)
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -377,6 +418,6 @@ class ModelDownloader:
         return self._current_download is not None
 
     @property
-    def current_download_id(self) -> Optional[str]:
+    def current_download_id(self) -> str | None:
         """Get the ID of the model currently being downloaded."""
         return self._current_download

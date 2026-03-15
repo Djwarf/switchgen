@@ -4,8 +4,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
-
 
 # Log format with timestamp, module, level, and message
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -13,8 +11,8 @@ LOG_FORMAT_SIMPLE = "%(levelname)s - %(message)s"
 
 
 def setup_logging(
-    level: Optional[int] = None,
-    log_file: Optional[Path] = None,
+    level: int | None = None,
+    log_file: Path | None = None,
     simple_format: bool = False,
 ) -> logging.Logger:
     """Configure application-wide logging.

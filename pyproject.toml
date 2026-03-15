@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "switchgen"
-version = "0.1.1"
+version = "0.2.0"
 description = "Image and video generator using ComfyUI as a library"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ dependencies = [
     # SwitchGen UI
     "PyGObject>=3.42",
     "huggingface_hub>=0.20.0",
+    "requests>=2.28.0",
 
     # ComfyUI core dependencies
     "torch",
@@ -46,6 +47,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "pytest-cov>=4.0",
+    "ruff>=0.4.0",
+    "mypy>=1.8",
 ]
 
 [project.scripts]
@@ -66,3 +70,41 @@ dependencies = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",   # Line length handled by formatter
+    "E402",   # Module level import not at top (needed for conditional imports after try/except)
+    "RUF001", # Ambiguous unicode chars (intentional × multiplication sign in UI)
+    "RUF022", # __all__ not sorted (we prefer logical grouping)
+    "SIM108", # Ternary operator suggestion (if/else is often more readable)
+    "SIM117", # Nested with statements (sometimes necessary with pytest.raises)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["switchgen"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+packages = ["switchgen"]
+
+[[tool.mypy.overrides]]
+module = [
+    "gi.*",
+    "comfy.*",
+    "nodes.*",
+    "folder_paths.*",
+    "execution.*",
+    "huggingface_hub.*",
+]
+ignore_missing_imports = true
