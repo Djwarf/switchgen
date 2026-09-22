@@ -1,0 +1,629 @@
+@import "tailwindcss";
+
+/* ============================================================
+   SwitchSides brand tokens - Classical Newspaper palette
+   Source: sym/branding-guide/Branding/{colours,typography}.md
+   ============================================================ */
+@theme {
+  --color-burgundy-950: #1e0000;
+  --color-burgundy-900: #2e0000; /* PRIMARY */
+  --color-burgundy-800: #3e0000;
+  --color-burgundy-700: #4e2821;
+  --color-burgundy-600: #532b2b;
+  --color-burgundy-500: #664141;
+  --color-burgundy-400: #8b5555;
+  --color-burgundy-300: #a87070;
+  --color-burgundy-200: #c59999;
+  --color-burgundy-100: #ddbfbf;
+  --color-burgundy-50: #f0dada;
+
+  --color-newsprint: #fafaf8;
+  --color-newsprint-aged: #f5f3ed;
+
+  --color-ink: #000000;
+  --color-grey-700: #404040;
+  --color-grey-500: #737373;
+  --color-grey-400: #a3a3a3;
+  --color-grey-300: #d4d4d4;
+  --color-grey-200: #e5e5e5;
+
+  --color-success: #166534;
+  --color-error: #991b1b;
+  --color-warning: #92400e;
+
+  --font-serif: "Crimson Text", Georgia, "Times New Roman", serif;
+
+  /* Type scale - typography.md */
+  --text-display: 3.5rem;
+  --text-h1: 2.25rem;
+  --text-h2: 1.875rem;
+  --text-h3: 1.5rem;
+  --text-body: 1rem;
+  --text-small: 0.875rem;
+  --text-caption: 0.75rem;
+  --text-overline: 0.625rem;
+}
+
+@font-face {
+  font-family: "Crimson Text";
+  src: url("/fonts/CrimsonText-Regular.ttf") format("truetype");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "Crimson Text";
+  src: url("/fonts/CrimsonText-Italic.ttf") format("truetype");
+  font-weight: 400; font-style: italic; font-display: swap;
+}
+@font-face {
+  font-family: "Crimson Text";
+  src: url("/fonts/CrimsonText-SemiBold.ttf") format("truetype");
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "Crimson Text";
+  src: url("/fonts/CrimsonText-Bold.ttf") format("truetype");
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background-color: var(--color-newsprint);
+  color: var(--color-ink);
+  font-family: var(--font-serif);
+  font-size: var(--text-body);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------
+   Editorial primitives
+   ------------------------------------------------------------ */
+
+.kicker {
+  font-size: var(--text-overline);
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-burgundy-900);
+}
+
+.section-rule {
+  border-bottom: 2px solid var(--color-burgundy-900);
+  padding-bottom: 0.35rem;
+  margin-bottom: 0.9rem;
+}
+
+.field {
+  width: 100%;
+  background-color: transparent;
+  border: 1px solid var(--color-grey-300);
+  padding: 0.5rem 0.65rem;
+  font-family: var(--font-serif);
+  font-size: var(--text-small);
+  color: var(--color-ink);
+  outline: none;
+  transition: border-color 120ms ease;
+}
+.field:focus { border-color: var(--color-burgundy-900); }
+.field::placeholder { color: var(--color-grey-400); font-style: italic; }
+
+textarea.field { resize: vertical; line-height: 1.5; }
+
+select.field {
+  appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--color-burgundy-900) 50%),
+    linear-gradient(135deg, var(--color-burgundy-900) 50%, transparent 50%);
+  background-position: right 0.85rem center, right 0.6rem center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.75rem;
+}
+
+.press {
+  display: block;
+  width: 100%;
+  background-color: var(--color-burgundy-900);
+  color: var(--color-newsprint);
+  font-family: var(--font-serif);
+  font-size: var(--text-small);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 0.7rem 1rem;
+  border: 1px solid var(--color-burgundy-900);
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.press:hover:not(:disabled) {
+  background-color: var(--color-newsprint);
+  color: var(--color-burgundy-900);
+}
+.press:disabled {
+  background-color: var(--color-grey-300);
+  border-color: var(--color-grey-300);
+  color: var(--color-grey-500);
+  cursor: not-allowed;
+}
+
+.dropcap::first-letter {
+  float: left;
+  font-size: 3.1rem;
+  line-height: 0.82;
+  font-weight: 700;
+  color: var(--color-burgundy-900);
+  padding-right: 0.5rem;
+  padding-top: 0.25rem;
+}
+
+* { scrollbar-width: thin; scrollbar-color: var(--color-grey-300) transparent; }
+
+/* ============================================================
+   SHELL ADDITIONS — appended, never replacing. Everything above
+   this line is untouched.
+
+   Two rule weights only: 1px grey-300 and 2px burgundy-900.
+   No border-radius. No box-shadow. Burgundy is rationed to the
+   list in the spec's burgundy budget.
+   ============================================================ */
+
+/* Quiet kicker — metadata, card labels, captions. Burgundy kickers
+   everywhere is the failure mode the restraint principle names. */
+.kicker-quiet {
+  font-size: var(--text-overline);
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-grey-700);
+}
+
+/* Rules — exactly two weights in the whole app. */
+.rule-hair  { border-bottom: 1px solid var(--color-grey-300); }
+.rule-heavy { border-bottom: 2px solid var(--color-burgundy-900); }
+
+/* Notices — components.md verbatim. */
+.notice { padding: 0.75rem 1rem; border-left: 4px solid; line-height: 1.5; }
+.notice strong { font-weight: 700; }
+.notice-info       { background: var(--color-burgundy-50); border-color: var(--color-burgundy-900); color: var(--color-ink); }
+.notice-success    { background: #f0fdf4; border-color: var(--color-success); color: #065f46; }
+.notice-error      { background: #fef2f2; border-color: var(--color-error); color: #7f1d1d; }
+.notice-warning    { background: #fffbeb; border-color: var(--color-warning); color: #78350f; }
+.notice-correction { background: #f5f5f5; border-left-color: var(--color-ink); font-style: italic; }
+.notice-correction strong {
+  font-style: normal;
+  text-transform: uppercase;
+  font-size: var(--text-small);
+  letter-spacing: 0.05em;
+}
+
+/* Pull quote — the prompt, under every result and in every detail view. */
+.pullquote {
+  font-size: 1.5rem;
+  font-style: italic;
+  line-height: 1.35;
+  border-left: 4px solid var(--color-burgundy-900);
+  padding-left: 1.25rem;
+  color: var(--color-ink);
+}
+
+/* Every number that changes or stacks. */
+.figures { font-variant-numeric: tabular-nums; }
+
+/* The house focus ring. Square, like everything else. */
+.ring:focus-visible {
+  outline: 2px solid var(--color-burgundy-900);
+  outline-offset: 2px;
+}
+
+/* `ring` is the house focus ring - and it is also a Tailwind utility name.
+   Tailwind emits `.ring` as a permanent 1px box-shadow in currentColor, which
+   drew a box around every tab, button and card in the application and broke the
+   rule that there is no box-shadow anywhere in it. This rule is unlayered, so it
+   beats the utility whatever the source order, and the ring stays where it
+   belongs: on focus, as a square outline. */
+.ring {
+  --tw-ring-shadow: 0 0 rgb(0 0 0 / 0);
+  box-shadow: none;
+}
+
+/* Seed: provisional until it is committed. */
+.seed-random    { color: var(--color-grey-500); font-style: italic; }
+.seed-committed { color: var(--color-ink); font-style: normal; }
+
+/* ------------------------------------------------------------
+   Shell primitives. Prefixed sg- so no other file collides.
+   ------------------------------------------------------------ */
+
+/* Editorial link: burgundy, underlined, never a button in disguise. */
+.sg-link {
+  color: var(--color-burgundy-900);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  text-decoration-thickness: 1px;
+  cursor: pointer;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+}
+.sg-link:hover { color: var(--color-burgundy-700); text-decoration-thickness: 2px; }
+.sg-link:disabled { color: var(--color-grey-400); text-decoration: none; cursor: not-allowed; }
+
+/* A quiet button that is still a button: hairline box, black label. */
+.sg-quiet {
+  font-size: var(--text-overline);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ink);
+  background: transparent;
+  border: 1px solid var(--color-grey-300);
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.sg-quiet:hover:not(:disabled) { border-color: var(--color-ink); background: var(--color-newsprint-aged); }
+.sg-quiet[aria-pressed='true'] { background: var(--color-ink); border-color: var(--color-ink); color: var(--color-newsprint); }
+.sg-quiet:disabled { color: var(--color-grey-400); border-color: var(--color-grey-200); cursor: not-allowed; }
+
+/* Section-bar tab. Active is burgundy label over a 2px burgundy underline;
+   inactive is grey with no rule. Nothing moves between the two states. */
+.sg-tab {
+  display: inline-block;
+  font-size: var(--text-overline);
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-grey-500);
+  text-decoration: none;
+  padding: 0.55rem 0.1rem;
+  border-bottom: 2px solid transparent;
+  transition: color 120ms ease;
+}
+.sg-tab:hover { color: var(--color-ink); }
+.sg-tab[aria-current='page'] {
+  color: var(--color-burgundy-900);
+  border-bottom-color: var(--color-burgundy-900);
+}
+
+/* The live-job mark: a printer's register square, not a dot. */
+.sg-mark {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--color-burgundy-900);
+  flex: none;
+}
+.sg-mark-live { animation: sg-breathe 1.6s ease-in-out infinite; }
+.sg-mark-idle { background: var(--color-grey-400); }
+.sg-mark-off  { background: var(--color-error); }
+@keyframes sg-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+/* The progress rule. One hairline channel, one burgundy fill, linear. */
+.sg-progress { position: relative; height: 2px; background: var(--color-grey-200); }
+.sg-progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--color-burgundy-900);
+  transition: width 400ms linear;
+}
+.sg-progress-idle { background: transparent; }
+
+/* Hold to stop: a burgundy wipe fills the button over 600ms. */
+.sg-hold { position: relative; overflow: hidden; }
+.sg-hold > .sg-hold-wipe {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--color-burgundy-900);
+  opacity: 0.16;
+  pointer-events: none;
+  transition: width 60ms linear;
+}
+
+/* Newspaper index: label, leader dots, key. */
+.sg-leader { display: flex; align-items: baseline; gap: 0.5rem; }
+.sg-leader-dots {
+  flex: 1 1 auto;
+  border-bottom: 1px dotted var(--color-grey-400);
+  transform: translateY(-0.28em);
+}
+
+/* A key, set as type rather than as a keycap graphic. */
+.sg-key {
+  font-size: var(--text-caption);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-ink);
+  border: 1px solid var(--color-grey-300);
+  padding: 0.05rem 0.35rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Overlay: the page behind is dimmed with ink, never blurred. */
+.sg-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2rem 1rem;
+  overflow: auto;
+  z-index: 60;
+}
+.sg-sheet {
+  background: var(--color-newsprint);
+  border: 1px solid var(--color-grey-300);
+  border-top: 2px solid var(--color-burgundy-900);
+  width: 100%;
+  max-width: 54rem;
+}
+
+/* The undo notice drains rather than counts. */
+.sg-drain { height: 1px; background: var(--color-grey-300); }
+.sg-drain-fill { height: 1px; background: var(--color-burgundy-900); animation: sg-drain linear forwards; }
+@keyframes sg-drain { from { width: 100%; } to { width: 0%; } }
+
+/* Motion, all three of it. */
+.sg-develop { animation: sg-develop 420ms ease-out both; }
+@keyframes sg-develop { from { filter: blur(8px); opacity: 0.4; } to { filter: blur(0); opacity: 1; } }
+.sg-unfold { animation: sg-unfold 180ms ease-out both; }
+@keyframes sg-unfold { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ------------------------------------------------------------
+   Shell corrections — appended, nothing above is touched.
+   ------------------------------------------------------------ */
+
+/* The section bar closes with a 1px hairline so the active tab's 2px burgundy
+   underline is the heaviest thing on the row. The tab sits over the hairline
+   rather than under it. */
+.sg-tab { margin-bottom: -1px; }
+
+/* A healthy connection. Green, not burgundy: the burgundy mark in the section
+   bar means "the press is running", and it must not have a twin. */
+.sg-mark-ok { background: var(--color-success); }
+
+/* The shortcuts card can outgrow a short window; let it scroll on its own. */
+.sg-sheet { max-height: calc(100vh - 4rem); overflow-y: auto; }
+
+/* Leader dots want the same baseline as the label either side of them. */
+.sg-leader-dots { min-width: 1.5rem; }
+
+/* ============================================================
+   CROSS-PLATFORM: safe areas, touch, focus floor, couch scale.
+   Appended in the file's existing idiom — nothing above this
+   line is touched. Every rule is either a new token, a new
+   sg- primitive, or guarded by a query that is false on a
+   desktop mouse. Palette, the two rule weights, the type scale
+   and the absence of radius are all unchanged.
+   ============================================================ */
+
+:root {
+  /* index.html sets viewport-fit=cover AND black-translucent, so the
+     document reaches under the status bar, the home indicator and the
+     notch. These are the four distances to pay back. 0px everywhere
+     that reports no inset — which is freya and book. */
+  --sg-safe-t: env(safe-area-inset-top, 0px);
+  --sg-safe-r: env(safe-area-inset-right, 0px);
+  --sg-safe-b: env(safe-area-inset-bottom, 0px);
+  --sg-safe-l: env(safe-area-inset-left, 0px);
+
+  /* The sticky section bar's height, so the archive's date rules and
+     the list view's column heads park BENEATH it instead of behind it.
+     In rem, so it tracks the couch steps at the foot of this file. */
+  --sg-bar-h: 2.25rem;
+
+  /* The paper is light. Saying it here as well as in the meta tag is
+     what opts out of Chrome for Android's Auto Dark Theme, which would
+     otherwise invert newsprint to near-black and burgundy to pink on
+     djwars-tab-s8. `only light` is the form that refuses the algorithm. */
+  color-scheme: only light;
+}
+
+/* Pay the insets once, for everything in normal flow: the masthead, all
+   three desks, the archive, the page foot. box-sizing: border-box is
+   already set by Tailwind preflight, so `height: 100%` above keeps
+   working and no scrollbar is introduced.
+
+   `position: fixed` escapes this, and `position: sticky` offsets are
+   measured against the scrollport rather than this padding — so the
+   section bar, the three bottom rails, the selection bar and the
+   full-bleed overlays each still add their own inset below. */
+body {
+  padding-top: var(--sg-safe-t);
+  padding-right: var(--sg-safe-r);
+  padding-bottom: var(--sg-safe-b);
+  padding-left: var(--sg-safe-l);
+}
+
+/* Pull-to-refresh reloads the page, which on this app means losing a
+   desk's draft and abandoning an in-flight job because someone
+   over-scrolled the archive on a tablet. Scrolling past the end should
+   simply stop. Set on both: the root is what the spec propagates to the
+   viewport, the body is what Chrome has always honoured. */
+html, body { overscroll-behavior-y: contain; }
+
+/* The section bar is the app's only navigation and it sticks. Pinned at
+   top: 0 it sits under the clock in standalone. Pinning it to the inset
+   instead would leave page content scrolling visibly through the strip
+   above it, so the pseudo-element paints newsprint over exactly the
+   inset height and the status bar reads as part of the paper. */
+.sg-sticky-top {
+  position: sticky;
+  top: var(--sg-safe-t);
+}
+.sg-sticky-top::before {
+  content: '';
+  position: absolute;
+  inset-inline: 0;
+  bottom: 100%;
+  height: var(--sg-safe-t);
+  background: var(--color-newsprint);
+}
+
+/* A 44px tap target that is invisible to the eye.
+   Several controls here are deliberately small printed objects — the
+   12px selection square in the list, the 16px one on a card, the two
+   pointer rails. Growing them would coarsen the page. This centres an
+   empty 44x44 pseudo-element over the element instead: no padding, no
+   border, no colour, not one visible pixel moved, and no layout shift.
+   Coarse pointers only, so the mouse and the TV are untouched. */
+@media (pointer: coarse) {
+  .sg-tap:not(.absolute):not(.fixed) { position: relative; }
+  .sg-tap::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Some archive controls appear on hover and only on hover. A touch
+   screen has no hover and cannot focus an invisible control, so there
+   they are simply printed. The hover rules are left exactly as written:
+   under `hover: none` they never match, so nothing fights. */
+@media (hover: none) {
+  .sg-touch-reveal { opacity: 1; }
+}
+
+/* The house controls are set to be read, not to be hit. On a touch
+   screen they get air and nothing else — same hairline, same caps, same
+   tracking, same absence of rounding.
+
+   .field additionally: iOS Safari zooms the page whenever it focuses a
+   field under 16px and, with viewport-fit=cover and no maximum-scale,
+   never zooms back. 14px is right on the desk and on the television and
+   wrong in the hand. */
+@media (pointer: coarse) {
+  :root { --sg-bar-h: 2.75rem; }
+
+  .field {
+    font-size: var(--text-body);
+    min-height: 44px;
+    padding: 0.6rem 0.7rem;
+  }
+  select.field { background-position: right 1rem center, right 0.75rem center; }
+
+  .sg-quiet { min-height: 44px; padding-block: 0.7rem; }
+  .sg-tab   { padding-block: 0.85rem; min-height: 44px; }
+  .sg-link  { padding-block: 0.35rem; }
+}
+
+/* Android paints a translucent rounded blue box over every tapped
+   control, on a design that has neither rounding nor blue. Turn it off,
+   and give the press state back as ink in the house idiom so a tap
+   still answers. */
+@media (pointer: coarse) {
+  :root { -webkit-tap-highlight-color: transparent; }
+  .press:active:not(:disabled) { background-color: var(--color-burgundy-800); }
+  .sg-quiet:active:not(:disabled) {
+    background-color: var(--color-newsprint-aged);
+    border-color: var(--color-ink);
+  }
+}
+
+/* Hold-to-stop is a 600ms press, and on Android 600ms is a long-press:
+   the selection callout and the context menu come up over the burgundy
+   wipe, and the resulting selection change cancels the pointer stream
+   before the hold completes. The button owns the gesture outright.
+   (Extends the .sg-hold above; position/overflow are unchanged.) */
+.sg-hold {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Overlays. 100vh on a mobile browser is the toolbar-RETRACTED height,
+   so a sheet capped in vh is taller than the visible page whenever the
+   toolbar is showing and its own foot falls below the fold. 100dvh
+   tracks it. The scrim's padding has to pay the insets itself, because
+   a fixed element never sees the body padding above.
+   These supersede the .sg-scrim padding and .sg-sheet max-height
+   earlier in the file, being appended after them. */
+.sg-scrim {
+  padding:
+    calc(2rem + var(--sg-safe-t))
+    calc(1rem + var(--sg-safe-r))
+    calc(2rem + var(--sg-safe-b))
+    calc(1rem + var(--sg-safe-l));
+  overscroll-behavior: contain;
+}
+.sg-sheet {
+  max-height: calc(100dvh - 4rem - var(--sg-safe-t) - var(--sg-safe-b));
+  overflow-y: auto;
+}
+
+/* The focus floor. :where() keeps specificity at 0, so every component
+   ring already written still wins. */
+:where(
+  a[href], button, input, select, textarea, summary,
+  [tabindex]:not([tabindex='-1']), [role='slider'], [role='menuitem'], [role='button']
+):focus-visible {
+  outline: 2px solid var(--color-burgundy-900);
+  outline-offset: 2px;
+}
+
+/* .field sets `outline: none`, which beats a :where() rule, and replaces
+   it with a 1px hairline changing colour — legible at desk distance,
+   nothing at all at three metres. Give the ring back. The quiet burgundy
+   border shift stays; this sits on top of it. */
+.field:focus-visible {
+  outline: 2px solid var(--color-burgundy-900);
+  outline-offset: 2px;
+}
+
+/* .press — the primary action on all three desks — declared no focus
+   style whatsoever. The 2px offset puts the ring on newsprint, outside
+   the burgundy fill, where it reads at 17:1 instead of burgundy-on-burgundy. */
+.press:focus-visible {
+  outline: 2px solid var(--color-burgundy-900);
+  outline-offset: 2px;
+}
+
+/* Placeholders are content on a form you are still learning. grey-400 on
+   newsprint is 2.47:1 — it fails AA outright and is gone at three metres.
+   grey-500 is 4.6:1 and still reads as secondary. */
+.field::placeholder { color: var(--color-grey-500); }
+
+/* The measure. newspaper-design-principles.md puts it at 50-60 characters;
+   inside the 110rem page container the offline band was running to nearly
+   200. One rule keeps every notice in the app honest at 4K. */
+.notice p { max-width: 68ch; }
+
+/* The reduced-motion block above collapses durations but leaves
+   animation-iteration-count alone, so .sg-mark-live's infinite breathe
+   becomes an infinite 0.01ms cycle — the connection mark flickers rather
+   than stops, and the compositor is kept awake for the life of a job.
+   iteration-count is the line that actually stops it. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* freya is wired to a television and read from the sofa. Every dimension
+   in this app is already in rem — the type tokens, Tailwind's spacing,
+   h-8, the 17rem/24rem columns, the 110rem measure — so one step on the
+   root prints the whole editorial system larger in proportion and moves
+   nothing relative to anything else. Media-query rem always resolves
+   against 16px, so Tailwind's sm/md/lg/xl do not shift underneath this.
+   Gated on height as well as width so an ultrawide desk monitor is not
+   caught by it. */
+@media (min-width: 1800px) and (min-height: 1000px) { html { font-size: 18px; } }
+@media (min-width: 2200px) { html { font-size: 19px; } }
+@media (min-width: 3000px) { html { font-size: 22px; } }

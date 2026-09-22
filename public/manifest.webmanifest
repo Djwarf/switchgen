@@ -1,0 +1,22 @@
+{
+  "name": "SwitchGen",
+  "short_name": "SwitchGen",
+  "description": "Local AI image and video generation",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#FAFAF8",
+  "theme_color": "#2e0000",
+  "categories": ["graphics", "photo", "utilities"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Pictures", "url": "/#/pictures" },
+    { "name": "Video", "url": "/#/video" },
+    { "name": "Archive", "url": "/#/archive" }
+  ]
+}
