@@ -12,9 +12,9 @@
  * Nothing on a clip is measured the way the picture stacks were. Every
  * strength here is the author's, and the copy says so.
  */
-import type { StackEntry } from './loras'
+import { loadStack, saveStack, type LoraStack, type StackEntry } from './loras'
 import { withVideoLoras, type LoraSpec, type VideoLoraSpec } from './refine'
-import type { FamilyDef } from './workflows'
+import { FAMILIES, type FamilyDef } from './workflows'
 
 const PAIR = /^(.*?)([_-])(HIGH|LOW)(\.[^.]+)$/i
 
@@ -70,7 +70,9 @@ export function builtInLoras(def: FamilyDef): Set<string> {
  *
  * On a two-half family a HIGH or LOW row becomes one spec per half. Each half
  * runs at its own row's strength when both halves have a row, and at this
- * row's strength when the partner is merely installed. A partner that is on
+ * row's strength when the partner is merely installed. A row at strength 0
+ * still counts as its half's row, so its half gets nothing rather than the
+ * partner's file: withVideoLoras chains nothing at 0. A partner that is on
  * the rack but switched off, or otherwise left out, is `excluded`: it is
  * never pulled back in, and the row is treated as having no partner, which
  * sends it to both halves. On a one-model family the list passes through,
@@ -145,7 +147,9 @@ export function chainVideoStack(
   excluded: ReadonlySet<string> = new Set(),
 ): ReturnType<typeof withVideoLoras> {
   const expanded = videoLorasToRun(def, specs, installed, excluded)
-  if (!expanded.length) return null
+  // Rows at 0 are passed in only to keep a pair's halves apart; with nothing
+  // else to chain, the family's own graph is the graph.
+  if (!expanded.some((s) => s.strength !== 0)) return null
   return withVideoLoras(def, expanded)
 }
 
@@ -167,14 +171,27 @@ export type RecordedLora = {
  * pulls its partner in when the partner is installed: that is how a lone row
  * ran before the record listed both halves. Only a half the record marks as
  * having run on both halves had its partner left out on purpose, and it gets
- * the partner back as a switched-off row so the partner stays out. The
+ * the partner back as a switched-off row so the partner stays out. A half
+ * the record marks as having run on its own half alone had its partner's row
+ * at 0 (a half at 0 is not recorded), and gets that row back at 0. The
  * family's own add-ons are never put on the rack, because its graph loads
  * them already.
+ *
+ * A record that marks no add-on with its half was filed before the halves
+ * were recorded, when the rack's rows were listed as they stood and a pair
+ * ran both halves at the strength of whichever of its rows came first. Both
+ * halves of a pair on such a record fold to one row at that strength, which
+ * is what ran, whatever the second row said.
+ *
+ * `installed` is null when nobody knows what is installed (the Archive does
+ * not load the add-on library). A partner that has to stay out then gets its
+ * switched-off row whether or not it is on disk, since leaving the row off
+ * would let it be pulled in the moment it is.
  */
 export function rackFromRecord(
   loras: readonly RecordedLora[],
   def: FamilyDef,
-  installed: ReadonlySet<string>,
+  installed: ReadonlySet<string> | null,
 ): StackEntry[] {
   const own = builtInLoras(def)
   const kept = loras.filter((l) => !own.has(l.name))
@@ -186,6 +203,7 @@ export function rackFromRecord(
   })
   if (!def.dualModel) return kept.map((l) => row(l))
 
+  const legacy = !kept.some((l) => l.half)
   const byName = new Map(kept.map((l) => [l.name, l]))
   const out: StackEntry[] = []
   const done = new Set<string>()
@@ -203,12 +221,76 @@ export function rackFromRecord(
       done.add(partner)
       const high = half.half === 'high' ? l : twin
       const low = high === l ? twin : l
+      if (legacy) {
+        // `l` is the one listed first, and its strength ran on both halves.
+        out.push(row({ ...high, strength: l.strength, clipStrength: l.clipStrength }))
+        continue
+      }
       out.push(row(high))
       if (low.strength !== high.strength) out.push(row(low))
+    } else if ((l.half === 'high' || l.half === 'low') && (installed === null || installed.has(partner))) {
+      // It ran on its own half only, so its partner's row was at 0: back at
+      // 0, the partner is not pulled in at this row's strength.
+      const zero = row({ name: partner, strength: 0 })
+      if (l.half === 'high') out.push(row(l), zero)
+      else out.push(zero, row(l))
     } else {
       out.push(row(l))
-      if (l.half === 'both' && installed.has(partner)) out.push(row({ ...l, name: partner }, false))
+      if (l.half === 'both' && (installed === null || installed.has(partner))) out.push(row({ ...l, name: partner }, false))
     }
   }
   return out
+}
+
+/** Two racks that would chain the same files at the same strengths. */
+export function sameRack(a: LoraStack, b: LoraStack): boolean {
+  return (
+    a.length === b.length &&
+    a.every((e, i) => e.file === b[i].file && e.strength === b[i].strength && e.enabled === b[i].enabled)
+  )
+}
+
+/** What putting a clip's record back did to its family's saved rack. */
+export type RestoredRack = {
+  familyId: string
+  /** The rack before, for an undo. */
+  prior: LoraStack
+  /** The rack the record asked for, now saved. */
+  next: LoraStack
+  /** A sentence for the reader when the rack changed under them, else null. */
+  note: string | null
+  /** Put the prior rack back. */
+  undo: () => void
+}
+
+/**
+ * Put the add-ons a clip's record ran with back on its family's rack, and save
+ * it, so the next clip runs them the same way wherever the record was reused
+ * from. A clip that used none empties the rack, since whatever was on it would
+ * otherwise ride along on a clip that never had it.
+ *
+ * The note speaks only when there was a rack to replace: a rack filled from
+ * nothing is plain to see on the desk.
+ */
+export function restoreRack(
+  entry: { familyId: string; loras?: readonly RecordedLora[] },
+  installed: ReadonlySet<string> | null,
+): RestoredRack {
+  const familyId = entry.familyId
+  const prior = loadStack(familyId)
+  const def = FAMILIES.find((f) => f.id === familyId) ?? null
+  const loras = entry.loras ?? []
+  const next: LoraStack = !loras.length
+    ? []
+    : def
+      ? rackFromRecord(loras, def, installed)
+      : loras.map((l) => ({ file: l.name, strength: l.strength, clipStrength: l.clipStrength, enabled: true }))
+  saveStack(familyId, next)
+  const note =
+    prior.length && !sameRack(prior, next)
+      ? next.length
+        ? 'The add-on rack now holds what this clip used.'
+        : 'The add-ons on the rack were taken off, because this clip used none.'
+      : null
+  return { familyId, prior, next, note, undo: () => void saveStack(familyId, prior) }
 }

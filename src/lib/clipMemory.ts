@@ -4,23 +4,37 @@
  * The memory verdict in hardware.ts counts weights, and the weights of a 14B
  * pair fit: two experts at about 9.3 GB each plus the encoder. What does not
  * fit is the working set of a long clip on top of them, and it arrives at the
- * very end, when the sampled latent is decoded. On 2026-09-22 a Wan 2.2 T2V
- * 14B clip sampled for fifteen minutes and was killed by earlyoom in its
- * final decode, with the ComfyUI process at 19.4 GB and the machine's swap
- * gone. The registry records two measured points on the same 30.5 GB
- * machine, and this module holds the clip against them rather than against
- * a model of memory nobody measured:
+ * very end, when the sampled latent is decoded. The registry records what the
+ * two pairs did on one 30.5 GB machine, and this module holds each pair to
+ * its own record rather than to a model of memory nobody measured.
+ *
+ * The text-to-video pair loads no add-on of its own. Measured bare:
  *
  *   49 frames at 832 x 480   peaked near 20 GB and survived
  *   81 frames at 832 x 480   peaked at 28.1 GB, exactly where earlyoom fires
  *
  * The second point is an edge, not a limit: the same render was killed the
  * next time because memory from earlier runs had stayed resident in the
- * long-lived ComfyUI process. So a clip larger than the edge is refused, a
- * clip between the two is cautioned, and before any clip on these families
- * ComfyUI is asked to release its cached models (releaseComfyMemory), which
- * is the registry's own advice ("restart the service between heavy renders")
- * without the restart.
+ * long-lived ComfyUI process. So a clip larger than the edge is refused and a
+ * clip between the two is cautioned. Releasing ComfyUI's cached models before
+ * the clip (releaseComfyMemory) is the registry's own advice ("restart the
+ * service between heavy renders") without the restart, and it answers only
+ * that second kind of kill: it clears what earlier runs left behind and makes
+ * no room for the clip itself.
+ *
+ * The image-to-video pair always loads an add-on on each half, and it is
+ * worse. With both, 81 frames at 832 x 480 was killed in three runs out of
+ * three, each as the decoder loaded beside the two experts, so inside the one
+ * run and out of reach of any release. 49 frames came through once, and was
+ * killed once with an add-on on only one half. The registry calls the pair
+ * not reliable on 30 GB and names the 5B as the model for a clip from a start
+ * frame. So anything larger than 49 frames at 832 x 480 is refused, and
+ * anything else is cautioned, never simply let through.
+ *
+ * Neither pair was measured with anything on the rack, and the registry says
+ * of a clip already at 28.1 GB that any addition tips it. Add-ons the reader
+ * chains make the verdict one step stricter: what would pass is cautioned and
+ * what would be cautioned is refused.
  *
  * On a machine with clearly more memory than the one measured, nothing is
  * refused: the figures were not taken there, and a refusal would be a claim
@@ -28,17 +42,27 @@
  */
 import type { Hardware } from './hardware'
 
-type Point = { width: number; height: number; frames: number; peakGb: number }
+type Point = { width: number; height: number; frames: number; peakGb?: number }
 
-/** The machine the two points were measured on. */
+/** The machine every point below was measured on. */
 const MEASURED_RAM_GB = 30.5
+
+/** The text-to-video pair, bare. */
 const SURVIVED: Point = { width: 832, height: 480, frames: 49, peakGb: 20 }
 const EDGE: Point = { width: 832, height: 480, frames: 81, peakGb: 28.1 }
+
+/** The image-to-video pair, with its own add-on on each half. */
+const I2V_ID = 'wan22-14b-i2v'
+const I2V_CAME_THROUGH: Point = { width: 832, height: 480, frames: 49 }
+const I2V_KILLED: Point = { width: 832, height: 480, frames: 81 }
+/** The model the registry names for a clip from a start frame instead, and what it was measured doing. */
+const SAFER_I2V = 'Wan 2.2 TI2V 5B, which made a 49-frame clip from a start frame at 1280 × 704 and peaked at 8.6 GB'
 
 /** Above this much RAM the measurements no longer describe the machine. */
 const BEYOND_MEASURED_GB = MEASURED_RAM_GB * 1.25
 
 const pixelFrames = (p: { width: number; height: number; frames: number }) => p.width * p.height * p.frames
+const at = (p: Point) => `${p.frames} frames at ${p.width} × ${p.height}`
 
 export type ClipMemory = {
   level: 'ok' | 'caution' | 'refuse'
@@ -49,53 +73,151 @@ export type ClipMemory = {
 }
 
 const OK: ClipMemory = { level: 'ok', reason: null, release: false }
+const caution = (reason: string): ClipMemory => ({ level: 'caution', reason, release: true })
+const refuse = (reason: string): ClipMemory => ({ level: 'refuse', reason, release: true })
 
 /**
  * The verdict for one clip. Only the two-model families (dualModel) are held
  * to the measurements; every other family gets `ok` and no release.
+ *
+ * `family.id` picks which pair's record applies; without it the clip is held
+ * to the text-to-video pair's. `addOns` is how many add-on files from the
+ * rack will be chained into the graph, the family's own not counted.
  */
 export function clipMemory(
-  family: { dualModel: boolean },
+  family: { id?: string; dualModel: boolean },
   clip: { width: number; height: number; frames: number },
   hardware: Hardware | null,
+  addOns = 0,
 ): ClipMemory {
   if (!family.dualModel) return OK
   const size = pixelFrames(clip)
   const ramGb = hardware ? hardware.ram.total / 1024 ** 3 : null
-  const roomier = ramGb !== null && ramGb >= BEYOND_MEASURED_GB
+  const here = ramGb !== null && ramGb >= BEYOND_MEASURED_GB ? ramGb : null
+  return family.id === I2V_ID ? imageToVideo(size, addOns > 0, here) : textToVideo(size, addOns > 0, here)
+}
 
+/** Said instead of a refusal on a machine clearly roomier than the one measured. */
+const unmeasured = (ramGb: number) => `This machine has ${ramGb.toFixed(0)} GB, which was not measured, so it may fit.`
+
+/**
+ * The text-to-video pair against its two bare points. `roomier` is the
+ * machine's memory in GB when it is clearly more than the measured machine's.
+ */
+function textToVideo(size: number, rack: boolean, roomier: number | null): ClipMemory {
+  const onTop = rack ? ' Its add-ons load on top of that, and the pair was measured with none.' : ''
   if (size > pixelFrames(EDGE)) {
     const times = (size / pixelFrames(EDGE)).toFixed(1)
-    if (roomier) {
-      return {
-        level: 'caution',
-        release: true,
-        reason: `This clip is ${times} times the size that peaked at ${EDGE.peakGb} GB on a ${MEASURED_RAM_GB} GB machine (${EDGE.frames} frames at ${EDGE.width} × ${EDGE.height}). This machine has ${ramGb.toFixed(0)} GB, which was not measured, so it may fit.`,
-      }
+    if (roomier !== null) {
+      return caution(
+        `This clip is ${times} times the size that peaked at ${EDGE.peakGb} GB on a ${MEASURED_RAM_GB} GB machine (${at(EDGE)}).${onTop} ${unmeasured(roomier)}`,
+      )
     }
-    return {
-      level: 'refuse',
-      release: true,
-      reason: `Too large for memory. ${EDGE.frames} frames at ${EDGE.width} × ${EDGE.height} was measured to peak at ${EDGE.peakGb} GB of ${MEASURED_RAM_GB} GB, which is where the machine kills the process, and this clip is ${times} times that size. It would sample for several minutes and then be killed in its final decode. Shorten it or make it smaller.`,
-    }
+    return refuse(
+      `Too large for memory. ${at(EDGE)} was measured to peak at ${EDGE.peakGb} GB of ${MEASURED_RAM_GB} GB, which is where the machine kills the process, and this clip is ${times} times that size.${onTop} It would sample for several minutes and then be killed in its final decode. Shorten it or make it smaller.`,
+    )
   }
 
   if (size > pixelFrames(SURVIVED)) {
-    return {
-      level: 'caution',
-      release: true,
-      reason: `Larger than the ${SURVIVED.frames} frames at ${SURVIVED.width} × ${SURVIVED.height} measured to fit (about ${SURVIVED.peakGb} GB). A clip this size has been killed for memory at its final decode, so ComfyUI's cached models are released before it runs.`,
+    if (!rack) {
+      return caution(
+        `Larger than the ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB). A clip this size has been killed for memory at its final decode. ComfyUI releases its cached models before it runs, which clears what earlier clips left behind and nothing more.`,
+      )
     }
+    const why = `The ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB) ran with no add-ons, and ${at(EDGE)} peaked at ${EDGE.peakGb} GB, which is where the machine kills the process. This clip is larger than the one that fit, and its add-ons load on top.`
+    if (roomier !== null) return caution(`${why} ${unmeasured(roomier)}`)
+    return refuse(
+      `Too large for memory with add-ons. ${why} Take the add-ons off, or make it no larger than ${at(SURVIVED)}.`,
+    )
   }
 
+  if (rack) {
+    return caution(
+      `The ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB) ran with no add-ons. The ones on the rack load on top of that, which nobody has measured.`,
+    )
+  }
   return { level: 'ok', reason: null, release: true }
+}
+
+/**
+ * The image-to-video pair against its own record. Nothing here is said to be
+ * fixed by the release: its kills happened inside the run, as the decoder
+ * loaded.
+ */
+function imageToVideo(size: number, rack: boolean, roomier: number | null): ClipMemory {
+  const larger = size > pixelFrames(I2V_CAME_THROUGH)
+  const record = `On a ${MEASURED_RAM_GB} GB machine this pair was killed at ${at(I2V_KILLED)} three times out of three, each as its final decode began, and ${at(I2V_CAME_THROUGH)} came through once.`
+
+  if (roomier !== null) {
+    if (!larger && !rack) return { level: 'ok', reason: null, release: true }
+    return caution(
+      `${record}${larger ? ' This clip is larger than that.' : ''}${rack ? ' The add-ons on the rack load on top of the one it already carries on each half.' : ''} ${unmeasured(roomier)}`,
+    )
+  }
+
+  if (larger) {
+    return refuse(
+      `Too large for memory. ${record} This clip is larger than the one that came through. Shorten it, or use ${SAFER_I2V}.`,
+    )
+  }
+  if (rack) {
+    return refuse(
+      `Too much for memory with add-ons. This pair already loads an add-on on each half. With those alone it was killed at ${at(I2V_KILLED)} three times out of three, and with only one of them it was killed at ${at(I2V_CAME_THROUGH)}. Anything on the rack loads on top. Take the add-ons off, or use ${SAFER_I2V}.`,
+    )
+  }
+  return caution(
+    `This pair is not reliable on a ${MEASURED_RAM_GB} GB machine. At ${at(I2V_CAME_THROUGH)} it came through once, and was killed once with an add-on on only one half. At ${at(I2V_KILLED)} it was killed three times out of three, each as its final decode began, which releasing cached models first does not prevent. For a clip from a start frame the safer choice is ${SAFER_I2V}.`,
+  )
+}
+
+/**
+ * Wait until ComfyUI has nothing running and nothing queued.
+ *
+ * A release (below) is a flag ComfyUI's worker reads when it takes its NEXT
+ * prompt, whichever prompt that is. Sent while other work is queued, it is
+ * spent on that work, and the heavy clip it was meant for starts with every
+ * model the earlier jobs loaded still resident, which is exactly how a 14B
+ * clip gets killed at its final decode. So a clip that needs a release waits
+ * for an empty queue, releases, and only then submits: sent in that order
+ * with nothing between, the release is read by that clip.
+ *
+ * Polls the queue every two seconds. `onWait` hears how many jobs are ahead
+ * each time it has to wait, for the desk to say so. Resolves true once the
+ * queue is empty, false if `signal` aborts first, and true without waiting
+ * when the queue cannot be read (ComfyUI down or unreachable): the submit
+ * that follows then reports the real error.
+ */
+export async function waitForIdleComfy(
+  signal?: AbortSignal,
+  onWait?: (ahead: number) => void,
+): Promise<boolean> {
+  for (;;) {
+    if (signal?.aborted) return false
+    let ahead: number
+    try {
+      const res = await fetch('/comfy/queue', { signal })
+      if (!res.ok) return true
+      const q = (await res.json()) as { queue_running?: unknown[]; queue_pending?: unknown[] }
+      ahead = (q.queue_running?.length ?? 0) + (q.queue_pending?.length ?? 0)
+    } catch {
+      if (signal?.aborted) return false
+      return true
+    }
+    if (ahead === 0) return true
+    onWait?.(ahead)
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 2000)
+      signal?.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+    })
+  }
 }
 
 /**
  * Ask ComfyUI to unload every cached model and free memory before its next
  * job. The flags are applied by ComfyUI's worker when the next prompt starts,
- * so this is sent immediately before queueing. Never throws: a failure only
- * means the clip runs with whatever is resident, as it did before.
+ * so this must be sent with an empty queue (see waitForIdleComfy) and
+ * immediately before queueing. Never throws: a failure only means the clip
+ * runs with whatever is resident, as it did before.
  */
 export async function releaseComfyMemory(): Promise<boolean> {
   try {

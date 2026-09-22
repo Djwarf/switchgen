@@ -14,13 +14,18 @@
  *      composition, with an undo and a plain-English list of anything that
  *      could not be carried across.
  *
- * Nothing here imports the registry or the workflow builder. Desks pass a
- * family's defaults in; this module only holds and persists the state. That
- * keeps the store testable and stops a registry change rippling into storage.
+ * The store itself imports neither the registry nor the workflow builder.
+ * Desks pass a family's defaults in; this module only holds and persists the
+ * state. That keeps the store testable and stops a registry change rippling
+ * into storage. The one reach outward is reuse of a clip, which puts the
+ * clip's add-ons back on its family's rack (videoLoras.restoreRack) so that
+ * reusing it does the same thing from every room.
  */
 
 import type { FileRef } from './comfy'
 import type { HistoryEntry, NewEntry } from './history'
+import { loraLabel } from './loras'
+import { restoreRack, type RestoredRack } from './videoLoras'
 
 export type { FileRef }
 
@@ -1011,6 +1016,12 @@ export type ReuseOptions = {
   /** Samplers the substitute offers, so an impossible one is dropped, not sent. */
   availableSamplers?: readonly string[]
   availableSchedulers?: readonly string[]
+  /**
+   * Add-on files installed right now, when the caller has read them. Only a
+   * clip's rack uses it; see videoLoras.rackFromRecord for what not knowing
+   * changes.
+   */
+  installedLoras?: ReadonlySet<string>
 }
 
 /**
@@ -1022,16 +1033,26 @@ export type ReuseOptions = {
  * with the lock on.
  *
  * Two things it cannot restore, because they live on the desk rather than in
- * the composition: the quality passes and the LoRA rack. A record that ran with
+ * the composition: the quality passes and the add-ons. A record that ran with
  * either says so in `notes`, by name and strength, rather than leaving the
  * reader to discover it from a picture that came out different at the same
  * seed. Restoring them is the desk's job; naming them is this function's.
+ * (reuseIntoDesk does put a clip's add-ons back on its rack, and replaces the
+ * note with what it did.)
+ *
+ * A region pass (variant `refine`) is filed against the whole picture it
+ * repainted part of, with the region's words and strength, and nothing on
+ * the record says which region or what mask. Loaded as image to image it
+ * would repaint the whole frame with words written for one small area. So
+ * only its words, model, seed and sampler settings are loaded, the picture
+ * and the strength are not, and a note says where it came from.
  *
  * Nothing runs. The reader sees precisely what they are about to make.
  */
 export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {}): Reuse {
   const desk = deskOf(entry.mode)
   const notes: ReuseNote[] = []
+  const regionPass = entry.variant === 'refine'
 
   let familyId = entry.familyId
   let model = entry.model
@@ -1069,17 +1090,17 @@ export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {
   const current = deskStore(desk).get()
   const composition: Composition = {
     ...newComposition(desk),
-    mode: entry.mode,
+    mode: regionPass ? 't2i' : entry.mode,
     familyId,
     model,
     prompt: entry.prompt,
     negative: entry.negative,
     positivePrefix: entry.positivePrefix ?? null,
-    source: sourceFromEntry(entry),
+    source: regionPass ? null : sourceFromEntry(entry),
     width: entry.width ?? current.width,
     height: entry.height ?? current.height,
     megapixels: entry.megapixels ?? null,
-    denoise: entry.denoise ?? null,
+    denoise: regionPass ? null : (entry.denoise ?? null),
     seed: opts.freshSeed ? randomSeed() : entry.seed,
     seedLocked: !opts.freshSeed,
     steps: entry.steps,
@@ -1105,7 +1126,7 @@ export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {
       ...(entry.width != null ? (['width', 'height'] as TunableField[]) : []),
       ...(entry.length != null ? (['length'] as TunableField[]) : []),
       ...(entry.fps != null ? (['fps'] as TunableField[]) : []),
-      ...(entry.denoise != null ? (['denoise'] as TunableField[]) : []),
+      ...(entry.denoise != null && !regionPass ? (['denoise'] as TunableField[]) : []),
       ...(entry.megapixels != null ? (['megapixels'] as TunableField[]) : []),
       ...(entry.split != null ? (['split'] as TunableField[]) : []),
       ...(entry.shift != null ? (['shift'] as TunableField[]) : []),
@@ -1113,7 +1134,13 @@ export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {
     ],
   }
 
-  if (entry.missing && entry.source) {
+  if (regionPass) {
+    notes.push({
+      field: 'region',
+      reason:
+        'This was a region pass, which repainted one area of another picture. Its words, model, seed and sampler are loaded, but not that picture or the area, so running this makes a new picture from the words alone. To repaint that area again, open the region bench on the picture it came from.',
+    })
+  } else if (entry.missing && entry.source) {
     notes.push({
       field: 'source',
       reason: 'The source picture may no longer be on disk. Check the well before you run this.',
@@ -1132,10 +1159,11 @@ export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {
   }
 
   if (entry.loras?.length) {
-    const named = entry.loras.map((l) => `${l.name} at ${l.strength}`)
+    const named = entry.loras.map((l) => `${loraLabel(l.name)} at ${l.strength}`)
+    const one = entry.loras.length === 1
     notes.push({
       field: 'loras',
-      reason: `Not carried over: ${entry.loras.length === 1 ? 'the add-on' : `the ${entry.loras.length} add-ons`} this used. Set the rack to ${sentenceList(named)} before you run this.`,
+      reason: `Not carried over: ${one ? 'the add-on' : `the ${entry.loras.length} add-ons`} this used, ${sentenceList(named)}. Add ${one ? 'it' : 'them'} again on the ${desk === 'video' ? 'Video' : 'Pictures'} desk before you run this.`,
     })
   }
 
@@ -1171,7 +1199,9 @@ export type AppliedReuse = Reuse & {
    * shows the loaded settings behind a notice offering both ways out.
    */
   clobbered: boolean
-  /** Put the desk back exactly as it was. */
+  /** For a clip, what happened to its family's add-on rack; null for a picture. */
+  rack: RestoredRack | null
+  /** Put the desk back exactly as it was, and a clip's rack with it. */
   undo: () => void
 }
 
@@ -1180,6 +1210,11 @@ export type AppliedReuse = Reuse & {
  *
  * The desk is decided by the record, never by where the reader happens to be:
  * a clip always restores into the Video desk, with the video controls.
+ *
+ * A clip's add-ons are put back on its family's rack here, not by whichever
+ * room asked, so "Use these settings" does the same thing from the Archive as
+ * from the Video desk. The rack's note replaces the "not carried over" one,
+ * because on a clip they were.
  */
 export function reuseIntoDesk(entry: HistoryEntry, opts: ReuseOptions = {}): AppliedReuse {
   const reuse = compositionFromEntry(entry, opts)
@@ -1189,10 +1224,22 @@ export function reuseIntoDesk(entry: HistoryEntry, opts: ReuseOptions = {}): App
     previous.prompt.trim().length > 0 && previous.prompt.trim() !== entry.prompt.trim()
 
   target.set(reuse.composition)
+  const rack = reuse.desk === 'video' ? restoreRack(entry, opts.installedLoras ?? null) : null
+  const notes = rack
+    ? [
+        ...reuse.notes.filter((n) => n.field !== 'loras'),
+        ...(rack.note ? [{ field: 'loras', reason: rack.note }] : []),
+      ]
+    : reuse.notes
   return {
     ...reuse,
+    notes,
     clobbered,
-    undo: () => target.set(previous),
+    rack,
+    undo: () => {
+      target.set(previous)
+      rack?.undo()
+    },
   }
 }
 

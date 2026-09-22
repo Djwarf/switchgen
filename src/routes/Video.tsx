@@ -30,8 +30,8 @@ import { OfferList } from '../components/result/ResultActions'
 import { videoOffersFor } from '../components/result/videoOffers'
 import { LoraRack } from '../components/video/LoraRack'
 import { EMPTY_LIBRARY, loadLoraLibrary, loadStack, missingTriggers, resolveStack, saveStack, targetFor, type LoraLibrary, type LoraStack } from '../lib/loras'
-import { chainVideoStack, rackFromRecord, videoLorasToRun } from '../lib/videoLoras'
-import { clipMemory, releaseComfyMemory } from '../lib/clipMemory'
+import { chainVideoStack, videoLorasToRun } from '../lib/videoLoras'
+import { clipMemory, releaseComfyMemory, waitForIdleComfy } from '../lib/clipMemory'
 import { CataloguePanel } from '../components/advanced/CataloguePanel'
 import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
@@ -53,6 +53,7 @@ import { useHoldToConfirm } from '../components/shell/hotkeys'
 import { onPlanLanded } from '../lib/downloads'
 
 import {
+  ComfyError,
   cancelJob,
   connect,
   fileUrl,
@@ -68,6 +69,7 @@ import {
   type FileRef,
   type OutputFile,
   type ProgressEvent as ComfyProgress,
+  type ServerJob,
 } from '../lib/comfy'
 
 import {
@@ -718,11 +720,41 @@ export type VideoJob = {
   cancelRequested: boolean
   /** True when ComfyUI releases its cached models before this clip runs. */
   release: boolean
+  /** What a clip that has not been sent yet is waiting for, in a sentence. */
+  waitNote: string | null
 }
 
 let jobs: VideoJob[] = []
 const jobListeners = new Set<() => void>()
 let pollTimer: ReturnType<typeof setInterval> | null = null
+
+/**
+ * Clips that need a release go to the press one at a time.
+ *
+ * ComfyUI applies a release to the next prompt its worker takes, or at once
+ * when it is idle, so a release is only this clip's when nothing is queued
+ * and nothing else is sent between it and the clip. Each such clip waits here
+ * for the one before it to settle, then for ComfyUI's queue to empty
+ * (waitForIdleComfy), then releases and submits. Sent together, a batch of
+ * them spent every release on the first clip, and the rest ran on whatever
+ * the one before had left resident.
+ */
+let releaseLane: Promise<void> = Promise.resolve()
+/** Clips still waiting their turn, so Stop can call the wait off. */
+const waiting = new Map<string, AbortController>()
+
+/** Resolves true when `p` settles, or false as soon as `signal` aborts. */
+function unlessStopped(p: Promise<void>, signal: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve(false)
+    const stop = () => resolve(false)
+    signal.addEventListener('abort', stop, { once: true })
+    void p.then(() => {
+      signal.removeEventListener('abort', stop)
+      resolve(!signal.aborted)
+    })
+  })
+}
 
 const unfinished = (j: VideoJob) => j.status === 'submitting' || j.status === 'queued' || j.status === 'running'
 
@@ -773,8 +805,10 @@ async function stopJob(id: string): Promise<void> {
   if (!job || !unfinished(job)) return
   if (!job.promptId) {
     // Still in flight to the queue. Mark it, and the queued handler stops it
-    // the moment ComfyUI hands us an id.
+    // the moment ComfyUI hands us an id. One still waiting its turn is never
+    // sent at all.
     patchJob(id, { cancelRequested: true, stage: 'Stopping' })
+    waiting.get(id)?.abort()
     return
   }
   patchJob(id, { cancelRequested: true, stage: 'Stopping' })
@@ -825,6 +859,7 @@ function startJob(opts: StartOptions): string {
     queuePos: null,
     cancelRequested: false,
     release: !!opts.release,
+    waitNote: null,
   }
   jobs = [job, ...jobs]
   announce()
@@ -836,10 +871,15 @@ function startJob(opts: StartOptions): string {
       patchJob(id, { promptId: e.promptId, status: 'queued', stage: 'Queued' })
       if (current.cancelRequested) void cancelJob(e.promptId).catch(() => undefined)
     } else if (e.phase === 'running') {
-      // ComfyUI applies a release after the job it is running, not before, so
-      // a heavy clip of ours waiting behind this one gets its release now. Its
-      // own, sent as it was queued, went to whatever was running then.
-      if (current.status !== 'running' && jobs.some((j) => j.id !== id && j.release && j.status === 'queued')) {
+      // A heavy clip releases for itself on an empty queue, but something of
+      // ours sent in the moment between its release and its prompt runs first
+      // and leaves its models behind. ComfyUI applies a release after the job
+      // it is running, so one sent now lands between this job and that clip.
+      // A spare one costs only a reload.
+      if (
+        current.status !== 'running' &&
+        jobs.some((j) => j.id !== id && j.release && (j.status === 'queued' || j.status === 'submitting'))
+      ) {
         void releaseComfyMemory()
       }
       const sampling = e.max > 1
@@ -856,11 +896,47 @@ function startJob(opts: StartOptions): string {
     }
   }
 
+  // Taken in the same tick the job is made, so clips made together keep
+  // their order in the lane.
+  let leaveLane = () => {}
+  let turn: Promise<void> = Promise.resolve()
+  if (opts.release) {
+    turn = releaseLane
+    releaseLane = new Promise<void>((resolve) => {
+      leaveLane = resolve
+    })
+  }
+
   const queue = async (): Promise<OutputFile[]> => {
-    // Sent immediately before the prompt: ComfyUI's worker drops its cached
-    // models before it takes the next job, so this clip starts from a clear
-    // machine rather than from whatever the last run left resident.
-    if (opts.release) await releaseComfyMemory()
+    if (opts.release) {
+      // Its turn, then an empty queue, then the release, then the prompt, with
+      // nothing in between: see releaseLane.
+      const stop = new AbortController()
+      waiting.set(id, stop)
+      const stopped = () => new ComfyError('Stopped before it was sent.', { cancelled: true })
+      try {
+        if (jobs.some((j) => j.id !== id && j.release && unfinished(j))) {
+          patchJob(id, {
+            stage: 'Waiting its turn',
+            waitNote: 'Waits for the clip before it to finish, so that one’s memory can be released before this starts.',
+          })
+        }
+        if (!(await unlessStopped(turn, stop.signal))) throw stopped()
+        const idle = await waitForIdleComfy(stop.signal, (ahead) =>
+          patchJob(id, {
+            stage: 'Waiting for the press',
+            waitNote: `ComfyUI has ${ahead} ${ahead === 1 ? 'job' : 'jobs'} to finish first. This clip waits for them, so the memory they hold can be released before it starts.`,
+          }),
+        )
+        if (!idle) throw stopped()
+        patchJob(id, { stage: 'Releasing memory', waitNote: null })
+        await releaseComfyMemory()
+        if (stop.signal.aborted) throw stopped()
+      } finally {
+        waiting.delete(id)
+      }
+      patchJob(id, { stage: 'Sending it to the press' })
+    }
     return run(opts.graph, onEvent)
   }
 
@@ -933,6 +1009,8 @@ function startJob(opts: StartOptions): string {
         queuePos: null,
       })
     })
+    // Settled either way, so the next heavy clip may take its turn.
+    .finally(() => leaveLane())
 
   return id
 }
@@ -959,21 +1037,38 @@ function managePoll(): void {
 async function reconcile(): Promise<void> {
   if (!jobs.some(unfinished)) return
 
-  let ids: string[]
+  let listed: ServerJob[]
   try {
     const page = await listJobs({ status: ['pending', 'in_progress'], limit: 100 })
-    ids = page.jobs.map((j) => j.id)
+    listed = page.jobs
   } catch {
     return // the connection notice covers an unreachable server
   }
 
   // Read again after the await: a job may have settled while the list was on
-  // its way, and its place in line is then nobody's business.
+  // its way, and its place in line is then nobody's business. A clip that is
+  // drawing has no place in line; its progress events keep it at 0.
   for (const job of jobs.filter(unfinished)) {
-    if (!job.promptId) continue
-    const at = ids.indexOf(job.promptId)
-    if (at >= 0 && at !== job.queuePos) patchJob(job.id, { queuePos: at })
+    if (!job.promptId || job.status === 'running') continue
+    const ahead = jobsAhead(listed, job.promptId)
+    if (ahead !== null && ahead !== job.queuePos) patchJob(job.id, { queuePos: ahead })
   }
+}
+
+/**
+ * How many jobs ComfyUI will run before this one, or null when it does not
+ * list it. /api/jobs sorts newest first, so a job's index in the list counts
+ * the jobs queued after it. ComfyUI takes the lowest priority number first
+ * (its queue is a heap on that number), and whatever is running goes first.
+ */
+function jobsAhead(listed: readonly ServerJob[], promptId: string): number | null {
+  const mine = listed.find((j) => j.id === promptId)
+  if (!mine) return null
+  if (mine.status === 'in_progress') return 0
+  const order = (j: ServerJob) => j.priority ?? j.create_time ?? 0
+  return listed.filter(
+    (j) => j.id !== promptId && (j.status === 'in_progress' || (j.status === 'pending' && order(j) < order(mine))),
+  ).length
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,12 +1279,20 @@ function Chips<T extends string | number>({
 
 const store = deskStore('video')
 
-/** Why the press cannot run yet, in the reader's words. Null means it can. */
-function reasonFor(family: VideoFamily | null, c: Composition, hardware: Hardware | null): string | null {
+/**
+ * Why the press cannot run yet, in the reader's words. Null means it can.
+ * `addOns` is how many rack files the clip would chain; see clipMemory.
+ */
+function reasonFor(
+  family: VideoFamily | null,
+  c: Composition,
+  hardware: Hardware | null,
+  addOns: number,
+): string | null {
   if (!family) return 'No video model is installed.'
   // First, because it is the one the reader cannot guess: a clip this size
   // samples for minutes and is then killed in its final decode.
-  const memory = clipMemory(family.def, clipOf(family, c), hardware)
+  const memory = clipMemory(family.def, clipOf(family, c), hardware, addOns)
   if (memory.level === 'refuse') return memory.reason
   if (!c.prompt.trim()) return 'Describe the shot first.'
   if (family.needsStartFrame && (c.mode !== 'i2v' || !c.source?.name)) {
@@ -1204,13 +1307,38 @@ function reasonFor(family: VideoFamily | null, c: Composition, hardware: Hardwar
   return null
 }
 
-/** Two racks that would chain the same files at the same strengths. */
-function sameRack(a: LoraStack, b: LoraStack): boolean {
-  return (
-    a.length === b.length &&
-    a.every((e, i) => e.file === b[i].file && e.strength === b[i].strength && e.enabled === b[i].enabled)
-  )
+/**
+ * The add-ons a rack will actually chain on a family: installed, fitting, on,
+ * pairs expanded.
+ */
+function rackToRun(fam: VideoFamily, l: LoraLibrary, stack: LoraStack) {
+  const target = targetFor(fam.def, fam.model)
+  const resolved = resolveStack(stack, l, target)
+  const installed = new Set(l.all.filter((i) => i.installed).map((i) => i.file))
+  // Rows on the rack that cannot run: switched off, or dropped as missing or
+  // made for another size. The other half of a pair is never pulled back in
+  // from among these, so its partner goes to both halves.
+  const dropped = new Set(resolved.dropped.map((d) => d.file))
+  const excluded = new Set(stack.filter((e) => !e.enabled || dropped.has(e.file)).map((e) => e.file))
+  // A row at 0 is not one of those. It says its half gets nothing, and on a
+  // two-half family it has to reach the expansion to say so, or its partner
+  // would take that half as well. resolveStack leaves it out of its specs.
+  const byName = new Map(resolved.specs.map((sp) => [sp.name, sp]))
+  const specs = fam.def.dualModel
+    ? stack.flatMap((e) => {
+        const sp = byName.get(e.file)
+        if (sp) return [sp]
+        return e.enabled && e.strength === 0 && !dropped.has(e.file) ? [{ name: e.file, strength: 0 }] : []
+      })
+    : resolved.specs
+  // What goes into the graph, each file at the strength it runs at, which is
+  // also what the record says ran. A half at 0 ran nothing.
+  const ran = videoLorasToRun(fam.def, specs, installed, excluded).filter((s) => s.strength !== 0)
+  return { target, stack, specs, installed, excluded, ran }
 }
+
+/** How many add-on files a clip chains from the rack, for the memory check. */
+const addOnCount = (ran: readonly { name: string }[]) => new Set(ran.map((s) => s.name)).size
 
 const EXAMPLES: { prompt: string; note: string }[] = [
   {
@@ -1369,14 +1497,12 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     return list.includes(frames) ? list : [...list, frames].sort((a, b) => a - b)
   }, [family, fps, frames])
   const notes = useMemo(() => (family ? marginaliaOf(family) : []), [family])
-  const memory = useMemo(
-    () => (family ? clipMemory(family.def, clipOf(family, composition), hardware) : null),
-    [family, composition, hardware],
-  )
 
   const myJobs = allJobs
   const live = useMemo(() => myJobs.filter(unfinished), [myJobs])
-  const runningJob = live[live.length - 1] ?? null
+  // The one drawing, when one is. A heavy clip waiting for the queue to empty
+  // can be older than a light clip that went straight in and is drawing now.
+  const runningJob = live.find((j) => j.status === 'running') ?? live[live.length - 1] ?? null
   const now = useNow(live.length > 0)
 
   // The plate shows the newest finished clip unless the reader is reading an
@@ -1640,22 +1766,11 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     [],
   )
 
-  /** The add-ons that will actually be chained: installed, fitting, on, pairs expanded. */
-  const resolvedLoras = useCallback((fam: VideoFamily) => {
-    const l = libRef.current
-    const target = targetFor(fam.def, fam.model)
-    const stack = rackOf(fam.def.id)
-    const resolved = resolveStack(stack, l, target)
-    const installed = new Set(l.all.filter((i) => i.installed).map((i) => i.file))
-    // Rows on the rack that will not run: switched off, dropped, or at nought.
-    // The other half of a pair is never pulled back in from among these.
-    const running = new Set(resolved.specs.map((sp) => sp.name))
-    const excluded = new Set(stack.map((e) => e.file).filter((f) => !running.has(f)))
-    // What goes into the graph, each file at the strength it runs at, which
-    // is also what the record says ran.
-    const ran = videoLorasToRun(fam.def, resolved.specs, installed, excluded)
-    return { target, stack, specs: resolved.specs, installed, excluded, ran }
-  }, [rackOf])
+  /** The add-ons that will actually be chained, as the press reads them. */
+  const resolvedLoras = useCallback(
+    (fam: VideoFamily) => rackToRun(fam, libRef.current, rackOf(fam.def.id)),
+    [rackOf],
+  )
 
   /** The graph one run sends, and the positive prompt in it, trigger words and all. */
   const buildGraph = useCallback(
@@ -1666,7 +1781,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       const shaped = c.mode === 'i2v' ? deriveImageToVideo(fam.def) : fam.def
       if (!shaped) return null
       const { target, stack: rack, specs, installed, excluded } = resolvedLoras(fam)
-      const chained = specs.length ? chainVideoStack(shaped, specs, installed, excluded) : null
+      const chained = chainVideoStack(shaped, specs, installed, excluded)
       const params = toParams({ ...c, seed }, { negative: defaultsFor(fam.def, fam.model).negative })
       if (c.mode !== 'i2v') delete params.image
       // An add-on without its trigger words runs at a fraction of itself.
@@ -1679,9 +1794,16 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     [resolvedLoras],
   )
 
+  // From the rack and library this render shows, which are the ones the
+  // press will read: `stack` follows `family` (see above).
+  const addOns = useMemo(() => (family ? addOnCount(rackToRun(family, lib, stack).ran) : 0), [family, lib, stack])
   const blockedReason = useMemo(
-    () => reasonFor(family, composition, hardware),
-    [family, composition, hardware],
+    () => reasonFor(family, composition, hardware, addOns),
+    [family, composition, hardware, addOns],
+  )
+  const memory = useMemo(
+    () => (family ? clipMemory(family.def, clipOf(family, composition), hardware, addOns) : null),
+    [family, composition, hardware, addOns],
   )
 
   /**
@@ -1711,11 +1833,12 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       }
       return false
     }
-    if (reasonFor(fam, c, hardware)) return false
+    const chained = addOnCount(resolvedLoras(fam).ran)
+    if (reasonFor(fam, c, hardware, chained)) return false
 
     const runs = c.runs ?? 1
     const first = c.seedLocked ? c.seed : randomSeed()
-    const release = clipMemory(fam.def, clipOf(fam, c), hardware).release
+    const release = clipMemory(fam.def, clipOf(fam, c), hardware, chained).release
 
     for (let i = 0; i < runs; i++) {
       const seed = first + i
@@ -1776,40 +1899,30 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     (entry: HistoryEntry, run: boolean) => {
       const fam = families.find((f) => f.def.id === entry.familyId) ?? null
       const installedModels = cat ? families.map((f) => f.model).filter(Boolean) : undefined
+      const l = libRef.current
+      // The rack as the desk holds it, which outlives a browser that cannot
+      // save one; the undo puts back this, not the saved copy.
       const priorRack = rackOf(entry.familyId)
       const applied = reuseIntoDesk(entry, {
         freshSeed: run,
         installedModels,
         availableSamplers: cat?.samplers,
         availableSchedulers: cat?.schedulers,
+        // Not known until the library has loaded, which the rack then allows for.
+        installedLoras: l === EMPTY_LIBRARY ? undefined : new Set(l.all.filter((i) => i.installed).map((i) => i.file)),
       })
-      // The record carries the add-ons it ran with; put them back on the rack
-      // so the next clip runs them the same way. Saved under the record's
-      // family, which is the one the store now points at.
-      const def = fam?.def ?? FAMILIES.find((f) => f.id === entry.familyId) ?? null
-      const installed = new Set(libRef.current.all.filter((i) => i.installed).map((i) => i.file))
-      const nextRack: LoraStack = entry.loras?.length
-        ? def
-          ? rackFromRecord(entry.loras, def, installed)
-          : entry.loras.map((l) => ({ file: l.name, strength: l.strength, enabled: true }))
-        : []
-      updateStack(nextRack, entry.familyId)
+      // reuseIntoDesk has put the record's add-ons back on the family's saved
+      // rack, the same as it does from the Archive. The desk's own copy
+      // follows, because `Make another` queues in this same tick and reads it.
+      const rack = applied.rack
+      if (rack) updateStack(rack.next, rack.familyId)
 
-      // The shared notes say the rack was not carried over, which on this desk
-      // it just was.
-      const notes = applied.notes.filter((n) => n.field !== 'loras').map((n) => n.reason)
+      const notes = applied.notes.map((n) => n.reason)
       // A two-model family records no single model file, so its absence has
       // to be read off the catalogue rather than off the record.
       const gone = !!cat && !fam
       if (gone && !applied.notes.some((n) => n.field === 'model')) {
         notes.unshift(`${entry.familyLabel} is no longer installed. Choose another style before you run this.`)
-      }
-      if (priorRack.length && !sameRack(priorRack, nextRack)) {
-        notes.push(
-          nextRack.length
-            ? 'The add-on rack now holds what this clip used.'
-            : 'The add-ons on the rack were taken off, because this clip used none.',
-        )
       }
 
       setViewing(null)
@@ -1822,7 +1935,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               ran,
               undo: () => {
                 applied.undo()
-                updateStack(priorRack, entry.familyId)
+                if (rack) updateStack(priorRack, rack.familyId)
               },
             }
           : null,
@@ -2682,6 +2795,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 <p className="mt-1 text-caption italic text-grey-700 tabular-nums">
                   The press is busy. This clip is {ordinal(job.queuePos + 1)} in line.
                 </p>
+              ) : null}
+
+              {job.waitNote && !job.promptId ? (
+                <p className="mt-1 text-caption italic text-grey-700 tabular-nums">{job.waitNote}</p>
               ) : null}
 
               {job.previewUrl ? (

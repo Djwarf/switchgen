@@ -6,7 +6,9 @@
  * alone: the same rows and the same picker as the picture rack, at the
  * author's strengths, and every figure it prints says which author.
  *
- * On a two-half family a pair of files is one row. See lib/videoLoras.ts.
+ * On a two-half family a pair of files is one row, and the picker offers it
+ * by its HIGH half. A HIGH row can give its LOW half a row of its own, which
+ * is how the two halves get two strengths. See lib/videoLoras.ts.
  *
  * The files a family already loads in its own graph are shown as in use and
  * never chained a second time, because chaining one again in front of the
@@ -79,7 +81,8 @@ export function LoraRack({
   const bytes = useMemo(
     () =>
       stack.reduce((sum, e) => {
-        if (!e.enabled || builtIn.has(e.file)) return sum
+        // A row at 0 chains nothing, and neither does the partner it pulls in.
+        if (!e.enabled || e.strength === 0 || builtIn.has(e.file)) return sum
         const info = lib.byFile.get(e.file)
         const partner = def.dualModel ? partnerOf(e.file) : null
         const twin = partner ? lib.byFile.get(partner) : undefined
@@ -147,8 +150,16 @@ export function LoraRack({
             const partner = half ? partnerOf(entry.file) : null
             const twin = partner ? lib.byFile.get(partner) : undefined
             const twinRow = partner ? onRack.get(partner) : undefined
+            // Whether the partner's own row reaches its half. A row that is
+            // on but cannot load is left out, and this file then goes to both
+            // halves, the same as when the partner's row is switched off.
+            const twinRuns =
+              !!twinRow?.enabled && !!twin?.installed && fitFor(twin, target).level !== 'mismatch'
             const HALF = half?.half.toUpperCase()
             const OTHER = half?.half === 'high' ? 'LOW' : 'HIGH'
+            // A HIGH row whose LOW half is installed and has no row can hand
+            // that half a row of its own, at this row's strength to start.
+            const canSplit = half?.half === 'high' && !!partner && !twinRow && !!twin?.installed
             return (
               <li key={entry.file} className="list-none">
                 <LoraRow
@@ -168,15 +179,39 @@ export function LoraRack({
                     {def.label} already loads this file itself, so this row is left out rather than loaded twice.
                   </p>
                 ) : half ? (
-                  <p className="mb-2 text-caption italic text-grey-500">
-                    {twinRow?.enabled
-                      ? `The ${HALF} half, at this row’s strength. Its ${OTHER} partner has a row of its own and goes to the other half at that row’s strength.`
-                      : twinRow
-                        ? `The ${HALF} half. Its ${OTHER} partner is switched off, so this goes to both halves at the same strength, which nobody has measured.`
-                        : twin?.installed
-                          ? `The ${HALF} half. Its ${OTHER} partner is installed and goes to the other half at the same strength.`
-                          : `The ${HALF} half only. No partner file is installed, so this goes to both halves at the same strength, which nobody has measured.`}
-                  </p>
+                  <div className="mb-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                    <p className="text-caption italic text-grey-500">
+                      {twinRuns && twinRow?.strength === 0
+                        ? `The ${HALF} half, at this row’s strength. Its ${OTHER} partner’s row is at 0, so the other half gets neither file.`
+                        : twinRuns
+                          ? `The ${HALF} half, at this row’s strength. Its ${OTHER} partner has a row of its own and goes to the other half at that row’s strength.`
+                          : twinRow?.enabled
+                            ? `The ${HALF} half. Its ${OTHER} partner’s row cannot be loaded, so this goes to both halves at the same strength, which nobody has measured.`
+                            : twinRow
+                              ? `The ${HALF} half. Its ${OTHER} partner is switched off, so this goes to both halves at the same strength, which nobody has measured.`
+                              : twin?.installed
+                                ? `The ${HALF} half. Its ${OTHER} partner is installed and goes to the other half at the same strength.`
+                                : `The ${HALF} half only. No partner file is installed, so this goes to both halves at the same strength, which nobody has measured.`}
+                    </p>
+                    {canSplit && twin ? (
+                      <button
+                        type="button"
+                        className="text-caption text-burgundy-900 underline"
+                        onClick={() => {
+                          const next = [...stack]
+                          next.splice(i + 1, 0, {
+                            file: twin.file,
+                            strength: entry.strength,
+                            clipStrength: entry.clipStrength,
+                            enabled: entry.enabled,
+                          })
+                          onStack(next)
+                        }}
+                      >
+                        Give the {OTHER} half its own strength
+                      </button>
+                    ) : null}
+                  </div>
                 ) : def.dualModel ? (
                   <p className="mb-2 text-caption italic text-grey-500">
                     Not a HIGH/LOW pair, so it goes to both halves at the same strength. Not measured.

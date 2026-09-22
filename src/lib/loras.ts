@@ -158,17 +158,6 @@ const SDXL_LINEAGE: ReadonlySet<LoraArch> = new Set<LoraArch>(['pony', 'illustri
 
 const isWan = (arch: LoraArch) => arch === 'wan' || arch.startsWith('wan-')
 
-/**
- * Wan add-ons whose size was read off the file's own safetensors header,
- * because the filename does not say it. Both halves of this pair carry
- * `lora_A` tensors of [64, 5120] across blocks 0 to 39, which is the 14B
- * layout; the 5B is 3072 wide with 30 blocks and the 1.3B is 1536 wide.
- */
-const WAN_SIZE_READ: Readonly<Record<string, LoraArch>> = {
-  Wan22_I2V_NSFW_General_HIGH: 'wan-14b',
-  Wan22_I2V_NSFW_General_LOW: 'wan-14b',
-}
-
 /** Names the catalogue's `claims` field uses, mapped to our architectures. */
 const ARCH_ALIAS: Record<string, LoraArch> = {
   pony: 'pony',
@@ -1396,6 +1385,24 @@ const stem = (file: string) =>
     .replace(/\.(safetensors|ckpt|pt|pth|sft|bin|gguf)$/i, '')
     .toLowerCase()
 
+/**
+ * Wan add-ons whose size was read off the file's own safetensors header,
+ * because the filename does not say it. Both halves of this pair carry
+ * `lora_A` tensors of [64, 5120] across blocks 0 to 39, which is the 14B
+ * layout; the 5B is 3072 wide with 30 blocks and the 1.3B is 1536 wide.
+ *
+ * Keyed through stem(), the same form the lookup uses, which lowercases: a
+ * key written in the file's own case would never be found.
+ */
+const WAN_SIZE_READ: ReadonlyMap<string, LoraArch> = new Map(
+  (
+    [
+      ['Wan22_I2V_NSFW_General_HIGH.safetensors', 'wan-14b'],
+      ['Wan22_I2V_NSFW_General_LOW.safetensors', 'wan-14b'],
+    ] as const
+  ).map(([file, arch]) => [stem(file), arch]),
+)
+
 const CATALOGUE_BY_STEM: ReadonlyMap<string, CatalogueEntry> = new Map(
   LORA_CATALOGUE.map(e => [stem(e.file), e]),
 )
@@ -1404,6 +1411,11 @@ const CATALOGUE_BY_STEM: ReadonlyMap<string, CatalogueEntry> = new Map(
 function titleOf(file: string): string {
   const base = stem(file).replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim()
   return base.charAt(0).toUpperCase() + base.slice(1)
+}
+
+/** The name the add-on library shows for a file, for copy written without the library to hand. */
+export function loraLabel(file: string): string {
+  return titleOf(file)
 }
 
 /** A LoRA the user can pick: catalogue metadata joined to what is on disk. */
@@ -1486,7 +1498,7 @@ function infoFromCatalogue(e: CatalogueEntry, onDisk: ModelFile | null, file: st
  * as a caution rather than as a fit.
  */
 function infoFromDisk(f: ModelFile): LoraInfo {
-  const read = WAN_SIZE_READ[stem(f.name)]
+  const read = WAN_SIZE_READ.get(stem(f.name))
   const guess = read ?? archFor(null, f.name)
   return {
     file: loraNameOf(f),
