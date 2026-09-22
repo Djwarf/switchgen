@@ -1443,7 +1443,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const [stack, setStack] = useState<LoraStack>([])
   const [stackFor, setStackFor] = useState<string | null>(null)
   const libRef = useRef(lib)
-  const stackRef = useRef(stack)
+  /** The rack as the press sees it, tagged with its family so a stale one is never chained. */
+  const stackRef = useRef<{ familyId: string; stack: LoraStack }>({ familyId: '', stack: [] })
   const takeLib = useCallback((l: LoraLibrary) => {
     libRef.current = l
     setLib(l)
@@ -1455,15 +1456,13 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   // asks for state that follows a prop, so the old family's rack is never
   // painted under the new family's name.
   if (family && stackFor !== family.def.id) {
-    const loaded = loadStack(family.def.id)
     setStackFor(family.def.id)
-    setStack(loaded)
-    stackRef.current = loaded
+    setStack(loadStack(family.def.id))
   }
   const updateStack = useCallback(
     (next: LoraStack, familyId = family?.def.id ?? '') => {
       setStack(next)
-      stackRef.current = next
+      stackRef.current = { familyId, stack: next }
       if (familyId) saveStack(familyId, next)
     },
     [family],
@@ -1473,21 +1472,24 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const resolvedLoras = useCallback((fam: VideoFamily) => {
     const l = libRef.current
     const target = targetFor(fam.def, fam.model)
-    const resolved = resolveStack(stackRef.current, l, target)
+    // The ref holds what the reader last set; for a family it has not been
+    // set for yet, the saved rack is the rack.
+    const stack = stackRef.current.familyId === fam.def.id ? stackRef.current.stack : loadStack(fam.def.id)
+    const resolved = resolveStack(stack, l, target)
     const installed = new Set(l.all.filter((i) => i.installed).map((i) => i.file))
-    return { target, specs: resolved.specs, installed }
+    return { target, stack, specs: resolved.specs, installed }
   }, [])
 
   const buildGraph = useCallback(
     (fam: VideoFamily, c: Composition, seed: number): ApiWorkflow | null => {
       const shaped = c.mode === 'i2v' ? deriveImageToVideo(fam.def) : fam.def
       if (!shaped) return null
-      const { target, specs, installed } = resolvedLoras(fam)
+      const { target, stack: rack, specs, installed } = resolvedLoras(fam)
       const chained = specs.length ? chainVideoStack(shaped, specs, installed) : null
       const params = toParams({ ...c, seed }, { negative: defaultsFor(fam.def, fam.model).negative })
       if (c.mode !== 'i2v') delete params.image
       // An add-on without its trigger words runs at a fraction of itself.
-      const words = missingTriggers(stackRef.current, libRef.current, params.positive, target)
+      const words = missingTriggers(rack, libRef.current, params.positive, target)
       if (words.length) params.positive = params.positive.trim() ? `${params.positive}, ${words.join(', ')}` : words.join(', ')
       const graph = instantiate(chained ?? shaped, params)
       applyShift(graph, c.shift)
