@@ -663,6 +663,18 @@ export type ShotPlanInput = {
  * The plan is pure. It queues nothing, uploads nothing, and does not need the
  * previous shot's filename to exist yet: that arrives at instantiateShot.
  */
+/**
+ * True when the family's own graph already carries a LoadImage, meaning it is
+ * image-to-video and cannot open a reel cold: the node would still hold its
+ * placeholder and the shot would render from the wrong frame.
+ *
+ * wan22-5b is the counter-example. Its start_image is optional, so it opens
+ * cold perfectly well and must not be caught by this.
+ */
+export function needsOpeningFrame(def: FamilyDef): boolean {
+  return Object.values(def.graph).some(n => n.class_type === 'LoadImage')
+}
+
 export function shotPlan(input: ShotPlanInput): ShotPlan {
   const { base, params, shots } = input
   const prefix = input.prefix ?? REEL_PREFIX
@@ -696,6 +708,14 @@ export function shotPlan(input: ShotPlanInput): ShotPlan {
     if (!cont && start.from !== 'none') {
       notes.push(`${base.label} has no slot for an opening frame, so this shot starts fresh.`)
       start = { from: 'none' }
+    }
+
+    if (index === 0 && start.from === 'none' && needsOpeningFrame(base)) {
+      warnings.push(
+        `${base.label} renders from a starting picture, so the first shot needs one. ` +
+        'Add a frame to shot 1, or open the reel with a text to video family.',
+      )
+      notes.push('Needs an opening frame.')
     }
 
     if (index > 0 && start.from === 'none') {
@@ -784,12 +804,19 @@ export function shotPlan(input: ShotPlanInput): ShotPlan {
 export function instantiateShot(job: ShotJob, previous?: FileRef | string | null): ApiWorkflow {
   const params: Params = { ...job.params }
 
+  // Every start that carries a frame must reach the graph. Handling only
+  // 'previous' silently dropped a user supplied opening frame AND every
+  // re-anchor frame, which is the drift mitigation shotPlan computes from
+  // reanchorEvery. Both looked wired and did nothing.
   if (job.start.from === 'previous') {
     const ref = typeof previous === 'string' ? previous : previous ? annotatedRef(previous) : null
     if (!ref) {
       throw new Error(`${job.label} continues from the shot before it, but no handoff frame was supplied.`)
     }
     params.image = ref
+  }
+  else if (job.start.from === 'given' || job.start.from === 'anchor') {
+    params.image = job.start.image
   }
 
   const wf = instantiate(job.def, params)

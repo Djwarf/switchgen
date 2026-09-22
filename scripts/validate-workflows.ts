@@ -33,6 +33,8 @@ import {
   deriveVaceShot,
   instantiateShot,
   shotPlan,
+  needsOpeningFrame,
+  setEndImage,
 } from '../src/lib/continuation'
 import {
   capabilitiesOf,
@@ -66,7 +68,9 @@ const installed = new Set([
   ...have('UNETLoader', 'unet_name'),
   ...have('UnetLoaderGGUF', 'unet_name'),
 ])
-const clips = have('CLIPLoader', 'clip_name')
+// GGUF encoders are listed by CLIPLoaderGGUF, not CLIPLoader, so a family using
+// a quantised encoder reads as 'missing' unless both lists are consulted.
+const clips = [...have('CLIPLoader', 'clip_name'), ...have('CLIPLoaderGGUF', 'clip_name')]
 const vaes = have('VAELoader', 'vae_name')
 const loras = have('LoraLoaderModelOnly', 'lora_name')
 
@@ -120,6 +124,11 @@ for (const def of FAMILIES) {
         }
         continue
       }
+      // LoadImage.image is written at run time with an uploaded filename or an
+      // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
+      // but which never appears in the static enum. Checking it here would fail
+      // every graph that does the correct thing.
+      if (node.class_type === 'LoadImage' && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         const shown = opts.length > 6 ? `${opts.slice(0, 6).join(', ')}, …` : opts.join(', ')
@@ -180,6 +189,11 @@ for (const [srcId, def] of Object.entries(IMG2IMG)) {
         continue
       }
       if (Array.isArray(v)) continue
+      // LoadImage.image is written at run time with an uploaded filename or an
+      // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
+      // but which never appears in the static enum. Checking it here would fail
+      // every graph that does the correct thing.
+      if (node.class_type === 'LoadImage' && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         errs.push(`node ${id} (${node.class_type}): "${k}"="${v}" not in enum`)
@@ -234,6 +248,11 @@ function checkGraph(wf: ApiWorkflow): string[] {
         }
         continue
       }
+      // LoadImage.image is written at run time with an uploaded filename or an
+      // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
+      // but which never appears in the static enum. Checking it here would fail
+      // every graph that does the correct thing.
+      if (node.class_type === 'LoadImage' && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         const shown = opts.length > 6 ? `${opts.slice(0, 6).join(', ')}, …` : opts.join(', ')
@@ -528,7 +547,7 @@ for (const def of FAMILIES) {
   const tap = deriveChainTap(def)
   checkChain(
     `${def.label}: opening shot with a handoff tap`,
-    tap ? instantiate(tap, params) : null,
+    tap ? instantiate(tap, needsOpeningFrame(def) ? { ...params, image: HANDOFF } : params) : null,
     ['ImageFromBatch', 'SaveImage'],
     tap ? tapErrors(tap.graph) : [],
   )
@@ -560,9 +579,13 @@ for (const def of FAMILIES) {
 
   // --- the bookend: pinned at both ends ------------------------------------
   const book = deriveBookend(def)
+  // instantiate() writes the opening frame through the image binding; the closing
+  // frame is a separate node, so build it the way the reel UI does.
+  const bookendWf = book ? instantiate(book, { ...params, image: HANDOFF }) : null
+  if (bookendWf) setEndImage(bookendWf, HANDOFF)
   checkChain(
     `${def.label}: first and last frame`,
-    book ? instantiate(book, { ...params, image: HANDOFF }) : null,
+    book ? bookendWf : null,
     ['WanFirstLastFrameToVideo'],
     book
       ? [
@@ -597,10 +620,16 @@ for (const def of FAMILIES) {
   const plan = shotPlan({
     base: def,
     params,
-    shots: [{ prompt: 'the opening shot' }, { prompt: 'the shot that continues it' }],
+    // an image-to-video family cannot open cold, so give shot 1 a frame the way the UI must
+      shots: [{ prompt: 'the opening shot', ...(needsOpeningFrame(def) ? { startImage: 'opening-frame.png' } : {}) }, { prompt: 'the shot that continues it' }],
   })
   const [first, second] = plan.jobs
-  if (!first || !second) {
+  // A family with no image conditioning cannot open a shot on a supplied frame.
+    // wan22-14b-t2v is exactly that: correct behaviour, so skip rather than fail.
+    if (second && second.start.from !== 'previous') {
+      console.log(`SKIP  ${def.label}: two-shot seam: this family cannot continue from a frame`)
+      cSkip += 2
+    } else if (!first || !second) {
     console.log(`FAIL  ${def.label}: two-shot seam: shotPlan returned ${plan.jobs.length} jobs, not 2`)
     cFail++
   } else {
