@@ -16,13 +16,16 @@
  *     kept under {@link BROKEN_KEY} and a fresh archive is started. An index is
  *     never silently discarded.
  *   - A generation never fails because the archive is full. On a quota error
- *     the oldest unstarred records are evicted and the write retried once.
+ *     the oldest unstarred records are shed and the write retried once. With
+ *     no server behind it they are gone. With one, they stay on screen for the
+ *     session and only this browser's saved copy is shorter: the server still
+ *     holds them. A record the server does not yet have is never shed.
  *
  * React: `useSyncExternalStore(subscribe, all)`. `all()` returns the same array
  * reference until something actually changes.
  */
 
-import { headFile, relPath, type FileRef } from './comfy'
+import { fileUrl, relPath, type FileRef } from './comfy'
 import { isQuotaError, onStorage, store, storageWorks, type DeskId, type Mode } from './session'
 
 export type { FileRef, DeskId, Mode }
@@ -36,10 +39,12 @@ const BROKEN_KEY = 'switchgen.archive.v2.broken'
 const HISTORY_VERSION = 2
 
 /**
- * How many records are kept. Roughly 800 bytes for a picture and 1.1 KB for a
- * clip, so 5,000 records is about 4.5 MB — inside a 5 MB localStorage budget,
- * and about two years of heavy use. Beyond the cap the oldest unstarred
- * records fall off the end.
+ * How many records this browser keeps. A record with its tags serialises to
+ * about 1 KB (119 records on the live archive averaged 1,018 characters), so
+ * 5,000 of them come close to the roughly five million characters a browser
+ * allows one origin, which the desk drafts share. Beyond the cap the oldest
+ * unstarred records fall off the end. With the server behind it, that only
+ * narrows what this browser shows: the server keeps them all.
  */
 const MAX_ENTRIES = 5000
 
@@ -128,6 +133,14 @@ export type HistoryEntry = {
   note?: string
   /** Set by the file audit. Never blocks anything. */
   missing?: boolean
+  /**
+   * Changed in this browser since the server last stamped it. Saved with the
+   * record, so a change made while the server was away is still sent after the
+   * tab closes, and until it is sent the server's older copy does not replace
+   * it. Only ever set on a record that has a `rev`; one without is unsent
+   * already. Never sent to the server.
+   */
+  pending?: boolean
 
   /**
    * The server's revision stamp. Absent on a record the server has never
@@ -152,7 +165,18 @@ export type ArchiveEntry = HistoryEntry
 /** What a caller hands to {@link add}. Identity and numbering are ours. */
 export type NewEntry = Omit<HistoryEntry, 'id' | 'no' | 'at'> & { at?: number }
 
-type Envelope = { v: number; nextNo: number; entries: HistoryEntry[] }
+type Envelope = {
+  v: number
+  nextNo: number
+  entries: HistoryEntry[]
+  /** Ids removed here whose removal the server has not yet acknowledged. */
+  gone?: string[]
+  /**
+   * How far into the server's log these entries have been brought, and which
+   * log. Saved with the entries it describes, so the two can never disagree.
+   */
+  sync?: { rev: number; epoch: string | null }
+}
 
 // ---------------------------------------------------------------------------
 // Load
@@ -160,6 +184,29 @@ type Envelope = { v: number; nextNo: number; entries: HistoryEntry[] }
 
 let entries: HistoryEntry[] = []
 let nextNo = 1
+/** Removals the server has not yet acknowledged. See {@link gone}. */
+let goneIds = new Set<string>()
+/** The server revision these entries are current to, and the epoch of its log. */
+let syncRev = 0
+let syncEpoch: string | null = null
+/**
+ * Set once this browser's archive mirrors a server's: the first pull, or a
+ * saved cursor from an earlier one. It decides what a full quota means, and
+ * whether a removal of a never-stamped record still has to be sent.
+ */
+let serverBacked = false
+/**
+ * Records sent in by the reader that the local cap dropped at once (an old
+ * restore, a large recovery). They never reach the screen, but the server
+ * keeps everything, so they wait here to be pushed. Memory only.
+ */
+const outbox = new Map<string, HistoryEntry>()
+
+/** A record that exists only here until it is pushed: never stamped, or changed since. */
+function unpushed(e: HistoryEntry): boolean {
+  return e.rev === undefined || e.pending === true
+}
+
 let loadIssueMessage: string | null = null
 /** Set when the stored envelope was older than this build and was brought forward. */
 let migratedOnLoad = false
@@ -234,6 +281,7 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
       ? e.files.filter((f: any) => typeof f?.filename === 'string').map((f: any) => fileRef(f))
       : undefined,
     rev: numOrNull(e.rev) ?? undefined,
+    pending: e.pending === true ? true : undefined,
     recovered: e.recovered === true ? true : undefined,
     tags: Array.isArray(e.tags) ? e.tags.filter((t: unknown): t is string => typeof t === 'string') : undefined,
     rating: ['general', 'sensitive', 'questionable', 'explicit'].includes(e.rating) ? e.rating : undefined,
@@ -319,6 +367,17 @@ function load(): void {
     typeof parsed.nextNo === 'number' && parsed.nextNo > 0
       ? parsed.nextNo
       : kept.reduce((m, e) => Math.max(m, e.no), 0) + 1
+  readSyncState(parsed)
+}
+
+/** The removal list and log position an envelope carries. Both are optional; an older envelope has neither. */
+function readSyncState(parsed: any, merge = false): void {
+  const ids: string[] = Array.isArray(parsed?.gone) ? parsed.gone.filter((x: unknown) => typeof x === 'string') : []
+  goneIds = merge ? new Set([...goneIds, ...ids]) : new Set(ids)
+  const sync = parsed?.sync
+  syncRev = numOrNull(sync?.rev) ?? 0
+  syncEpoch = typeof sync?.epoch === 'string' ? sync.epoch : null
+  if (syncRev > 0) serverBacked = true
 }
 
 const MODES: readonly Mode[] = ['t2i', 'i2i', 'edit', 't2v', 'i2v']
@@ -438,36 +497,57 @@ load()
 // ---------------------------------------------------------------------------
 
 let quotaMessage: string | null = null
+/**
+ * With a server behind it, how many records the last full save found room for.
+ * Later saves keep to it rather than failing on the whole list every time.
+ */
+let roomFor: number | null = null
 
-function envelope(): Envelope {
-  return { v: HISTORY_VERSION, nextNo, entries }
+function envelope(list: HistoryEntry[] = entries): Envelope {
+  return {
+    v: HISTORY_VERSION,
+    nextNo,
+    entries: list,
+    gone: goneIds.size ? [...goneIds] : undefined,
+    sync: syncRev > 0 ? { rev: syncRev, epoch: syncEpoch } : undefined,
+  }
+}
+
+/** False only when the browser said it is full. Any other failure is memory-only storage, already handled by `store`. */
+function tryWrite(list: HistoryEntry[]): boolean {
+  try {
+    store.set(HISTORY_KEY, JSON.stringify(envelope(list)))
+    return true
+  } catch (err) {
+    return !isQuotaError(err)
+  }
 }
 
 function writeNow(): void {
   saveTimer = null
-  const body = JSON.stringify(envelope())
-  try {
-    store.set(HISTORY_KEY, body)
-    return
-  } catch (err) {
-    if (!isQuotaError(err)) return
-  }
+  const kept = roomFor === null ? entries : trimTo(entries, roomFor, unpushed)
+  if (tryWrite(kept)) return
 
   // Full. Shed the oldest unstarred records and try once more. A generation
   // must never fail because the archive filled up.
-  const before = entries.length
-  const starred = entries.filter((e) => e.starred)
-  const rest = entries.filter((e) => !e.starred)
-  const evicted = Math.min(EVICT_ON_QUOTA, rest.length)
-  entries = [...starred, ...rest.slice(0, Math.max(0, rest.length - evicted))].sort(
-    (a, b) => b.at - a.at,
-  )
-  try {
-    store.set(HISTORY_KEY, JSON.stringify(envelope()))
-    quotaMessage = `Your archive was full, so we removed the ${before - entries.length} oldest records. The files are still on disk.`
-  } catch {
-    quotaMessage =
-      'Your archive is full and we could not save it. Save a copy, then clear out some records.'
+  const shed = trimTo(kept, Math.max(0, kept.length - EVICT_ON_QUOTA), serverBacked ? unpushed : undefined)
+  const fits = tryWrite(shed)
+  if (serverBacked) {
+    // Only records the server already holds were shed, so this browser's copy
+    // is a window onto the archive and nothing has been lost. The records stay
+    // on screen for this session; only the saved copy is shorter. Telling the
+    // reader to clear records out here would have them remove real records
+    // for every device.
+    roomFor = shed.length
+    const shown = shed.length.toLocaleString('en-GB')
+    quotaMessage = fits
+      ? `This browser has run out of room, so after a reload it will show only the newest ${shown} records. Nothing was removed: the older ones are still in the archive on the server.`
+      : 'This browser has run out of room and could not save its copy of the archive. Nothing was removed from the archive on the server, and changes made here are still sent to it while this page is open.'
+  } else {
+    entries = shed
+    quotaMessage = fits
+      ? `Your archive was full, so we removed the ${kept.length - shed.length} oldest records. The files are still on disk.`
+      : 'Your archive is full and we could not save it. Save a copy, then clear out some records.'
   }
   announce()
 }
@@ -541,22 +621,53 @@ export function onCommit(fn: (delta: CommitDelta) => void): () => void {
   }
 }
 
-function commit(next: HistoryEntry[], opts: { remote?: boolean; trimmed?: boolean } = {}): void {
+/**
+ * Make `next` the archive.
+ *
+ * `untrimmed` is the list as it stood before a trim to the local cap, when
+ * there was one. A trim is this browser running out of room, not the reader
+ * removing anything, so what it dropped is never reported as a removal. With
+ * a server behind it, anything the trim dropped that the server does not yet
+ * have still goes there, because the server keeps everything; what the reader
+ * brought in and the trim dropped at once is reported as a change.
+ */
+function commit(next: HistoryEntry[], opts: { remote?: boolean; untrimmed?: readonly HistoryEntry[] } = {}): void {
   const prev = entries
+  const remote = opts.remote === true
   entries = next
   indexCache = new WeakMap()
-  save()
-  announce()
-  if (!commitListeners.size) return
+  if (remote && !commitListeners.size) {
+    save()
+    announce()
+    return
+  }
   // Records are replaced, never mutated, so identity says what changed.
   const prevById = new Map(prev.map((e) => [e.id, e]))
   const nextIds = new Set(next.map((e) => e.id))
+  const beforeTrim = opts.untrimmed ? new Set(opts.untrimmed.map((e) => e.id)) : nextIds
   const upserted = next.filter((e) => prevById.get(e.id) !== e)
-  // A trim to the local cap is this browser running out of room, not the
-  // reader removing anything: it is never reported as a removal.
-  const removed = opts.trimmed ? [] : prev.filter((e) => !nextIds.has(e.id)).map((e) => e.id)
+  const removedEntries = prev.filter((e) => !beforeTrim.has(e.id))
+  if (!remote) {
+    // A removal is kept until the server says it has it, so closing the tab
+    // first does not bring the record back on the next pull.
+    for (const e of removedEntries) if (e.rev !== undefined || serverBacked) goneIds.add(e.id)
+    for (const e of upserted) goneIds.delete(e.id)
+    if (serverBacked && opts.untrimmed) {
+      for (const e of opts.untrimmed) {
+        if (nextIds.has(e.id)) continue
+        const changedNow = prevById.get(e.id) !== e
+        if (!changedNow && !unpushed(e)) continue
+        outbox.set(e.id, e)
+        if (changedNow) upserted.push(e)
+      }
+    }
+  }
+  save()
+  announce()
+  if (!commitListeners.size) return
+  const removed = removedEntries.map((e) => e.id)
   if (!upserted.length && !removed.length) return
-  const delta: CommitDelta = { upserted, removed, remote: opts.remote === true }
+  const delta: CommitDelta = { upserted, removed, remote }
   for (const fn of [...commitListeners]) {
     try {
       fn(delta)
@@ -578,6 +689,10 @@ onStorage(HISTORY_KEY, (value) => {
     kept.sort((a, b) => b.at - a.at)
     entries = kept
     nextNo = typeof parsed.nextNo === 'number' ? parsed.nextNo : nextNo
+    // The log position describes the entries it was saved with, so it is
+    // taken with them. Removals are merged rather than replaced: one this tab
+    // has not yet sent is still this tab's to send.
+    readSyncState(parsed, true)
     indexCache = new WeakMap()
     announce()
   } catch {
@@ -629,8 +744,28 @@ export function add(input: NewEntry): HistoryEntry {
     at: input.at ?? Date.now(),
   }
   const next = [entry, ...entries]
-  commit(next.length > MAX_ENTRIES ? trim(next) : next, { trimmed: next.length > MAX_ENTRIES })
+  commit(trim(next), { untrimmed: next })
   return entry
+}
+
+/**
+ * File several records as one change: one sort, one trim, one commit. The
+ * recovery pass can file thousands of outputs at once, and one {@link add}
+ * each copied the whole archive every time and held the page for seconds.
+ * Numbers are handed out in the order given, so pass them oldest first.
+ */
+export function addMany(inputs: readonly NewEntry[]): HistoryEntry[] {
+  if (!inputs.length) return []
+  const now = Date.now()
+  const made: HistoryEntry[] = inputs.map((input) => ({
+    ...input,
+    id: cryptoId(),
+    no: nextNo++,
+    at: input.at ?? now,
+  }))
+  const next = [...made, ...entries].sort((a, b) => b.at - a.at)
+  commit(trim(next), { untrimmed: next })
+  return made
 }
 
 // ---------------------------------------------------------------------------
@@ -638,23 +773,45 @@ export function add(input: NewEntry): HistoryEntry {
 // ---------------------------------------------------------------------------
 
 /**
- * Merge what the server sent. The server wins by id. A removal is honoured
- * only for a record the server had stamped: a local record it has never seen
- * cannot have been removed there, and stays to be pushed.
+ * Merge what the server sent. The server wins by id, with two exceptions that
+ * both mean this browser holds something the server has not yet taken: a
+ * record changed here or never stamped, and a record removed here. Those wait
+ * for the push, which is what settles them; replacing them first would wipe
+ * the change off the screen while the older copy was still on its way. A
+ * removal is honoured only for a record the server had stamped: a local record
+ * it has never seen cannot have been removed there, and stays to be pushed.
+ *
+ * `cursor` is the log position the answer brings these entries to.
  */
-export function mergeFromServer(records: readonly unknown[], removed: readonly string[], serverNextNo: number): number {
+export function mergeFromServer(
+  records: readonly unknown[],
+  removed: readonly string[],
+  serverNextNo: number,
+  cursor?: { rev: number; epoch: string | null },
+): number {
   const map = new Map(entries.map((e) => [e.id, e]))
   let n = 0
   let changed = 0
   for (const raw of records) {
     if (!sane(raw)) continue
-    const e = normalise(raw, ++n)
-    const local = map.get(e.id)
-    if (local && local.rev === e.rev && local.rev !== undefined) continue
+    n++
+    const id = typeof (raw as { id?: unknown }).id === 'string' ? (raw as { id: string }).id : ''
+    const local = id ? map.get(id) : undefined
+    if (local) {
+      // Unchanged since this browser last saw it, which is most of a full
+      // pull: settled before paying for `normalise`.
+      if (local.rev !== undefined && local.rev === numOrNull((raw as { rev?: unknown }).rev)) continue
+      if (unpushed(local)) continue
+    } else if (goneIds.has(id)) continue
+    const e = normalise(raw, n)
+    e.pending = undefined
     map.set(e.id, e)
     changed++
   }
   for (const id of removed) {
+    // The server has it removed; nothing is left for this browser to send.
+    goneIds.delete(id)
+    outbox.delete(id)
     const local = map.get(id)
     if (local && local.rev !== undefined) {
       map.delete(id)
@@ -662,48 +819,161 @@ export function mergeFromServer(records: readonly unknown[], removed: readonly s
     }
   }
   nextNo = Math.max(nextNo, serverNextNo)
-  if (!changed) return 0
-  commit([...map.values()].sort((a, b) => b.at - a.at), { remote: true })
+  const moved = cursor !== undefined && (cursor.rev !== syncRev || cursor.epoch !== syncEpoch)
+  if (cursor) {
+    syncRev = cursor.rev
+    syncEpoch = cursor.epoch
+    serverBacked = true
+  }
+  if (!changed) {
+    if (moved) save()
+    return 0
+  }
+  // The server keeps every record; this browser keeps the newest of them, and
+  // never one that exists only here.
+  const merged = [...map.values()].sort((a, b) => b.at - a.at)
+  commit(trimTo(merged, MAX_ENTRIES, unpushed), { remote: true, untrimmed: merged })
   return changed
 }
 
-/** Stamp records the server just accepted with its revision and, when it reassigned one, its edition number. */
-export function applyServerMeta(assigned: readonly { id: string; no: number; rev: number }[]): void {
+/**
+ * Stamp records the server just accepted with its revision and, when it
+ * reassigned one, its edition number.
+ *
+ * `sent` is exactly what went, so the stamp lands on the content the server
+ * now holds at that revision and on nothing else. A record changed here again
+ * while the push was in flight keeps its mark and goes next; it takes only the
+ * number, so it is not renumbered a second time. A record that was replaced
+ * some other way meanwhile (another tab's save) becomes what was sent, stamped,
+ * so this browser and the server never hold different content at one revision.
+ */
+export function applyServerMeta(
+  assigned: readonly { id: string; no: number; rev: number }[],
+  sent: readonly HistoryEntry[] = [],
+): void {
   if (!assigned.length) return
   const meta = new Map(assigned.map((a) => [a.id, a]))
+  const sentById = new Map(sent.map((e) => [e.id, e]))
+  for (const e of sent) if (meta.has(e.id) && outbox.get(e.id) === e) outbox.delete(e.id)
   let changed = false
   const next = entries.map((e) => {
     const m = meta.get(e.id)
-    if (!m || (e.rev === m.rev && e.no === m.no)) return e
+    if (!m) return e
+    const went = sentById.get(e.id)
+    if (!went || went === e) {
+      if (e.rev === m.rev && e.no === m.no && !e.pending) return e
+      changed = true
+      return { ...e, rev: m.rev, no: m.no, pending: undefined }
+    }
+    if (unpushed(e)) {
+      if (e.no === m.no) return e
+      changed = true
+      return { ...e, no: m.no }
+    }
     changed = true
-    return { ...e, rev: m.rev, no: m.no }
+    return { ...went, rev: m.rev, no: m.no, pending: undefined }
   })
   if (!changed) return
   nextNo = Math.max(nextNo, next.reduce((mx, e) => Math.max(mx, e.no), 0) + 1)
   commit(next, { remote: true })
 }
 
-/** Records the server has never stamped. */
+/**
+ * Everything the server does not yet have from this browser: records it has
+ * never stamped, records changed here since, and records the local cap
+ * dropped before they could be sent.
+ */
 export function unsynced(): HistoryEntry[] {
-  return entries.filter((e) => e.rev === undefined)
+  const out = entries.filter(unpushed)
+  for (const e of outbox.values()) out.push(e)
+  return out
+}
+
+/** Ids removed here that the server has not yet acknowledged removing. */
+export function gone(): string[] {
+  return [...goneIds]
+}
+
+/** The server has these removals. */
+export function acknowledgeRemoved(ids: readonly string[]): void {
+  let changed = false
+  for (const id of ids) changed = goneIds.delete(id) || changed
+  if (changed) save()
+}
+
+/** How many changes are waiting for the server. */
+export function pendingCount(): number {
+  let n = goneIds.size + outbox.size
+  for (const e of entries) if (unpushed(e)) n++
+  return n
+}
+
+/**
+ * Drop records the server refused: a stale copy of one removed on another
+ * device, or a second record for a file it already has. It is the server's
+ * word, so it is not sent back.
+ */
+export function forget(ids: readonly string[]): void {
+  if (!ids.length) return
+  const drop = new Set(ids)
+  for (const id of ids) outbox.delete(id)
+  if (!entries.some((e) => drop.has(e.id))) return
+  commit(
+    entries.filter((e) => !drop.has(e.id)),
+    { remote: true },
+  )
+}
+
+/** Where this browser's copy stands in the server's log. */
+export function syncCursor(): { rev: number; epoch: string | null } {
+  return { rev: syncRev, epoch: syncEpoch }
+}
+
+/** Say whether a server holds the archive behind this browser. The sync is the one caller. */
+export function setServerBacked(on: boolean): void {
+  serverBacked = on
+  if (!on) {
+    roomFor = null
+    outbox.clear()
+  }
 }
 
 /** Drop the oldest unstarred records down to the cap. Starred are exempt. */
 function trim(list: HistoryEntry[]): HistoryEntry[] {
-  const over = list.length - MAX_ENTRIES
+  return trimTo(list, MAX_ENTRIES)
+}
+
+/**
+ * Drop the oldest records down to `max`, never a starred one or one `keep`
+ * covers. Oldest means furthest down the list, which is kept newest first.
+ * Returns the same array when nothing needs to go.
+ */
+function trimTo(list: HistoryEntry[], max: number, keep?: (e: HistoryEntry) => boolean): HistoryEntry[] {
+  let over = list.length - max
   if (over <= 0) return list
-  const out = [...list]
-  for (let i = out.length - 1; i >= 0 && out.length > MAX_ENTRIES; i--) {
-    if (!out[i].starred) out.splice(i, 1)
+  const drop = new Set<HistoryEntry>()
+  for (let i = list.length - 1; i >= 0 && over > 0; i--) {
+    const e = list[i]
+    if (e.starred || keep?.(e)) continue
+    drop.add(e)
+    over--
   }
-  return out
+  return drop.size ? list.filter((e) => !drop.has(e)) : list
 }
 
 /** Change one record — star it, note it, mark it missing. */
 export function update(id: string, patch: Partial<HistoryEntry>): HistoryEntry | null {
   const i = entries.findIndex((e) => e.id === id)
   if (i < 0) return null
-  const updated = { ...entries[i], ...patch, id: entries[i].id, no: entries[i].no }
+  const was = entries[i]
+  const updated = {
+    ...was,
+    ...patch,
+    id: was.id,
+    no: was.no,
+    // A stamped record changed here is marked until the server takes it.
+    pending: was.rev !== undefined ? true : undefined,
+  }
   const next = [...entries]
   next[i] = updated
   commit(next)
@@ -736,11 +1006,20 @@ export function removeMany(ids: readonly string[]): HistoryEntry[] {
   return removed
 }
 
-/** Put removed records back, in their original places. The undo. */
+/**
+ * Put removed records back, in their original places. The undo.
+ *
+ * They come back unstamped. By the time the reader undoes, the removal may
+ * already be on the server, and a stamped copy arriving after its removal is
+ * refused there as stale. An unstamped one is a record arriving, which is what
+ * an undo is.
+ */
 export function restore(...records: HistoryEntry[]): void {
   if (!records.length) return
   const known = new Set(entries.map((e) => e.id))
-  const back = records.filter((r) => !known.has(r.id))
+  const back = records
+    .filter((r) => !known.has(r.id))
+    .map((r) => ({ ...r, rev: undefined, pending: undefined }))
   if (!back.length) return
   commit([...back, ...entries].sort((a, b) => b.at - a.at))
 }
@@ -817,27 +1096,55 @@ export async function deleteFiles(
   return out
 }
 
+/** What one audit found. `unanswered` records were left exactly as they were. */
+export type AuditResult = { checked: number; missing: number; unanswered: number }
+
+/**
+ * Ask ComfyUI whether one file is there. True when it serves it, false only
+ * when it answers 404, and null for everything else: a 502 from the proxy
+ * while ComfyUI is down, a 5xx, the network gone. Only a 404 says the file is
+ * not there; the rest say the question was not answered.
+ */
+async function fileIsThere(f: FileRef): Promise<boolean | null> {
+  try {
+    const r = await fetch(fileUrl(f), { method: 'HEAD' })
+    if (r.ok) return true
+    return r.status === 404 ? false : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Check which records' files are still on disk, marking those that are not.
  *
  * A missing file is never an error: the record keeps its settings, so what was
  * lost can be made again. Runs in small batches so it can be done on idle.
+ *
+ * A record is marked only on a definite answer. The mark is shared with every
+ * device, so a guess would put "moved or deleted" on files that are intact.
+ * A batch with no answer at all ends the pass: ComfyUI is down or the network
+ * is, and nothing after it would fare better.
  */
 export async function checkMissing(
   records: readonly HistoryEntry[] = entries,
   batch = 20,
-): Promise<number> {
-  let missingCount = 0
+): Promise<AuditResult> {
+  let checked = 0
+  let missing = 0
   for (let i = 0; i < records.length; i += batch) {
     const slice = records.slice(i, i + batch)
-    const found = await Promise.all(slice.map((e) => headFile(e.file)))
+    const found = await Promise.all(slice.map((e) => fileIsThere(e.file)))
+    if (found.every((f) => f === null)) break
     slice.forEach((e, n) => {
-      const missing = !found[n]
-      if (missing) missingCount++
-      if (Boolean(e.missing) !== missing) update(e.id, { missing })
+      const there = found[n]
+      if (there === null) return
+      checked++
+      if (!there) missing++
+      if (Boolean(e.missing) !== !there) update(e.id, { missing: !there })
     })
   }
-  return missingCount
+  return { checked, missing, unanswered: records.length - checked }
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,13 +1311,24 @@ export function search(query: string, within: readonly HistoryEntry[] = entries)
 // Export and import
 // ---------------------------------------------------------------------------
 
-/** The whole archive as JSON — what "Save a copy" downloads. */
+/**
+ * This browser's archive as JSON, what "Save a copy" downloads when there is
+ * no server to ask for the whole of it. The sync bookkeeping stays behind: it
+ * describes this browser, not the records.
+ */
 export function exportJson(): string {
-  return JSON.stringify(envelope(), null, 2)
+  return JSON.stringify({ v: HISTORY_VERSION, nextNo, entries }, null, 2)
 }
 
 /**
  * Merge a saved copy back in. Records are matched by id; the newer `at` wins.
+ *
+ * A record this browser does not hold comes in unstamped, like an undo:
+ * restoring from a file is a deliberate act, and the server takes an unstamped
+ * record even where it had been removed. Past the local cap the oldest records
+ * do not stay in this browser; with a server behind it they are still sent
+ * there and counted, and without one they are not counted, because they are
+ * not kept anywhere.
  * @returns how many records were added or updated.
  */
 export function importJson(text: string): number {
@@ -1024,22 +1342,31 @@ export function importJson(text: string): number {
   if (!Array.isArray(incoming)) throw new Error('That file is not a SwitchGen archive.')
 
   const byId = new Map(entries.map((e) => [e.id, e]))
-  let changed = 0
+  const touched: string[] = []
   let n = 0
   for (const raw of incoming) {
     if (!sane(raw)) continue
     const e = normalise(raw, ++n)
     const existing = byId.get(e.id)
     if (!existing || e.at > existing.at) {
-      byId.set(e.id, existing ? { ...existing, ...e } : { ...e, no: e.no || nextNo++ })
-      changed++
+      byId.set(
+        e.id,
+        existing
+          ? // The server's stamp on this browser's copy is the one that counts, not the file's.
+            { ...existing, ...e, rev: existing.rev, pending: existing.rev !== undefined ? true : undefined }
+          : { ...e, no: e.no || nextNo++, rev: undefined, pending: undefined },
+      )
+      touched.push(e.id)
     }
   }
-  if (!changed) return 0
+  if (!touched.length) return 0
   const merged = [...byId.values()].sort((a, b) => b.at - a.at)
   nextNo = Math.max(nextNo, merged.reduce((m, e) => Math.max(m, e.no), 0) + 1)
-  commit(merged.length > MAX_ENTRIES ? trim(merged) : merged)
-  return changed
+  const kept = trim(merged)
+  commit(kept, { untrimmed: merged })
+  if (serverBacked || kept === merged) return touched.length
+  const keptIds = new Set(kept.map((e) => e.id))
+  return touched.filter((id) => keptIds.has(id)).length
 }
 
 /**
@@ -1052,6 +1379,7 @@ export const history = {
   count,
   get,
   add,
+  addMany,
   update,
   star,
   remove,
@@ -1061,6 +1389,12 @@ export const history = {
   mergeFromServer,
   applyServerMeta,
   unsynced,
+  gone,
+  acknowledgeRemoved,
+  pendingCount,
+  forget,
+  syncCursor,
+  setServerBacked,
   deleteFile,
   deleteFiles,
   checkMissing,

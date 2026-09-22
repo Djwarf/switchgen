@@ -2,8 +2,11 @@
  * The dense view: one line per record, every number in tabular figures, and
  * sortable heads. This is the view you use when you are hunting for the run
  * where you set CFG to 3.5, not the one where you are looking at pictures.
+ *
+ * Memoised for the same reason as the grid: typing in the search box must not
+ * redraw every row before the results have even changed.
  */
-import type { MouseEvent } from 'react'
+import { memo, type MouseEvent } from 'react'
 import type { HistoryEntry } from '../../lib/history'
 import { CardActions, type EntryActions } from './CardActions'
 import { Highlight, clockTime, dimensions } from './query'
@@ -67,7 +70,7 @@ function Head({
   )
 }
 
-export function Table({
+export const Table = memo(function Table({
   entries,
   terms,
   sortKey,
@@ -105,6 +108,7 @@ export function Table({
               <tr
                 key={entry.id}
                 ref={(el) => registerRef(entry, el)}
+                data-archive-record
                 tabIndex={focusedId === entry.id ? 0 : -1}
                 onFocus={() => onFocused(entry)}
                 onClick={(e) => onActivate(entry, e)}
@@ -175,4 +179,4 @@ export function Table({
       </table>
     </div>
   )
-}
+})

@@ -14,7 +14,7 @@
  *      a picture into Pictures, with every parameter the record carried.
  */
 import { capabilities as visionCapabilities, tagImages } from '../lib/vision'
-import { useArchiveSync } from '../lib/archiveSync'
+import { serverArchiveCopy, useArchiveSync } from '../lib/archiveSync'
 import { recoverUnfiled } from '../lib/recover'
 import {
   useCallback,
@@ -62,12 +62,11 @@ import {
   goToSection,
   setArchiveQuery,
 } from '../components/shell/route'
-import { Card } from '../components/archive/Card'
 import type { EntryActions } from '../components/archive/CardActions'
-import { DateHead } from '../components/archive/DateHead'
 import { DeleteDialog } from '../components/archive/DeleteDialog'
 import { Detail } from '../components/archive/Detail'
 import { FacetRail } from '../components/archive/FacetRail'
+import { Grid } from '../components/archive/Grid'
 import { Notice } from '../components/type'
 import { offerUndo } from '../components/shell/UndoBar'
 import { SearchBand, type KindFilter } from '../components/archive/SearchBand'
@@ -324,7 +323,11 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     if (auditedThisSession || !records.length) return
     auditedThisSession = true
     const run = () => {
-      void checkMissing(all().slice(0, 200), 20)
+      void checkMissing(all().slice(0, 200), 20).then(({ checked }) => {
+        // Nothing answered, most likely because ComfyUI is down. Nothing was
+        // learned and nothing was marked, so the next visit tries again.
+        if (!checked) auditedThisSession = false
+      })
     }
     const idle = (
       window as unknown as { requestIdleCallback?: (cb: () => void) => number }
@@ -376,6 +379,28 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       })
     },
     [ordered],
+  )
+
+  // Stable, so the grid and the list can skip rendering while the reader types.
+  const activate = useCallback(
+    (entry: HistoryEntry, e: MouseEvent) => {
+      if (e.shiftKey || selected.size) toggleSelection(entry, e)
+      else setOpenId(entry.id)
+    },
+    [selected.size, toggleSelection],
+  )
+
+  const noteFocus = useCallback((entry: HistoryEntry) => setFocusedId(entry.id), [])
+
+  const sortBy = useCallback(
+    (key: SortKey) => {
+      if (key === sortKey) setAscending((v) => !v)
+      else {
+        setSortKey(key)
+        setAscending(false)
+      }
+    },
+    [sortKey],
   )
 
   // -- the verbs ------------------------------------------------------------
@@ -506,14 +531,34 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
 
   const runMissingAudit = useCallback(async () => {
     setChecking(true)
-    const missing = await checkMissing(all(), 20)
+    const { checked, missing, unanswered } = await checkMissing(all(), 20)
     setChecking(false)
+    if (!checked) {
+      setBanner({
+        variant: 'error',
+        title: 'Nothing was checked',
+        text: 'ComfyUI did not answer, so we could not tell which files are on disk. No record was changed.',
+      })
+      return
+    }
+    const gone = `${missing} ${missing === 1 ? 'file is' : 'files are'} no longer on disk. Their settings are still here. Search is:missing to see them.`
+    if (!unanswered) {
+      setBanner({
+        variant: missing ? 'correction' : 'success',
+        title: missing ? 'Correction' : 'All present',
+        text: missing ? gone : 'Every file in the archive is still on disk.',
+      })
+      return
+    }
+    // Part of the way through, ComfyUI stopped answering. Say what was found,
+    // and that the rest were left alone rather than guessed at.
+    const rest = `We could not get an answer from ComfyUI for the other ${unanswered}, so those records were left as they were.`
     setBanner({
-      variant: missing ? 'correction' : 'success',
-      title: missing ? 'Correction' : 'All present',
+      variant: missing ? 'correction' : 'info',
+      title: missing ? 'Correction' : 'Partly checked',
       text: missing
-        ? `${missing} ${missing === 1 ? 'file is' : 'files are'} no longer on disk. Their settings are still here. Search is:missing to see them.`
-        : 'Every file in the archive is still on disk.',
+        ? `Of the ${checked} files we could check, ${gone} ${rest}`
+        : `The ${checked} files we could check are all on disk. ${rest}`,
     })
   }, [])
 
@@ -581,6 +626,28 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       setTagging(null)
     }
   }, [])
+
+  /**
+   * "Save a copy". With the server behind it, the copy is the server's whole
+   * archive: this browser keeps only a window of it, and a copy of the window
+   * would be missing everything older.
+   */
+  const saveCopy = useCallback(async () => {
+    const name = `switchgen-archive-${new Date().toISOString().slice(0, 10)}.json`
+    if (sync.mode === 'server') {
+      try {
+        saveText(name, await serverArchiveCopy())
+        return
+      } catch {
+        setBanner({
+          variant: 'correction',
+          title: 'Correction',
+          text: `The server did not answer, so this copy holds only the ${countRecords().toLocaleString('en-GB')} records this browser keeps.`,
+        })
+      }
+    }
+    saveText(name, exportJson())
+  }, [sync.mode])
 
   const importFile = useCallback(async (file: File) => {
     try {
@@ -673,7 +740,12 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return
 
-      const target = open ?? focused
+      // A key that acts on a record acts on the one focus is in. `focusedId`
+      // outlives the focus that set it, so a key pressed on the rail, the
+      // search band or the section bar must not reach back to the last card
+      // touched.
+      const inRecord = !!(e.target as Element | null)?.closest?.('[data-archive-record]')
+      const target = open ?? (inRecord ? focused : null)
 
       switch (e.key) {
         case '/':
@@ -701,10 +773,13 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           } else move(-1)
           return
         case 'Enter':
-          if (focused && !open) {
-            e.preventDefault()
-            setOpenId(focused.id)
-          }
+          // Only on the card or row itself. On a button or a link, inside a
+          // card or anywhere else, Enter is that control's own: taking it here
+          // made "More actions" impossible to open from a keyboard or a TV
+          // remote, whose OK key is Enter.
+          if (!focused || open || e.target !== cardRefs.current.get(focused.id)) return
+          e.preventDefault()
+          setOpenId(focused.id)
           return
         case 'v':
           settings.patch({ view: prefs.view === 'grid' ? 'list' : 'grid' })
@@ -808,9 +883,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           query={query}
           onToggle={(token) => setQuery((current) => toggleToken(current, token))}
           onClear={() => setQuery('')}
-          onExport={() =>
-            saveText(`switchgen-archive-${new Date().toISOString().slice(0, 10)}.json`, exportJson())
-          }
+          onExport={() => void saveCopy()}
           onImport={importFile}
           onCheckMissing={runMissingAudit}
           checking={checking}
@@ -947,22 +1020,13 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
                 terms={terms}
                 sortKey={sortKey}
                 ascending={ascending}
-                onSort={(key) => {
-                  if (key === sortKey) setAscending((v) => !v)
-                  else {
-                    setSortKey(key)
-                    setAscending(false)
-                  }
-                }}
+                onSort={sortBy}
                 focusedId={focusedId}
                 selected={selected}
                 canDeleteFile={canDeleteFiles}
-                onActivate={(entry, e) => {
-                  if (e.shiftKey || selected.size) toggleSelection(entry, e)
-                  else setOpenId(entry.id)
-                }}
-                onFocused={(entry) => setFocusedId(entry.id)}
-                onToggleSelect={(entry, e) => toggleSelection(entry, e)}
+                onActivate={activate}
+                onFocused={noteFocus}
+                onToggleSelect={toggleSelection}
                 registerRef={registerRef}
                 actionsFor={actionsFor}
               />
@@ -970,38 +1034,18 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           )}
 
           {!empty && !nothingMatches && prefs.view === 'grid' && (
-            <div>
-              {groups.map((group) => (
-                <section key={group.label}>
-                  <DateHead label={group.label} count={group.entries.length} />
-                  <ul
-                    role="list"
-                    className="grid grid-cols-1 gap-x-6 gap-y-8 min-[780px]:grid-cols-2 min-[1100px]:grid-cols-3 min-[1400px]:grid-cols-4"
-                  >
-                    {group.entries.map((entry) => (
-                      <li key={entry.id}>
-                        <Card
-                          entry={entry}
-                          terms={terms}
-                          focused={focusedId === entry.id}
-                          selected={selected.has(entry.id)}
-                          selecting={selected.size > 0}
-                          canDeleteFile={canDeleteFiles}
-                          onActivate={(e) => {
-                            if (e.shiftKey || selected.size) toggleSelection(entry, e)
-                            else setOpenId(entry.id)
-                          }}
-                          onFocused={() => setFocusedId(entry.id)}
-                          onToggleSelect={(e) => toggleSelection(entry, e)}
-                          registerRef={(el) => registerRef(entry, el)}
-                          {...actionsFor(entry)}
-                        />
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              ))}
-            </div>
+            <Grid
+              groups={groups}
+              terms={terms}
+              focusedId={focusedId}
+              selected={selected}
+              canDeleteFile={canDeleteFiles}
+              onActivate={activate}
+              onFocused={noteFocus}
+              onToggleSelect={toggleSelection}
+              registerRef={registerRef}
+              actionsFor={actionsFor}
+            />
           )}
 
           {!empty && ordered.length > visible.length && (

@@ -43,6 +43,7 @@ export function Card({
   return (
     <article
       ref={registerRef}
+      data-archive-record
       tabIndex={focused ? 0 : -1}
       onFocus={onFocused}
       aria-label={`${editionNo(entry.no)}. ${entry.prompt || 'no prompt'}`}

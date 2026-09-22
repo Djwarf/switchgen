@@ -3,13 +3,18 @@
  *
  * A generation made by another front end, by ComfyUI's own interface, or by
  * this app before the archive existed, sits in the outputs folder with no
- * record. GET /api/outputs lists every media file there; the difference
- * against the archive is what needs filing. For each such file, ComfyUI's own
- * /history may still hold the exact graph that produced it, and a family's
- * bindings say which node input held the prompt, the seed, the steps, so the
- * settings come back out of the graph rather than being guessed. When history
- * has forgotten the file (it is in-memory and lost on restart), the record is
- * minimal and says so: a file, a time, and `recovered: true`.
+ * record. GET /api/outputs lists every media file there and marks the ones a
+ * record on the server already names; what is left, less what this browser
+ * holds but has not yet pushed, is what needs filing. The server's mark is the
+ * one that matters: this browser keeps only a window of the archive, and a
+ * file whose record fell out of that window is filed already, not unfiled.
+ *
+ * For each file that really has no record, ComfyUI's own /history may still
+ * hold the exact graph that produced it, and a family's bindings say which
+ * node input held the prompt, the seed, the steps, so the settings come back
+ * out of the graph rather than being guessed. When history has forgotten the
+ * file (it is in-memory and lost on restart), the record is minimal and says
+ * so: a file, a time, and `recovered: true`.
  */
 import { pastRuns, readBoundParams, relPath, type ApiWorkflow, type FileRef, type PastRun } from './comfy'
 import { history, type HistoryEntry, type NewEntry } from './history'
@@ -22,6 +27,8 @@ export type UnfiledFile = {
   size: number
   mtime: number
   kind: 'image' | 'video'
+  /** A record on the server names this file. Absent from a server that predates the mark. */
+  filed?: boolean
 }
 
 /** Every media file under the outputs root that no record stands for. */
@@ -35,7 +42,7 @@ async function findUnfiled(): Promise<UnfiledFile[]> {
     known.add(relPath(e.file))
     for (const f of e.files ?? []) known.add(relPath(f))
   }
-  return (data.files ?? []).filter((f) => !known.has(f.rel))
+  return (data.files ?? []).filter((f) => !f.filed && !known.has(f.rel))
 }
 
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback)
@@ -157,11 +164,16 @@ export function recoverUnfiled(): Promise<{ filed: number; fromHistory: number }
     for (const run of runs) for (const f of run.files) byFile.set(relPath(f), run)
     let fromHistory = 0
     // Oldest first, so edition numbers follow the order the files were made.
-    for (const f of [...unfiled].sort((a, b) => a.mtime - b.mtime)) {
-      const run = byFile.get(f.rel)
-      history.add(run ? fromRun(run, f) : minimal(f))
-      if (run) fromHistory++
-    }
+    // One change for the lot: filed one at a time, a folder of thousands held
+    // the page for seconds.
+    const made = [...unfiled]
+      .sort((a, b) => a.mtime - b.mtime)
+      .map((f) => {
+        const run = byFile.get(f.rel)
+        if (run) fromHistory++
+        return run ? fromRun(run, f) : minimal(f)
+      })
+    history.addMany(made)
     return { filed: unfiled.length, fromHistory }
   })().finally(() => { running = null })
   return running
