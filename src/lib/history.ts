@@ -188,11 +188,15 @@ type Envelope = {
   /** Ids removed here whose removal the server has not yet acknowledged. */
   gone?: string[]
   /**
-   * How far into the server's log these entries have been brought, and which
-   * log. Saved with the entries it describes, so the two can never disagree.
+   * How far into the server's log these entries have been brought, which log,
+   * and which load of it the server was running. Saved with the entries it
+   * describes, so the two can never disagree.
    */
-  sync?: { rev: number; epoch: string | null }
+  sync?: { rev: number; epoch: string | null; boot?: string | null }
 }
+
+/** Where this browser's copy stands in the server's log. */
+export type SyncCursor = { rev: number; epoch: string | null; boot: string | null }
 
 // ---------------------------------------------------------------------------
 // Load
@@ -202,9 +206,10 @@ let entries: HistoryEntry[] = []
 let nextNo = 1
 /** Removals the server has not yet acknowledged. See {@link gone}. */
 let goneIds = new Set<string>()
-/** The server revision these entries are current to, and the epoch of its log. */
+/** The server revision these entries are current to, the epoch of its log, and the server's load of it. */
 let syncRev = 0
 let syncEpoch: string | null = null
+let syncBoot: string | null = null
 /**
  * Set once this browser's archive mirrors a server's: the first pull, or a
  * saved cursor from an earlier one. It decides what a full quota means, and
@@ -217,6 +222,14 @@ let serverBacked = false
  * keeps everything, so they wait here to be pushed. Memory only.
  */
 const outbox = new Map<string, HistoryEntry>()
+/**
+ * Ids this tab has changed since it last wrote the archive to storage: added,
+ * edited, removed, restored, a removal the server acknowledged, a record to be
+ * sent again. Another tab's write cannot hold these changes, because it had
+ * not seen them, so when one arrives they are laid back over it rather than
+ * lost with the list it replaces. Memory only, and emptied by each write.
+ */
+const unwritten = new Set<string>()
 
 /** A record that exists only here until it is pushed: never stamped, or changed since. */
 function unpushed(e: HistoryEntry): boolean {
@@ -391,14 +404,23 @@ function load(): void {
   readSyncState(parsed)
 }
 
-/** The removal list and log position an envelope carries. Both are optional; an older envelope has neither. */
-function readSyncState(parsed: any, merge = false): void {
-  const ids: string[] = Array.isArray(parsed?.gone) ? parsed.gone.filter((x: unknown) => typeof x === 'string') : []
-  goneIds = merge ? new Set([...goneIds, ...ids]) : new Set(ids)
+/** The removal list an envelope carries. An older envelope has none. */
+function goneOf(parsed: any): Set<string> {
+  return new Set(Array.isArray(parsed?.gone) ? parsed.gone.filter((x: unknown) => typeof x === 'string') : [])
+}
+
+/** The log position an envelope carries. An older envelope has none. */
+function readCursor(parsed: any): void {
   const sync = parsed?.sync
   syncRev = numOrNull(sync?.rev) ?? 0
   syncEpoch = typeof sync?.epoch === 'string' ? sync.epoch : null
-  if (syncRev > 0) serverBacked = true
+  syncBoot = typeof sync?.boot === 'string' ? sync.boot : null
+  if (syncRev > 0 || syncEpoch !== null) serverBacked = true
+}
+
+function readSyncState(parsed: any): void {
+  goneIds = goneOf(parsed)
+  readCursor(parsed)
 }
 
 const MODES: readonly Mode[] = ['t2i', 'i2i', 'edit', 't2v', 'i2v']
@@ -530,7 +552,9 @@ function envelope(list: HistoryEntry[] = entries): Envelope {
     nextNo,
     entries: list,
     gone: goneIds.size ? [...goneIds] : undefined,
-    sync: syncRev > 0 ? { rev: syncRev, epoch: syncEpoch } : undefined,
+    // Kept even at rev 0 once the log is known: a browser that has only pushed
+    // holds stamps from that log, and must be able to tell when it changes.
+    sync: syncRev > 0 || syncEpoch !== null ? { rev: syncRev, epoch: syncEpoch, boot: syncBoot } : undefined,
   }
 }
 
@@ -547,12 +571,16 @@ function tryWrite(list: HistoryEntry[]): boolean {
 function writeNow(): void {
   saveTimer = null
   const kept = roomFor === null ? entries : trimTo(entries, roomFor, unpushed)
-  if (tryWrite(kept)) return
+  if (tryWrite(kept)) {
+    unwritten.clear()
+    return
+  }
 
   // Full. Shed the oldest unstarred records and try once more. A generation
   // must never fail because the archive filled up.
   const shed = trimTo(kept, Math.max(0, kept.length - EVICT_ON_QUOTA), serverBacked ? unpushed : undefined)
   const fits = tryWrite(shed)
+  if (fits) unwritten.clear()
   if (serverBacked) {
     // Only records the server already holds were shed, so this browser's copy
     // is a window onto the archive and nothing has been lost. The records stay
@@ -669,6 +697,8 @@ function commit(next: HistoryEntry[], opts: { remote?: boolean; untrimmed?: read
   const upserted = next.filter((e) => prevById.get(e.id) !== e)
   const removedEntries = prev.filter((e) => !beforeTrim.has(e.id))
   if (!remote) {
+    for (const e of upserted) unwritten.add(e.id)
+    for (const e of removedEntries) unwritten.add(e.id)
     // A removal is kept until the server says it has it, so closing the tab
     // first does not bring the record back on the next pull.
     for (const e of removedEntries) if (e.rev !== undefined || serverBacked) goneIds.add(e.id)
@@ -698,23 +728,59 @@ function commit(next: HistoryEntry[], opts: { remote?: boolean; untrimmed?: read
   }
 }
 
-// A second tab writing the archive must not leave this one showing a stale one.
+/**
+ * A second tab wrote the archive. Take its list, its removals and its log
+ * position, which describe each other, then lay this tab's own unwritten
+ * changes back over them.
+ *
+ * Writes are debounced, so the other tab wrote without having seen what this
+ * tab did since its own last write: a picture just filed, a star, a removal,
+ * an undo. Those exist nowhere else yet, not even as a mark waiting to be
+ * sent, and taking the other list as it stands would lose them. Everything
+ * this tab had already written, the other tab had read, so its list is the
+ * word on those, including a removal it has since seen acknowledged. The one
+ * exception is a copy the server has stamped later than this tab's settled
+ * one, which is newer news than this tab has.
+ */
 onStorage(HISTORY_KEY, (value) => {
   if (value === null) return
   try {
     const parsed = JSON.parse(value)
     if (!parsed || !Array.isArray(parsed.entries) || parsed.v !== HISTORY_VERSION) return
-    const kept: HistoryEntry[] = []
+    const byId = new Map<string, HistoryEntry>()
     let n = 0
-    for (const e of parsed.entries) if (sane(e)) kept.push(normalise(e, ++n))
-    kept.sort((a, b) => b.at - a.at)
-    entries = kept
-    nextNo = typeof parsed.nextNo === 'number' ? parsed.nextNo : nextNo
-    // The log position describes the entries it was saved with, so it is
-    // taken with them. Removals are merged rather than replaced: one this tab
-    // has not yet sent is still this tab's to send.
-    readSyncState(parsed, true)
+    for (const e of parsed.entries) {
+      if (!sane(e)) continue
+      const r = normalise(e, ++n)
+      byId.set(r.id, r)
+    }
+    const gone = goneOf(parsed)
+    if (unwritten.size) {
+      const mine = new Map(entries.map((e) => [e.id, e]))
+      for (const id of unwritten) {
+        const own = mine.get(id)
+        if (!own) {
+          byId.delete(id)
+          if (goneIds.has(id)) gone.add(id)
+          else gone.delete(id)
+          continue
+        }
+        const theirs = byId.get(id)
+        const newer = theirs !== undefined && !unpushed(own) && (theirs.rev ?? -1) > (own.rev ?? -1)
+        if (!newer) byId.set(id, own)
+        gone.delete(id)
+      }
+    }
+    entries = [...byId.values()].sort((a, b) => b.at - a.at)
+    // Numbers are never reused, so the higher count stands.
+    if (typeof parsed.nextNo === 'number') nextNo = Math.max(nextNo, parsed.nextNo)
+    goneIds = gone
+    readCursor(parsed)
     indexCache = new WeakMap()
+    // Written back, so the other tab gets what only this one had. A write
+    // already due is left to land when it was going to: pushed back on every
+    // arrival, a tab written to often enough would never write at all.
+    if (unwritten.size && !saveTimer) save()
     announce()
   } catch {
     /* a write we cannot read is a write we ignore */
@@ -794,6 +860,20 @@ export function addMany(inputs: readonly NewEntry[]): HistoryEntry[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * The server's log lost everything after `lostAbove` and has been rebuilt
+ * since: a new log altogether (0), or the same one come back from disk behind
+ * what it had answered. Sent with a full pull.
+ */
+export type ServerReset = {
+  lostAbove: number
+  /** Each removal's rev, from a server that gives them. */
+  removedRev?: Readonly<Record<string, number>>
+}
+
+const idOf = (raw: unknown): string =>
+  typeof (raw as { id?: unknown })?.id === 'string' ? (raw as { id: string }).id : ''
+
+/**
  * Merge what the server sent. The server wins by id, with two exceptions that
  * both mean this browser holds something the server has not yet taken: a
  * record changed here or never stamped, and a record removed here. Those wait
@@ -803,25 +883,53 @@ export function addMany(inputs: readonly NewEntry[]): HistoryEntry[] {
  * it has never seen cannot have been removed there, and stays to be pushed.
  *
  * `cursor` is the log position the answer brings these entries to.
+ *
+ * With `reset`, the answer is the whole of a log that lost its tail. A record
+ * here stamped in the lost part is this browser's copy of something the
+ * server no longer has, unless the server has written or removed it again
+ * since, which is newer. Such a record goes back to unstamped, so it is sent
+ * again like any record the server has never seen; nothing else would ever
+ * send it, and it would stay in this browser alone. A rev in the lost part
+ * also no longer names one version, so it settles nothing by matching.
  */
 export function mergeFromServer(
   records: readonly unknown[],
   removed: readonly string[],
   serverNextNo: number,
-  cursor?: { rev: number; epoch: string | null },
+  cursor?: { rev: number; epoch: string | null; boot?: string | null },
+  reset?: ServerReset,
 ): number {
   const map = new Map(entries.map((e) => [e.id, e]))
   let n = 0
   let changed = 0
+  if (reset) {
+    const lost = reset.lostAbove
+    const heldAt = new Map<string, number>()
+    for (const raw of records) if (sane(raw) && idOf(raw)) heldAt.set(idOf(raw), numOrNull((raw as { rev?: unknown }).rev) ?? 0)
+    const removedAt = new Map<string, number>()
+    for (const id of removed) removedAt.set(id, numOrNull(reset.removedRev?.[id]) ?? Infinity)
+    for (const e of entries) {
+      if (e.rev === undefined || e.rev <= lost) continue
+      if ((heldAt.get(e.id) ?? -1) > lost || (removedAt.get(e.id) ?? -1) > lost) continue
+      map.set(e.id, { ...e, rev: undefined, pending: undefined })
+      unwritten.add(e.id)
+      changed++
+    }
+  }
   for (const raw of records) {
     if (!sane(raw)) continue
     n++
-    const id = typeof (raw as { id?: unknown }).id === 'string' ? (raw as { id: string }).id : ''
+    const id = idOf(raw)
     const local = id ? map.get(id) : undefined
     if (local) {
       // Unchanged since this browser last saw it, which is most of a full
       // pull: settled before paying for `normalise`.
-      if (local.rev !== undefined && local.rev === numOrNull((raw as { rev?: unknown }).rev)) continue
+      if (
+        local.rev !== undefined &&
+        local.rev === numOrNull((raw as { rev?: unknown }).rev) &&
+        (!reset || local.rev <= reset.lostAbove)
+      )
+        continue
       if (unpushed(local)) continue
     } else if (goneIds.has(id)) continue
     const e = normalise(raw, n)
@@ -840,10 +948,13 @@ export function mergeFromServer(
     }
   }
   nextNo = Math.max(nextNo, serverNextNo)
-  const moved = cursor !== undefined && (cursor.rev !== syncRev || cursor.epoch !== syncEpoch)
+  const boot = cursor?.boot ?? null
+  const moved =
+    cursor !== undefined && (cursor.rev !== syncRev || cursor.epoch !== syncEpoch || boot !== syncBoot)
   if (cursor) {
     syncRev = cursor.rev
     syncEpoch = cursor.epoch
+    syncBoot = boot
     serverBacked = true
   }
   if (!changed) {
@@ -918,7 +1029,13 @@ export function gone(): string[] {
 /** The server has these removals. */
 export function acknowledgeRemoved(ids: readonly string[]): void {
   let changed = false
-  for (const id of ids) changed = goneIds.delete(id) || changed
+  for (const id of ids) {
+    if (!goneIds.delete(id)) continue
+    // Settled here; another tab's older write still listing it must not
+    // bring the removal back to be sent again, perhaps after an undo.
+    unwritten.add(id)
+    changed = true
+  }
   if (changed) save()
 }
 
@@ -946,8 +1063,20 @@ export function forget(ids: readonly string[]): void {
 }
 
 /** Where this browser's copy stands in the server's log. */
-export function syncCursor(): { rev: number; epoch: string | null } {
-  return { rev: syncRev, epoch: syncEpoch }
+export function syncCursor(): SyncCursor {
+  return { rev: syncRev, epoch: syncEpoch, boot: syncBoot }
+}
+
+/**
+ * The highest server stamp this browser holds, on its cursor or on any record.
+ * A push stamps records without moving the cursor, so the cursor alone can be
+ * behind what this browser has from the server.
+ */
+export function highestRev(): number {
+  let top = syncRev
+  for (const e of entries) if (e.rev !== undefined && e.rev > top) top = e.rev
+  for (const e of outbox.values()) if (e.rev !== undefined && e.rev > top) top = e.rev
+  return top
 }
 
 /** Say whether a server holds the archive behind this browser. The sync is the one caller. */
@@ -1462,6 +1591,7 @@ export const history = {
   pendingCount,
   forget,
   syncCursor,
+  highestRev,
   setServerBacked,
   deleteFile,
   deleteFiles,

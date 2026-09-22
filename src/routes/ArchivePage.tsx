@@ -562,20 +562,41 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     })
   }, [])
 
-  const runRecover = useCallback(async () => {
+  const runRecover = useCallback(async function runRecover(includeRemoved = false) {
     setRecovering(true)
     try {
-      const { filed, fromHistory } = await recoverUnfiled()
+      const { filed, fromHistory, removed } = await recoverUnfiled({ includeRemoved })
+      // Files whose record was removed on purpose are left out; say so, and
+      // let the reader bring them back if that is what they came for.
+      const text = filed
+        ? `${filed} ${filed === 1 ? 'file' : 'files'} in the outputs folder had no record. ${
+            fromHistory
+              ? `${fromHistory} came back with ${fromHistory === 1 ? 'its' : 'their'} settings from ComfyUI's history; the rest are filed by name and date.`
+              : 'ComfyUI no longer remembers how they were made, so they are filed by name and date.'
+          }${
+            removed
+              ? ` ${removed === 1 ? 'One more was' : `${removed} more were`} left out because ${
+                  removed === 1 ? 'its record was' : 'their records were'
+                } removed from the archive.`
+              : ''
+          }`
+        : removed
+          ? `Every file in the outputs folder has a record, apart from ${
+              removed === 1 ? 'one whose record was' : `${removed} whose records were`
+            } removed from the archive. ${removed === 1 ? 'It was' : 'Those were'} left out.`
+          : 'Every file in the outputs folder already has a record.'
       setBanner({
         variant: filed ? 'success' : 'info',
         title: filed ? 'Filed' : 'Nothing to file',
-        text: filed
-          ? `${filed} ${filed === 1 ? 'file' : 'files'} in the outputs folder had no record. ${
-              fromHistory
-                ? `${fromHistory} came back with ${fromHistory === 1 ? 'its' : 'their'} settings from ComfyUI's history; the rest are filed by name and date.`
-                : 'ComfyUI no longer remembers how they were made, so they are filed by name and date.'
-            }`
-          : 'Every file in the outputs folder already has a record.',
+        text,
+        actions: removed
+          ? [
+              {
+                label: removed === 1 ? 'File that one as well' : `File those ${removed} as well`,
+                run: () => void runRecover(true),
+              },
+            ]
+          : undefined,
       })
     } catch (err) {
       setBanner({

@@ -18,7 +18,21 @@
  * The log carries an `epoch`, made once when the archive is. A client keeps
  * the rev it has read up to, and a rev only means something within one log:
  * when the epoch it remembers is not this one, the archive was started again
- * and the client reads the whole of it rather than the tail.
+ * and the client reads the whole of it rather than the tail, and sends back
+ * what it holds that the new log does not.
+ *
+ * Within one log a restart can still lose the last writes: a change is
+ * answered before the debounced save puts it on disk, and a process killed in
+ * between comes back behind what it told its clients. So every answer also
+ * carries `boot`, made each time this file is loaded, and `base`, the rev this
+ * process read from disk. A client that holds revs above `base` from an
+ * earlier boot knows the log above `base` was lost and rebuilt, and resends
+ * its own copies of what went missing.
+ *
+ * A removed record's files are remembered as `dismissed`, with the time. The
+ * files stay on disk, and without this the recovery pass would find them
+ * unnamed and file them again on the next page load. A file written at that
+ * path after the removal is a different file and is not dismissed.
  *
  * Edition numbers are the server's. A client may propose one; if it collides
  * with a number another device already used, the server hands back the number
@@ -26,11 +40,11 @@
  *
  * Local-only, same posture as the other servers: writes pass guardMutation,
  * the body is capped, and nothing here touches a media file. GET /api/outputs
- * lists them, marking the ones a record already names, so the client can find
- * files no record describes.
+ * lists them, marking the ones a record already names and the ones whose
+ * record was removed, so the client can find files no record describes.
  */
 import { randomUUID } from 'node:crypto'
-import { promises as fs } from 'node:fs'
+import { mkdirSync, promises as fs, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { guardMutation, readBody, reqUrl, safely, send } from './guard.mjs'
 
@@ -50,8 +64,19 @@ const OUTPUTS_CACHE_MS = 4000
 
 const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback)
 
+/** This load of the file. A client compares it with the one its revs came from. */
+const BOOT = randomUUID()
+
 function fresh() {
-  return { v: 3, epoch: randomUUID(), rev: 0, nextNo: 1, records: new Map(), tombstones: new Map() }
+  return { v: 3, epoch: randomUUID(), rev: 0, base: 0, nextNo: 1, records: new Map(), tombstones: new Map(), dismissed: new Map() }
+}
+
+/** `{rel: removedAt}` from the file, keeping only well-formed pairs. */
+function readDismissed(raw) {
+  const out = new Map()
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [rel, at] of Object.entries(raw)) if (typeof at === 'number' && Number.isFinite(at)) out.set(rel, at)
+  return out
 }
 
 let store = null
@@ -71,13 +96,16 @@ async function load() {
         let nextNo = num(doc.nextNo, 1)
         for (const r of records.values()) nextNo = Math.max(nextNo, num(r?.no, 0) + 1)
         const epoch = typeof doc.epoch === 'string' && doc.epoch ? doc.epoch : null
+        const rev = num(doc.rev, 0)
         store = {
           v: 3,
           epoch: epoch ?? randomUUID(),
-          rev: num(doc.rev, 0),
+          rev,
+          base: rev,
           nextNo,
           records,
           tombstones: new Map(Object.entries(doc.tombstones ?? {})),
+          dismissed: readDismissed(doc.dismissed),
         }
         // An archive from before the epoch gets one now and keeps it. Left
         // unwritten, every restart would make a new one and send every client
@@ -100,6 +128,13 @@ async function load() {
 
 let saveTimer = null
 let writing = Promise.resolve()
+/**
+ * Changes made, and how many of them a finished write holds. A change is
+ * answered before it is on disk, so the two differ until a write that
+ * serialised it has been renamed into place, and only then is it safe to exit.
+ */
+let changes = 0
+let persisted = 0
 
 function serialise(s) {
   const cutoff = Date.now() - TOMBSTONE_MS
@@ -111,18 +146,21 @@ function serialise(s) {
     nextNo: s.nextNo,
     records: Object.fromEntries(s.records),
     tombstones: Object.fromEntries(s.tombstones),
+    dismissed: Object.fromEntries(s.dismissed),
   })
 }
 
 /** Atomic: write beside, then rename over. A crash mid-write leaves the old file whole. */
 function writeNow() {
   saveTimer = null
+  const upTo = changes
   const body = serialise(store)
   writing = writing.then(async () => {
     await fs.mkdir(path.dirname(ARCHIVE), { recursive: true })
     const tmp = `${ARCHIVE}.tmp`
     await fs.writeFile(tmp, body, 'utf8')
     await fs.rename(tmp, ARCHIVE)
+    persisted = Math.max(persisted, upTo)
   }).catch(err => {
     console.warn(`[switchgen-archive] could not write ${ARCHIVE}: ${err?.message ?? err}`)
   })
@@ -130,13 +168,56 @@ function writeNow() {
 }
 
 function save() {
+  changes++
   if (saveTimer) clearTimeout(saveTimer)
   saveTimer = setTimeout(writeNow, SAVE_DEBOUNCE_MS)
 }
 
-for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.once(sig, () => { if (saveTimer) { clearTimeout(saveTimer); writeNow() } })
+/**
+ * Write whatever is not yet on disk, synchronously, as the process ends.
+ *
+ * An asynchronous write started here never lands: Vite answers SIGTERM by
+ * closing the server and calling process.exit(), and the file system work
+ * still queued is dropped with the process. It writes through a file of its
+ * own beside the archive, so a write already under way cannot interleave
+ * with this one.
+ */
+function flushSync() {
+  if (!store || persisted >= changes) return
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+  try {
+    mkdirSync(path.dirname(ARCHIVE), { recursive: true })
+    const tmp = `${ARCHIVE}.exit.tmp`
+    writeFileSync(tmp, serialise(store), 'utf8')
+    renameSync(tmp, ARCHIVE)
+    persisted = changes
+  } catch (err) {
+    console.warn(`[switchgen-archive] could not write ${ARCHIVE} on exit: ${err?.message ?? err}`)
+  }
 }
+
+// Vite loads this file afresh each time its config reloads, so the process
+// hooks are added once and call every load's flush, oldest first.
+//
+// SIGTERM, which `switchgen stop` sends, is Vite's: it closes the server and
+// calls process.exit(), and the exit hook writes. Nothing ends the process on
+// SIGINT but Node's default, which skips exit hooks, and any listener takes
+// that default away; the signal-exit handler already in a preview process
+// stands down whenever another listener is present. So the SIGINT listener
+// here writes and then ends the process itself, with the code the default
+// gives, rather than leaving it running.
+const FLUSHERS = Symbol.for('switchgen.archive.flush')
+const flushers = globalThis[FLUSHERS] ??= (() => {
+  const all = new Set()
+  const flushAll = () => { for (const fn of all) fn() }
+  process.once('exit', flushAll)
+  process.once('SIGINT', () => {
+    flushAll()
+    process.exit(130)
+  })
+  return all
+})()
+flushers.add(flushSync)
 
 // -------------------------------------------------------------- mutation --
 
@@ -211,38 +292,59 @@ function upsert(s, records, { restore = false } = {}) {
     const { rev: _oldRev, pending: _pending, ...rest } = r
     s.records.set(r.id, { ...rest, no, rev })
     if (owners) for (const rel of relsOf(r)) if (!owners.has(rel)) owners.set(rel, r.id)
+    // A record naming a file again (an undo, a restore) takes back its removal.
+    for (const rel of relsOf(r)) s.dismissed.delete(rel)
     s.tombstones.delete(r.id)
     assigned.push({ id: r.id, no, rev })
   }
   return { assigned, refused }
 }
 
+/**
+ * Remove records. Their files stay on disk, and are remembered as dismissed so
+ * the recovery pass does not file them again; unlike the tombstone, that is
+ * kept for as long as the archive is, because the file is.
+ */
 function remove(s, ids) {
   let n = 0
+  const now = Date.now()
   for (const id of ids) {
     if (typeof id !== 'string' || !s.records.has(id)) continue
+    for (const rel of relsOf(s.records.get(id))) s.dismissed.set(rel, now)
     s.records.delete(id)
-    s.tombstones.set(id, { rev: ++s.rev, at: Date.now() })
+    s.tombstones.set(id, { rev: ++s.rev, at: now })
     n++
   }
   return n
 }
 
+/**
+ * What changed after `since`. `removedRev` gives each removal's rev, which a
+ * client rebuilding after a lost tail needs: a removal from before the loss is
+ * older than a copy it holds from after, and one from since is newer.
+ */
 function changesSince(s, since) {
   const full = !(since > 0)
   const records = []
   for (const r of s.records.values()) if (full || num(r.rev, 0) > since) records.push(r)
   const removed = []
-  for (const [id, t] of s.tombstones) if (num(t?.rev, 0) > since) removed.push(id)
-  return { epoch: s.epoch, rev: s.rev, nextNo: s.nextNo, full, records, removed }
+  const removedRev = Object.create(null)
+  for (const [id, t] of s.tombstones) {
+    const rev = num(t?.rev, 0)
+    if (rev > since) { removed.push(id); removedRev[id] = rev }
+  }
+  return { epoch: s.epoch, boot: BOOT, base: s.base, rev: s.rev, nextNo: s.nextNo, full, records, removed, removedRev }
 }
+
+/** What every stream message says: where the log is, which log, and which load of it. */
+const where = (s) => `data: ${JSON.stringify({ rev: s.rev, epoch: s.epoch, boot: BOOT })}\n\n`
 
 // ---------------------------------------------------------------- stream --
 
 const watchers = new Set()
 
-function broadcast(rev) {
-  const line = `data: ${JSON.stringify({ rev })}\n\n`
+function broadcast(s) {
+  const line = where(s)
   for (const res of watchers) {
     try { res.write(line) } catch { watchers.delete(res) }
   }
@@ -326,7 +428,7 @@ export function switchgenArchive() {
           Connection: 'keep-alive',
           'X-Accel-Buffering': 'no',
         })
-        res.write(`data: ${JSON.stringify({ rev: s.rev })}\n\n`)
+        res.write(where(s))
         watchers.add(res)
         const stop = () => { watchers.delete(res); try { res.end() } catch { /* gone */ } }
         res.on('close', stop)
@@ -340,7 +442,7 @@ export function switchgenArchive() {
         if (!b || !Array.isArray(b.records)) return send(res, 400, { error: 'body must be JSON {records: [...]} under 2 MB' })
         const s = await load()
         const { assigned, refused } = upsert(s, b.records, { restore: p === '/api/archive/restore' })
-        if (assigned.length) { save(); broadcast(s.rev) }
+        if (assigned.length) { save(); broadcast(s) }
         return send(res, 200, { rev: s.rev, nextNo: s.nextNo, assigned, refused })
       }
 
@@ -350,7 +452,7 @@ export function switchgenArchive() {
         if (!b || !Array.isArray(b.ids)) return send(res, 400, { error: 'body must be JSON {ids: [...]}' })
         const s = await load()
         const removed = remove(s, b.ids)
-        if (removed) { save(); broadcast(s.rev) }
+        if (removed) { save(); broadcast(s) }
         return send(res, 200, { rev: s.rev, removed })
       }
 
@@ -363,7 +465,14 @@ export function switchgenArchive() {
         const named = new Set()
         for (const r of s.records.values()) for (const rel of relsOf(r)) named.add(rel)
         const listed = since ? files.filter(f => f.mtime > since) : files
-        return send(res, 200, { root: OUTPUTS, files: listed.map(f => (named.has(f.rel) ? { ...f, filed: true } : f)) })
+        const mark = (f) => {
+          if (named.has(f.rel)) return { ...f, filed: true }
+          // Written no later than its record was removed: the same file, which
+          // the reader took out of the archive and kept on disk.
+          const removedAt = s.dismissed.get(f.rel)
+          return removedAt !== undefined && f.mtime <= removedAt ? { ...f, dismissed: true } : f
+        }
+        return send(res, 200, { root: OUTPUTS, files: listed.map(mark) })
       }
 
       const method = METHODS.get(p)

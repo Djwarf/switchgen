@@ -19,11 +19,17 @@
  *      and this tab pulls what it has not seen. A tab that was hidden pulls
  *      when it is shown again, because it gives up its stream while hidden.
  *
+ * A server started again can come back behind what it answered: a new log
+ * when its file was lost, or the same log missing the writes it had not yet
+ * saved. Each answer says which log and which load of it, and a pull that
+ * finds this browser holding stamps from a part of the log that is gone reads
+ * the whole archive and sends back what the server no longer has.
+ *
  * Without the server (a static host), the mode is `local` and nothing here
  * runs. The archive works exactly as it did before, per browser.
  */
 import { useSyncExternalStore } from 'react'
-import { history, onCommit, type HistoryEntry } from './history'
+import { history, onCommit, type HistoryEntry, type SyncCursor } from './history'
 import { recoverUnfiled } from './recover'
 
 export type ArchiveSyncMode = 'starting' | 'server' | 'local' | 'offline'
@@ -93,8 +99,13 @@ type Pull = {
   full: boolean
   records: unknown[]
   removed: string[]
-  /** Absent from a server that predates it. */
+  /** The log. Absent from a server that predates it. */
   epoch?: string
+  /** This load of the log, and the rev it read from disk. Absent from a server that predates them. */
+  boot?: string
+  base?: number
+  /** Each removal's rev. Absent from a server that predates it. */
+  removedRev?: Record<string, number>
 }
 type Pushed = {
   rev: number
@@ -113,19 +124,48 @@ let pulling: Promise<void> | null = null
 let connected = false
 const BATCH = 200
 
+/**
+ * Where the server's log lost what this browser read from it: every rev above
+ * the number returned is gone or means something else now. Null when nothing
+ * was lost.
+ *
+ * A revision only means something within one log, so a different epoch loses
+ * all of it. Within one log, a server loaded again kept only what it had
+ * written to disk (`base`); if this browser holds a stamp above that from an
+ * earlier load, the writes above it were lost and their revs handed out again,
+ * and a tail read from the cursor would skip records this browser never saw.
+ * A server too old to say which load it is can only be caught behind.
+ */
+function lostAbove(cur: SyncCursor, data: Pull): number | null {
+  const epoch = data.epoch ?? null
+  if (cur.epoch !== null && epoch !== null && epoch !== cur.epoch) return 0
+  if (data.boot != null && data.base != null && data.boot !== cur.boot && history.highestRev() > data.base) {
+    return data.base
+  }
+  return data.rev < cur.rev ? data.rev : null
+}
+
 async function pull(): Promise<void> {
   if (pulling) return pulling
   pulling = (async () => {
-    const { rev: since, epoch } = history.syncCursor()
-    let data = await api<Pull>(`/api/archive?since=${since}`)
-    // A revision only means something within one log. A different epoch, or a
-    // log that is now behind where this browser had read to, is an archive
-    // started again, and its tail would skip records this browser never saw.
-    if (since > 0 && ((data.epoch != null && data.epoch !== epoch) || data.rev < since)) {
-      data = await api<Pull>('/api/archive?since=0')
-    }
-    history.mergeFromServer(data.records, data.removed, data.nextNo, { rev: data.rev, epoch: data.epoch ?? null })
+    const cur = history.syncCursor()
+    let data = await api<Pull>(`/api/archive?since=${cur.rev}`)
+    const lost = lostAbove(cur, data)
+    // A cursor from before the log had an epoch cannot be placed in it, so
+    // the archive is read whole; nothing is known to be lost, so none is sent.
+    const unplaced = cur.epoch === null && data.epoch != null
+    if (cur.rev > 0 && (lost !== null || unplaced)) data = await api<Pull>('/api/archive?since=0')
+    history.mergeFromServer(
+      data.records,
+      data.removed,
+      data.nextNo,
+      { rev: data.rev, epoch: data.epoch ?? null, boot: data.boot ?? null },
+      lost === null ? undefined : { lostAbove: lost, removedRev: data.removedRev },
+    )
     set({ rev: data.rev, mode: 'server', error: null, lastSyncAt: Date.now(), pending: history.pendingCount() })
+    // What the server lost is marked to send; a pull from the stream is not
+    // followed by a push of its own.
+    if (lost !== null) scheduleFlush()
   })().finally(() => { pulling = null })
   return pulling
 }
@@ -211,10 +251,19 @@ function openStream(): void {
   } catch {
     return
   }
+  // Any difference from where this browser stands is worth a pull, not only a
+  // log that moved ahead: a server started again reconnects this stream at a
+  // lower rev, or as another log or load, and the pull is what notices.
   stream.onmessage = (ev) => {
-    let rev = 0
-    try { rev = Number((JSON.parse(ev.data) as { rev?: number }).rev) || 0 } catch { return }
-    if (rev > history.syncCursor().rev) void pull().catch(() => {})
+    let msg: { rev?: unknown; epoch?: unknown; boot?: unknown }
+    try { msg = JSON.parse(ev.data) as typeof msg } catch { return }
+    const cur = history.syncCursor()
+    const rev = Number(msg.rev) || 0
+    const epoch = typeof msg.epoch === 'string' ? msg.epoch : null
+    const boot = typeof msg.boot === 'string' ? msg.boot : null
+    if (rev !== cur.rev || (epoch !== null && epoch !== cur.epoch) || (boot !== null && boot !== cur.boot)) {
+      void pull().catch(() => {})
+    }
   }
 }
 

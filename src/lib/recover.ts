@@ -9,6 +9,11 @@
  * one that matters: this browser keeps only a window of the archive, and a
  * file whose record fell out of that window is filed already, not unfiled.
  *
+ * A file whose record the reader removed is not unfiled: removing a record
+ * keeps its file on disk by design, and filing it again on the next page load
+ * would undo the removal. The server marks those, and only a reader asking for
+ * them by name brings them back.
+ *
  * For each file that really has no record, ComfyUI's own /history may still
  * hold the exact graph that produced it, and a family's bindings say which
  * node input held the prompt, the seed, the steps, so the settings come back
@@ -29,10 +34,15 @@ export type UnfiledFile = {
   kind: 'image' | 'video'
   /** A record on the server names this file. Absent from a server that predates the mark. */
   filed?: boolean
+  /** The record that named this file was removed and the file kept. Absent from a server that predates the mark. */
+  dismissed?: boolean
 }
 
-/** Every media file under the outputs root that no record stands for. */
-async function findUnfiled(): Promise<UnfiledFile[]> {
+/**
+ * Every media file under the outputs root that no record stands for, and,
+ * apart, those whose record was removed.
+ */
+async function findUnfiled(): Promise<{ unfiled: UnfiledFile[]; removed: UnfiledFile[] }> {
   const res = await fetch('/api/outputs', { headers: { Accept: 'application/json' } })
   const type = res.headers.get('content-type') ?? ''
   if (!res.ok || !type.includes('json')) throw new Error('the outputs listing is not available here')
@@ -42,7 +52,14 @@ async function findUnfiled(): Promise<UnfiledFile[]> {
     known.add(relPath(e.file))
     for (const f of e.files ?? []) known.add(relPath(f))
   }
-  return (data.files ?? []).filter((f) => !f.filed && !known.has(f.rel))
+  const unfiled: UnfiledFile[] = []
+  const removed: UnfiledFile[] = []
+  for (const f of data.files ?? []) {
+    if (f.filed || known.has(f.rel)) continue
+    if (f.dismissed) removed.push(f)
+    else unfiled.push(f)
+  }
+  return { unfiled, removed }
 }
 
 const str = (v: unknown, fallback = ''): string => (typeof v === 'string' ? v : fallback)
@@ -147,17 +164,33 @@ function minimal(f: UnfiledFile): NewEntry {
   }
 }
 
-let running: Promise<{ filed: number; fromHistory: number }> | null = null
+export type Recovered = {
+  /** Records made. */
+  filed: number
+  /** Of those, how many came with settings from ComfyUI's history. */
+  fromHistory: number
+  /** Files left out because their record was removed from the archive. */
+  removed: number
+}
+
+let running: Promise<Recovered> | null = null
 
 /**
  * File every unfiled output. Safe to call twice; the second call waits for the
- * first. Returns how many records were made and how many came with settings.
+ * first. Files whose record was removed are left out and counted, unless
+ * `includeRemoved` asks for them, which only the reader does.
  */
-export function recoverUnfiled(): Promise<{ filed: number; fromHistory: number }> {
-  if (running) return running
+export function recoverUnfiled(opts: { includeRemoved?: boolean } = {}): Promise<Recovered> {
+  if (running) {
+    // A pass already running leaves the removed files alone; one asked to
+    // take them goes after it rather than returning its answer.
+    return opts.includeRemoved ? running.catch(() => {}).then(() => recoverUnfiled(opts)) : running
+  }
   running = (async () => {
-    const unfiled = await findUnfiled()
-    if (!unfiled.length) return { filed: 0, fromHistory: 0 }
+    const found = await findUnfiled()
+    const unfiled = opts.includeRemoved ? [...found.unfiled, ...found.removed] : found.unfiled
+    const removed = opts.includeRemoved ? 0 : found.removed.length
+    if (!unfiled.length) return { filed: 0, fromHistory: 0, removed }
     let runs: PastRun[] = []
     try { runs = await pastRuns(1000) } catch { /* ComfyUI is down or has forgotten; file minimally */ }
     const byFile = new Map<string, PastRun>()
@@ -174,7 +207,7 @@ export function recoverUnfiled(): Promise<{ filed: number; fromHistory: number }
         return run ? fromRun(run, f) : minimal(f)
       })
     history.addMany(made)
-    return { filed: unfiled.length, fromHistory }
+    return { filed: unfiled.length, fromHistory, removed }
   })().finally(() => { running = null })
   return running
 }

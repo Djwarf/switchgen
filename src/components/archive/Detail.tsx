@@ -21,6 +21,27 @@ import { archFor } from '../../lib/loras'
 import { familyOwning } from '../../lib/workflows'
 import { duration, editionNo, fullDate, madeFrom } from './query'
 
+/**
+ * Which shape of the style ran, in words. The record keeps the machine name;
+ * a name this build does not know came from a newer one and is shown as it is.
+ */
+function variantLabel(variant: HistoryEntry['variant']): string | null {
+  switch (variant) {
+    case null:
+      return null
+    case 'img2img':
+      return 'Redrawn from a picture'
+    case 'i2v':
+      return 'A clip from a start frame'
+    case 'nolora':
+      return 'Full steps, without the speed-up add-ons'
+    case 'refine':
+      return 'One region of a finished picture, redrawn'
+    default:
+      return String(variant)
+  }
+}
+
 type Props = EntryActions & {
   entry: HistoryEntry
   canDeleteFile: boolean
@@ -296,7 +317,7 @@ export function Detail({
               <Row label="Style" value={entry.familyLabel} />
               <Row label="Model" value={entry.modelLabel} />
               <Row label="Weight file" value={entry.model} wrap />
-              <Row label="Variant" value={entry.variant ?? undefined} />
+              <Row label="Variant" value={variantLabel(entry.variant)} />
               <Row label="Mode" value={entry.mode} />
               <Row
                 label="Size"
