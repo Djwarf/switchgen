@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { switchgenApi } from './server/api.mjs'
+import { switchgenArchive } from './server/archive.mjs'
 import { switchgenDownloads } from './server/downloads.mjs'
 import { switchgenReel } from './server/reel.mjs'
 import { switchgenVision } from './server/vision.mjs'
@@ -42,7 +43,7 @@ const allowedHosts = [
 ]
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), switchgenApi(), switchgenDownloads(), switchgenReel(), switchgenVision()],
+  plugins: [react(), tailwindcss(), switchgenApi(), switchgenArchive(), switchgenDownloads(), switchgenReel(), switchgenVision()],
   server: { host, port: 5273, proxy, allowedHosts },
   preview: { host, port: 5273, proxy, allowedHosts },
 })

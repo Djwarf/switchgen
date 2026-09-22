@@ -13,6 +13,8 @@
  *   3. Reuse lands in the right room. A clip restores into the Video desk and
  *      a picture into Pictures, with every parameter the record carried.
  */
+import { useArchiveSync } from '../lib/archiveSync'
+import { recoverUnfiled } from '../lib/recover'
 import {
   useCallback,
   useEffect,
@@ -195,6 +197,8 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [canDeleteFiles, setCanDeleteFiles] = useState(false)
   const [checking, setChecking] = useState(false)
+  const [recovering, setRecovering] = useState(false)
+  const sync = useArchiveSync()
   const [sortKey, setSortKey] = useState<SortKey>('at')
   const [ascending, setAscending] = useState(false)
   const [issue, setIssue] = useState<string | null>(() => loadIssue())
@@ -497,6 +501,32 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     })
   }, [])
 
+  const runRecover = useCallback(async () => {
+    setRecovering(true)
+    try {
+      const { filed, fromHistory } = await recoverUnfiled()
+      setBanner({
+        variant: filed ? 'success' : 'info',
+        title: filed ? 'Filed' : 'Nothing to file',
+        text: filed
+          ? `${filed} ${filed === 1 ? 'file' : 'files'} in the outputs folder had no record. ${
+              fromHistory
+                ? `${fromHistory} came back with ${fromHistory === 1 ? 'its' : 'their'} settings from ComfyUI's history; the rest are filed by name and date.`
+                : 'ComfyUI no longer remembers how they were made, so they are filed by name and date.'
+            }`
+          : 'Every file in the outputs folder already has a record.',
+      })
+    } catch (err) {
+      setBanner({
+        variant: 'error',
+        title: 'We could not read the outputs folder',
+        text: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setRecovering(false)
+    }
+  }, [])
+
   const importFile = useCallback(async (file: File) => {
     try {
       const added = await file.text().then(importJson)
@@ -731,6 +761,9 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           checking={checking}
           persistent={isPersistent()}
           canDeleteFiles={canDeleteFiles}
+          sync={sync}
+          onRecover={() => void runRecover()}
+          recovering={recovering}
         />
 
         <main className="min-w-0 flex-1">

@@ -256,6 +256,30 @@ export function sidecarsOf(def: FamilyDef): { clip: string[]; vae: string } {
   return { clip: [...clip], vae }
 }
 
+/** The family that lists this exact file. Hints are not good enough for a picker. */
+export function familyOwning(model: string): FamilyDef | null {
+  for (const def of FAMILIES) if (def.models.includes(model)) return def
+  return null
+}
+
+/**
+ * The family whose graph a submitted graph came from, read off the weight it
+ * loads. For a record rebuilt from ComfyUI's history, where the graph is all
+ * that survives.
+ */
+export function familyForGraph(graph: Record<string, { class_type: string; inputs: Record<string, unknown> }>): FamilyDef | null {
+  const loaded = new Set<string>()
+  for (const node of Object.values(graph)) {
+    for (const k of ['ckpt_name', 'unet_name'] as const) {
+      const v = node.inputs[k]
+      if (typeof v === 'string') loaded.add(v)
+    }
+  }
+  if (!loaded.size) return null
+  for (const def of FAMILIES) if (modelsOf(def).some((m) => loaded.has(m))) return def
+  return null
+}
+
 /** Every model file referenced by any loader in a family's graph. */
 export function modelsOf(def: FamilyDef): string[] {
   const out = new Set<string>(def.models)

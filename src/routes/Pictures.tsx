@@ -65,6 +65,7 @@ import {
   instantiate,
   type FamilyDef,
   type Params,
+  familyOwning
 } from '../lib/workflows'
 import {
   modelFiles,
@@ -366,12 +367,6 @@ async function readCatalogue(): Promise<Catalogue> {
     installed: [...installed],
     sizes,
   }
-}
-
-/** The family that lists this exact file. Hints are not good enough for a picker. */
-function familyOwning(model: string): FamilyDef | null {
-  for (const def of Object.values(BY_ID)) if (def.models.includes(model)) return def
-  return null
 }
 
 let cataloguePromise: Promise<Catalogue> | null = null

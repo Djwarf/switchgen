@@ -27,6 +27,7 @@ import { useEffect, useState } from 'react'
 import { Shell, go, jobs, parseRoute, useRoute } from './components/shell'
 import { Player } from './components/player/Player'
 import { posterUrl } from './components/archive/Poster'
+import { startArchiveSync } from './lib/archiveSync'
 import { gb, probeHardware, type Hardware } from './lib/hardware'
 import ArchivePage from './routes/ArchivePage'
 import Pictures, { pressSnapshot, subscribePress } from './routes/Pictures'
@@ -38,6 +39,12 @@ export default function App() {
   const gpu = useGpuLine()
 
   useJobBridges()
+
+  // One archive for every device. Started here, the one component mounted
+  // for the life of the page, so a route change never restarts it.
+  useEffect(() => {
+    void startArchiveSync()
+  }, [])
 
   return (
     <Shell gpu={gpu}>

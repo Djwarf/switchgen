@@ -128,6 +128,14 @@ export type HistoryEntry = {
   note?: string
   /** Set by the file audit. Never blocks anything. */
   missing?: boolean
+
+  /**
+   * The server's revision stamp. Absent on a record the server has never
+   * seen, which is exactly the set the sync pushes on start.
+   */
+  rev?: number
+  /** Filed from the outputs folder after the fact, not by the desk that made it. */
+  recovered?: boolean
 }
 
 /**
@@ -220,6 +228,8 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
     files: Array.isArray(e.files)
       ? e.files.filter((f: any) => typeof f?.filename === 'string').map((f: any) => fileRef(f))
       : undefined,
+    rev: numOrNull(e.rev) ?? undefined,
+    recovered: e.recovered === true ? true : undefined,
     prompt: str(e.prompt, ''),
     negative: typeof e.negative === 'string' ? e.negative : null,
     familyId: str(e.familyId, ''),
@@ -508,11 +518,45 @@ function announce(): void {
   }
 }
 
-function commit(next: HistoryEntry[]): void {
+/**
+ * What one commit changed, for the sync. `remote` marks a change that came
+ * from the server, which must not be echoed back to it.
+ */
+export type CommitDelta = { upserted: HistoryEntry[]; removed: string[]; remote: boolean }
+
+const commitListeners = new Set<(delta: CommitDelta) => void>()
+
+/** Hear every change as a delta. The sync is the one subscriber. */
+export function onCommit(fn: (delta: CommitDelta) => void): () => void {
+  commitListeners.add(fn)
+  return () => {
+    commitListeners.delete(fn)
+  }
+}
+
+function commit(next: HistoryEntry[], opts: { remote?: boolean; trimmed?: boolean } = {}): void {
+  const prev = entries
   entries = next
   indexCache = new WeakMap()
   save()
   announce()
+  if (!commitListeners.size) return
+  // Records are replaced, never mutated, so identity says what changed.
+  const prevById = new Map(prev.map((e) => [e.id, e]))
+  const nextIds = new Set(next.map((e) => e.id))
+  const upserted = next.filter((e) => prevById.get(e.id) !== e)
+  // A trim to the local cap is this browser running out of room, not the
+  // reader removing anything: it is never reported as a removal.
+  const removed = opts.trimmed ? [] : prev.filter((e) => !nextIds.has(e.id)).map((e) => e.id)
+  if (!upserted.length && !removed.length) return
+  const delta: CommitDelta = { upserted, removed, remote: opts.remote === true }
+  for (const fn of [...commitListeners]) {
+    try {
+      fn(delta)
+    } catch {
+      /* one broken subscriber must not stop the rest */
+    }
+  }
 }
 
 // A second tab writing the archive must not leave this one showing a stale one.
@@ -578,8 +622,63 @@ export function add(input: NewEntry): HistoryEntry {
     at: input.at ?? Date.now(),
   }
   const next = [entry, ...entries]
-  commit(next.length > MAX_ENTRIES ? trim(next) : next)
+  commit(next.length > MAX_ENTRIES ? trim(next) : next, { trimmed: next.length > MAX_ENTRIES })
   return entry
+}
+
+// ---------------------------------------------------------------------------
+// The server's copy
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge what the server sent. The server wins by id. A removal is honoured
+ * only for a record the server had stamped: a local record it has never seen
+ * cannot have been removed there, and stays to be pushed.
+ */
+export function mergeFromServer(records: readonly unknown[], removed: readonly string[], serverNextNo: number): number {
+  const map = new Map(entries.map((e) => [e.id, e]))
+  let n = 0
+  let changed = 0
+  for (const raw of records) {
+    if (!sane(raw)) continue
+    const e = normalise(raw, ++n)
+    const local = map.get(e.id)
+    if (local && local.rev === e.rev && local.rev !== undefined) continue
+    map.set(e.id, e)
+    changed++
+  }
+  for (const id of removed) {
+    const local = map.get(id)
+    if (local && local.rev !== undefined) {
+      map.delete(id)
+      changed++
+    }
+  }
+  nextNo = Math.max(nextNo, serverNextNo)
+  if (!changed) return 0
+  commit([...map.values()].sort((a, b) => b.at - a.at), { remote: true })
+  return changed
+}
+
+/** Stamp records the server just accepted with its revision and, when it reassigned one, its edition number. */
+export function applyServerMeta(assigned: readonly { id: string; no: number; rev: number }[]): void {
+  if (!assigned.length) return
+  const meta = new Map(assigned.map((a) => [a.id, a]))
+  let changed = false
+  const next = entries.map((e) => {
+    const m = meta.get(e.id)
+    if (!m || (e.rev === m.rev && e.no === m.no)) return e
+    changed = true
+    return { ...e, rev: m.rev, no: m.no }
+  })
+  if (!changed) return
+  nextNo = Math.max(nextNo, next.reduce((mx, e) => Math.max(mx, e.no), 0) + 1)
+  commit(next, { remote: true })
+}
+
+/** Records the server has never stamped. */
+export function unsynced(): HistoryEntry[] {
+  return entries.filter((e) => e.rev === undefined)
 }
 
 /** Drop the oldest unstarred records down to the cap. Starred are exempt. */
@@ -944,6 +1043,9 @@ export const history = {
   removeMany,
   restore,
   clear,
+  mergeFromServer,
+  applyServerMeta,
+  unsynced,
   deleteFile,
   deleteFiles,
   checkMissing,

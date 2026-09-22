@@ -237,6 +237,14 @@ export function Detail({
               </div>
             )}
 
+            {entry.recovered ? (
+              <p className="mt-4 text-caption italic text-grey-700">
+                {entry.prompt
+                  ? "Settings read back from ComfyUI's history, not filed by the desk that made it."
+                  : 'Filed from the outputs folder by name and date. ComfyUI no longer remembers how it was made.'}
+              </p>
+            ) : null}
+
             <blockquote className="mt-6 border-l-4 border-burgundy-900 pl-5 font-serif text-[1.5rem] leading-snug break-words italic">
               {entry.prompt || 'No prompt was recorded for this one.'}
             </blockquote>

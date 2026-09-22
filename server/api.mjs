@@ -151,6 +151,9 @@ async function capabilities() {
     models: true,
     hardware: true,
     hardwareStream: true,
+    // Served by switchgenArchive(), registered beside this plugin. It spawns
+    // nothing, so mounted and working are the same thing for it.
+    archive: true,
     gpu: t.gpu,
     tools: { aria2c: t.aria2c, ffmpeg: t.ffmpeg, ffprobe: t.ffprobe },
   }

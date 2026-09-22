@@ -29,6 +29,8 @@ export type ServerCapabilities = {
   hardwareStream: boolean
   /** nvidia-smi answers. */
   gpu: boolean
+  /** The shared archive is served here. */
+  archive: boolean
   tools: ServerTools
   roots: { models?: string; outputs?: string }
   /** Why everything is false, when it is. Null when the server answered. */
@@ -44,6 +46,7 @@ const NONE: ServerCapabilities = {
   hardware: false,
   hardwareStream: false,
   gpu: false,
+  archive: false,
   tools: { aria2c: null, ffmpeg: null, ffprobe: null },
   roots: {},
   reason: 'the local server did not answer, so this page can only talk to ComfyUI',

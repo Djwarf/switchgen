@@ -9,6 +9,7 @@
  * Counts are taken over the whole archive, not the filtered set, so you can
  * see what dropping a filter would buy you before you drop it.
  */
+import type { ArchiveSyncState } from '../../lib/archiveSync'
 import { useMemo, useRef } from 'react'
 import type { HistoryEntry } from '../../lib/history'
 import { hasToken } from './query'
@@ -25,6 +26,21 @@ type Props = {
   persistent: boolean
   /** False when the app cannot reach the local server that deletes files. */
   canDeleteFiles: boolean
+  /** Where the archive lives right now, from the sync. Null before it has said. */
+  sync: ArchiveSyncState | null
+  /** File the outputs no record describes. */
+  onRecover: () => void
+  recovering: boolean
+}
+
+function syncLine(sync: ArchiveSyncState | null): string {
+  if (!sync || sync.mode === 'starting') return 'Checking the server.'
+  const waiting = sync.pending
+    ? ` ${sync.pending} ${sync.pending === 1 ? 'change is' : 'changes are'} waiting for the server.`
+    : ''
+  if (sync.mode === 'server') return `Shared with every device on this server.${waiting || ' Up to date.'}`
+  if (sync.mode === 'offline') return `This browser only for now: the server did not answer.${waiting}`
+  return 'This browser only. There is no local server to share it through.'
 }
 
 type Row = { label: string; token: string; count: number }
@@ -128,6 +144,9 @@ export function FacetRail({
   checking,
   persistent,
   canDeleteFiles,
+  sync,
+  onRecover,
+  recovering,
 }: Props) {
   const file = useRef<HTMLInputElement | null>(null)
   const { counts, families } = useMemo(() => tally(entries), [entries])
@@ -208,6 +227,7 @@ export function FacetRail({
         <h3 className="mb-2 text-[0.625rem] font-semibold tracking-[0.18em] text-grey-700 uppercase">
           The archive
         </h3>
+        <p className="mb-2 text-caption italic text-grey-700">{syncLine(sync)}</p>
         <ul className="space-y-1 text-small">
           <li>
             <button
@@ -218,6 +238,18 @@ export function FacetRail({
               Save a copy
             </button>
           </li>
+          {sync?.mode === 'server' ? (
+            <li>
+              <button
+                type="button"
+                onClick={onRecover}
+                disabled={recovering}
+                className="text-burgundy-900 underline underline-offset-2 hover:no-underline disabled:text-grey-500 disabled:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+              >
+                {recovering ? 'Looking through the outputs folder' : 'Look for files with no record'}
+              </button>
+            </li>
+          ) : null}
           <li>
             <button
               type="button"
