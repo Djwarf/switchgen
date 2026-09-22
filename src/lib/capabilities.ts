@@ -60,7 +60,7 @@ let cache: Promise<ServerCapabilities> | null = null
  * answer, short enough that a server which was restarting is found once it
  * is back.
  */
-const RETRY_FAILED_MS = 10_000
+export const RETRY_FAILED_MS = 10_000
 
 /**
  * An answer is cached for the page's lifetime: it changes when a binary is
@@ -97,17 +97,46 @@ export function serverCapabilities(): Promise<ServerCapabilities> {
   return probe
 }
 
-/** The same answer for a component. Null until it arrives. */
+/**
+ * Ask, hand the answer on, and while the answer is a failure ask again once
+ * it has stopped standing. The short hold on a failure only helps whoever
+ * asks next; a component that is already on screen with one would keep it,
+ * and go on saying the server cannot do what it never got to check, until it
+ * was mounted again. The retry waits the same span as the hold, so it lands
+ * after the failure has been let go and makes a real request, and every
+ * component retrying in the same window shares that one request.
+ *
+ * `ask` must not reject; both probes turn a failure into an answer. Returns
+ * the function that stops asking.
+ */
+export function askUntilAnswered<T>(
+  ask: () => Promise<T>,
+  failed: (answer: T) => boolean,
+  onAnswer: (answer: T) => void,
+): () => void {
+  let live = true
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const once = () => {
+    void ask().then(answer => {
+      if (!live) return
+      onAnswer(answer)
+      if (failed(answer)) timer = setTimeout(once, RETRY_FAILED_MS)
+    })
+  }
+  once()
+  return () => {
+    live = false
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * The same answer for a component. Null until it arrives. A failure is
+ * replaced by the real answer once the server is back, so a panel opened
+ * during a restart offers what the server can do without being reopened.
+ */
 export function useServerCapabilities(): ServerCapabilities | null {
   const [caps, setCaps] = useState<ServerCapabilities | null>(null)
-  useEffect(() => {
-    let live = true
-    void serverCapabilities().then(c => {
-      if (live) setCaps(c)
-    })
-    return () => {
-      live = false
-    }
-  }, [])
+  useEffect(() => askUntilAnswered(serverCapabilities, c => c.reason !== null, setCaps), [])
   return caps
 }

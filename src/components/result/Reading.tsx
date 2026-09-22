@@ -19,9 +19,9 @@ import type { LoraArch } from '../../lib/loras'
 import type { IndexedBase } from '../../lib/loraIndex'
 import { size } from '../../lib/loras'
 import {
-  capabilities,
   inspectImage,
   refreshCapabilities,
+  watchCapabilities,
   type ImageFacts,
   type ImageRating,
   type ImageSource,
@@ -96,15 +96,9 @@ export function Reading(props: ReadingProps) {
   const [installing, setInstalling] = useState<FetchProgress | null>(null)
   const [installError, setInstallError] = useState<string | null>(null)
 
-  useEffect(() => {
-    let live = true
-    void capabilities().then((c) => {
-      if (live) setCaps(c)
-    })
-    return () => {
-      live = false
-    }
-  }, [])
+  // Asked again while the server has not answered, so a reading that mounted
+  // during a restart offers itself, or the tagger fetch, once the server is back.
+  useEffect(() => watchCapabilities(setCaps), [])
 
   if (!source || !caps) return null
 

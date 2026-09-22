@@ -99,6 +99,7 @@
 
 import type { IndexedBase, LoraIndexEntry } from './loraIndex'
 import { LORA_INDEX, } from './loraIndex'
+import { askUntilAnswered, RETRY_FAILED_MS } from './capabilities'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -222,7 +223,8 @@ export type VisionReport = {
 }
 
 export type VisionCapabilities = {
-  server: string
+  /** Null when the vision endpoint did not answer: the rest is then a stand-in, not a check. */
+  server: string | null
   python: string | null
   /** True only when an interpreter, the model and the tag list are all present. */
   tagger: boolean
@@ -566,38 +568,58 @@ async function post(path: string, source: ImageSource, extra?: Record<string, un
   return data
 }
 
+/** What a probe that got no answer stands in for. Nothing in it was checked. */
+const UNANSWERED: VisionCapabilities = {
+  server: null,
+  python: null,
+  tagger: false,
+  taggerModel: null,
+  taggerBytes: null,
+  taggerVocabulary: 'danbooru-v3',
+  detect: false,
+  detectors: [],
+  device: 'cpu',
+  roots: {},
+  install: null,
+  reason: 'the vision endpoint did not answer, so no picture can be read until it does',
+}
+
 let capsCache: Promise<VisionCapabilities> | null = null
 
 /**
  * What this machine can actually see, straight from the server's own checks.
  *
- * Cached, because it is read on every render of anything that offers the
- * feature and the answer only changes when a file appears on disk. Call
- * `refreshCapabilities` after a download.
+ * An answer is cached, because it is read on every render of anything that
+ * offers the feature and it only changes when a file appears on disk; call
+ * `refreshCapabilities` after a download. A failure is not an answer, so it
+ * is held only as long as the server probe in capabilities.ts holds one: the
+ * server may have been restarting, and a failure kept for good would hide
+ * reading, the tagger fetch and archive tagging until the page was reloaded.
  */
 export function capabilities(): Promise<VisionCapabilities> {
-  if (!capsCache) {
-    capsCache = fetch('/api/vision/capabilities')
-      .then(async r => {
-        if (!r.ok) throw new Error(`vision capabilities: ${r.status}`)
-        return await r.json() as VisionCapabilities
-      })
-      .catch(() => ({
-        server: 'switchgen-vision',
-        python: null,
-        tagger: false,
-        taggerModel: null,
-        taggerBytes: null,
-        taggerVocabulary: 'danbooru-v3',
-        detect: false,
-        detectors: [],
-        device: 'cpu',
-        roots: {},
-        install: null,
-        reason: 'the vision endpoint did not answer, so this build has no image understanding',
-      } satisfies VisionCapabilities))
-  }
-  return capsCache
+  if (capsCache) return capsCache
+  const probe: Promise<VisionCapabilities> = fetch('/api/vision/capabilities')
+    .then(async r => {
+      if (!r.ok) throw new Error(`vision capabilities: ${r.status}`)
+      return await r.json() as VisionCapabilities
+    })
+    .catch(() => {
+      setTimeout(() => {
+        if (capsCache === probe) capsCache = null
+      }, RETRY_FAILED_MS)
+      return UNANSWERED
+    })
+  capsCache = probe
+  return probe
+}
+
+/**
+ * Hand each answer to `onAnswer`, asking again while the server has not
+ * answered, so a reading on screen since a restart finds the server once it
+ * is back. Returns the function that stops asking.
+ */
+export function watchCapabilities(onAnswer: (caps: VisionCapabilities) => void): () => void {
+  return askUntilAnswered(capabilities, c => c.server === null, onAnswer)
 }
 
 export function refreshCapabilities(): Promise<VisionCapabilities> {

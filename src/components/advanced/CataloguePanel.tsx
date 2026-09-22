@@ -161,7 +161,9 @@ export function CataloguePanel({
     await Promise.all([
       fetchCatalog(true).then(
         (c) => {
-          if (mounted.current) setCatalog({ families: c.families, total: c.counts.families })
+          if (!mounted.current) return
+          setCatalog({ families: c.families, total: c.counts.families })
+          setError(null)
         },
         (e: unknown) => {
           if (mounted.current) setError(e instanceof Error ? e.message : String(e))
@@ -198,12 +200,19 @@ export function CataloguePanel({
 
   if (!caps) return null
   if (!caps.downloads) {
+    // A reason means the server never answered, so nothing was checked and
+    // aria2c may well be there; the hook asks again, and this gives way to
+    // the catalogue once it does. Without one, the server looked and found
+    // no aria2c.
     return (
       <section className="mb-7">
         <Head title="The catalogue" />
         <Note>
-          aria2c is not on the server, so nothing can be fetched from here. Files placed under the
-          models folder by hand are picked up the next time the desk reads what is installed.
+          {caps.reason !== null
+            ? `${caps.reason.charAt(0).toUpperCase()}${caps.reason.slice(1)}. This panel asks again on its own.`
+            : 'aria2c is not on the server, so nothing can be fetched from here.'}{' '}
+          Files placed under the models folder by hand are picked up the next time the desk reads what
+          is installed.
         </Note>
       </section>
     )
@@ -222,6 +231,7 @@ export function CataloguePanel({
 
   const ask = (row: Row) => {
     const cat = row.cat!
+    setError(null)
     setPlans((p) => ({ ...p, [cat.id]: 'loading' }))
     void fetchPlan(cat.id, cat.installed.chosenModel ?? null)
       .then((plan) => {
@@ -231,7 +241,16 @@ export function CataloguePanel({
           startPlan({ family: cat.id, model: plan.chosenModel })
         }
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        if (!mounted.current) return
+        // No plan came back, so the row returns to its Fetch link and asking
+        // again is one click; left on 'loading' it would wait for an answer
+        // that is not coming. The reason is said above the list, named for
+        // the row, since the row itself no longer shows that it asked.
+        const why = (e instanceof Error ? e.message : String(e)).replace(/\.$/, '')
+        setPlans((p) => ({ ...p, [cat.id]: undefined }))
+        setError(`Could not ask the server whether ${row.def.label} fits: ${why}.`)
+      })
   }
 
   return (
