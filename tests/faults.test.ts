@@ -29,4 +29,20 @@ describe('faults', () => {
     expect(f.message).toBe('lost')
     expect(faultTitle(f)).toBe('That job did not finish')
   })
+
+  it('calls a job that broke with no detail and no node one that did not finish, and points at nothing', () => {
+    const f = faultOf(new ComfyError('bad frame'))
+    expect(f.detail).toBeNull()
+    expect(f.nodeType).toBeNull()
+    expect(faultTitle(f)).toBe('That job did not finish')
+    expect(faultBody(f)).toBe('bad frame')
+    expect(faultBody(f)).not.toContain('highlighted setting')
+    expect(faultWhere(f)).toBeNull()
+  })
+
+  it('names the node of a job that broke while running without calling it rejected', () => {
+    const f = faultOf(new ComfyError('bad frame', { node: '11', nodeType: 'LoadImage' }))
+    expect(faultTitle(f)).toBe('That job did not finish')
+    expect(faultWhere(f)).toBe('The trouble is in LoadImage (node 11).')
+  })
 })

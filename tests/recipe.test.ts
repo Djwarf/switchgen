@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
+import { settle } from '../src/components/advanced/overrides'
+import type { Hardware, ModelFile } from '../src/lib/hardware'
 import type { LoraIndexEntry } from '../src/lib/loraIndex'
-import { decide, explain } from '../src/lib/recipe'
+import type { LoraLibrary } from '../src/lib/loras'
+import { decide, explain, plainWords, positiveFor, regionAddOns } from '../src/lib/recipe'
+import { suggest } from '../src/lib/suggest'
+import { FAMILIES } from '../src/lib/workflows'
 import { ANATOMY_HELPER, EXPLICIT, MICRO_DETAILS, NOOBAI, SCREENCAP, library } from './fixtures'
 
 // The recipe reads triggers and training vocabulary from src/lib/loraIndex.ts,
@@ -142,5 +147,111 @@ describe('the sharpness figure and the words under the button', () => {
     expect(words).toContain('do not attach')
     // The reason is in the notes, not the warnings; an empty list must not be pointed at.
     if (!r.warnings.length) expect(words).not.toMatch(/say why/)
+  })
+})
+
+describe('decide(): memory, priced on the graph that will run', () => {
+  const GiB = 1024 ** 3
+  const file = (name: string, size: number): ModelFile => ({ name, rel: name, folder: 'x', size, mtime: 0 })
+  const sizes = new Map([
+    [NOOBAI, file(NOOBAI, 7 * GiB)],
+    [SCREENCAP, file(SCREENCAP, 200_000_000)],
+  ])
+  const machine = (free: number): Hardware => ({
+    cpu: { cores: 8, model: 'test' },
+    ram: { total: 64 * GiB, free },
+    gpu: { name: 'test', vramTotal: 16 * GiB, vramUsed: 0, vramFree: 16 * GiB },
+    disk: null,
+    platform: 'test',
+  })
+  const run = (hardware: Hardware, accepted: string[] = []) =>
+    decide({ ...base, prompt, anatomy: 'off', hardware, sizes, addOns: { accepted } })
+
+  it('counts an accepted add-on\'s bytes on top of the checkpoint', () => {
+    const bare = run(machine(64 * GiB))
+    const chained = run(machine(64 * GiB), [SCREENCAP])
+    expect(bare.ok && chained.ok).toBe(true)
+    if (!bare.ok || !chained.ok) return
+    expect(chained.verdict!.footprint.files.map((f) => f.name)).toContain(SCREENCAP)
+    expect(chained.verdict!.footprint.weightBytes - bare.verdict!.footprint.weightBytes).toBe(200_000_000)
+  })
+
+  it('warns in the verdict\'s own words when the chained graph is a tight fit', () => {
+    const roomy = run(machine(64 * GiB), [SCREENCAP])
+    if (!roomy.ok) throw new Error('no plan')
+    // Free memory just above what the chain needs: tight, not refused.
+    const r = run(machine(Math.round(roomy.verdict!.footprint.needBytes / 0.9)), [SCREENCAP])
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.verdict!.level).toBe('tight')
+    expect(r.warnings).toContain(r.verdict!.reason)
+  })
+})
+
+describe('decide(): a pass ComfyUI cannot run here', () => {
+  it('is not offered, and carries the sentence that says what is missing', () => {
+    const r = decide({ ...base, prompt, anatomy: 'off', passBlocks: { face: 'X' } })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.passes.face.available).toBe(false)
+    expect(r.passes.face.blocked).toBe('X')
+    expect(r.passes.hand.available).toBe(true)
+  })
+
+  it('is switched off by the settings panel too, which neither builds it nor counts it', () => {
+    const r = decide({ ...base, prompt, anatomy: 'off', passBlocks: { face: 'X' } })
+    if (!r.ok) throw new Error('no plan')
+    const settled = settle(r, { passes: { face: true, hand: false, hires: false } })
+    expect(settled.passes.face).toBe(false)
+    expect(settled.cost).toBe(1)
+    expect(settled.rebuilt).toBe(false)
+  })
+})
+
+describe('the words an add-on answers to', () => {
+  const MARKDOWN = '## 🧠 Usage (Python)'
+
+  it('leaves out a model card\'s markdown and anything over a line', () => {
+    expect(plainWords([MARKDOWN, 'score_9', 'a\nb'])).toEqual(['score_9'])
+  })
+
+  it('never sends a heading as a prompt word', () => {
+    const il = FAMILIES.find((f) => f.id === 'sdxl-illustrious')!
+    const positive = positiveFor({ def: il, model: NOOBAI, prompt: 'a girl', loras: [], lib: library(), extra: [MARKDOWN, 'detailed hand'] })
+    expect(positive).not.toContain('##')
+    expect(positive).toContain('detailed hand')
+  })
+
+  it('never prints a heading as an add-on\'s word on the region bench', () => {
+    const lib = library([SCREENCAP, EXPLICIT, ANATOMY_HELPER, MICRO_DETAILS])
+    const rows = lib.all.map((r) => (r.file === ANATOMY_HELPER ? { ...r, trigger: MARKDOWN } : r))
+    const marked: LoraLibrary = { ...lib, all: rows, byFile: new Map(rows.map((r) => [r.file, r])) }
+    const il = FAMILIES.find((f) => f.id === 'sdxl-illustrious')!
+    const held = regionAddOns(marked, il, NOOBAI)
+    const helper = held.find((h) => h.file === ANATOMY_HELPER)
+    expect(helper).toBeDefined()
+    expect(helper!.why).not.toContain('Its word, ##')
+    expect(helper!.why).not.toContain('##')
+  })
+})
+
+describe('suggest(): the sentence under an offered add-on', () => {
+  it('says its words are added for the reader, in plain words', () => {
+    const il = FAMILIES.find((f) => f.id === 'sdxl-illustrious')!
+    const r = suggest({ prompt, family: il, model: NOOBAI, installed: library(), anatomy: 'off' })
+    const pick = r.ranked.find((s) => s.file === SCREENCAP)
+    expect(pick).toBeDefined()
+    // Its caption phrase has commas, so it is several words.
+    expect(pick!.why).toContain('Its words, fine anime screencap_xl, anime coloring, anime screencap, are added to the prompt for you.')
+    expect(pick!.why).not.toMatch(/LoRA|trigger/i)
+  })
+
+  it('speaks of one word when the phrase is one', () => {
+    const il = FAMILIES.find((f) => f.id === 'sdxl-illustrious')!
+    const r = suggest({ prompt: 'explicit photography of a woman, realistic, nude', family: il, model: NOOBAI, installed: library(), anatomy: 'off' })
+    const pick = r.ranked.find((s) => s.file === EXPLICIT)
+    expect(pick).toBeDefined()
+    expect(pick!.why).toContain('Its word, v4n1lla, is added to the prompt for you.')
+    expect(pick!.why).not.toMatch(/LoRA|trigger/i)
   })
 })

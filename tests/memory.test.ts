@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { clipMemory } from '../src/lib/clipMemory'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { clipMemory, waitForIdleComfy } from '../src/lib/clipMemory'
 import { feasibility, type Hardware, type ModelFile } from '../src/lib/hardware'
 import { withVideoLoras } from '../src/lib/refine'
 import { FAMILIES } from '../src/lib/workflows'
@@ -60,6 +60,87 @@ describe('clipMemory: the 14B pairs against the two measured points', () => {
     for (const id of ['wan22-5b', 'hunyuan-video', 'ltxv-0_9_6-gguf']) {
       expect(clipMemory(family(id), at(241, 1280, 720), MEASURED_MACHINE)).toEqual({ level: 'ok', reason: null, release: false })
     }
+  })
+})
+
+describe('clipMemory: the image-to-video pair against its own record', () => {
+  const pair = family('wan22-14b-i2v')
+
+  it('refuses anything larger than the 49 frames that came through once', () => {
+    for (const frames of [81, 61]) expect(clipMemory(pair, at(frames), MEASURED_MACHINE).level).toBe('refuse')
+  })
+
+  it('never simply lets a clip through, and points to the 5B instead of promising a release will help', () => {
+    for (const frames of [49, 33]) {
+      const v = clipMemory(pair, at(frames), MEASURED_MACHINE)
+      expect(v.level).toBe('caution')
+      expect(v.release).toBe(true)
+      expect(v.reason).toContain('5B')
+      expect(v.reason).not.toContain('released before it runs')
+    }
+  })
+
+  it('refuses the size that came through once when add-ons are chained on top', () => {
+    expect(clipMemory(pair, at(49), MEASURED_MACHINE, 1).level).toBe('refuse')
+  })
+})
+
+describe('clipMemory: add-ons on the text-to-video pair', () => {
+  const pair = family('wan22-14b-t2v')
+
+  it('makes the verdict one step stricter, since the pair was measured with none', () => {
+    expect(clipMemory(pair, at(49), MEASURED_MACHINE, 1).level).toBe('caution')
+    expect(clipMemory(pair, at(61), MEASURED_MACHINE, 1).level).toBe('refuse')
+    expect(clipMemory(pair, at(61), MEASURED_MACHINE).level).toBe('caution')
+  })
+
+  it('refuses nothing with add-ons on a machine nobody measured', () => {
+    const v = clipMemory(pair, at(61), machine(64), 1)
+    expect(v.level).toBe('caution')
+    expect(v.reason).toContain('which was not measured')
+  })
+
+  it('does not claim the release makes room for the clip', () => {
+    expect(clipMemory(pair, at(81), MEASURED_MACHINE).reason).not.toContain("so ComfyUI's cached models are released before it runs")
+  })
+
+  it('holds a family with no id to the text-to-video points', () => {
+    const bare = { dualModel: true }
+    for (const [frames, addOns] of [[49, 0], [61, 0], [85, 0], [49, 1], [61, 1]] as const) {
+      expect(clipMemory(bare, at(frames), MEASURED_MACHINE, addOns)).toEqual(clipMemory(pair, at(frames), MEASURED_MACHINE, addOns))
+    }
+  })
+})
+
+describe('waiting for an idle ComfyUI before a release', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+  const queue = (running: number, pending: number) =>
+    new Response(JSON.stringify({ queue_running: Array(running).fill([]), queue_pending: Array(pending).fill([]) }), {
+      headers: { 'content-type': 'application/json' },
+    })
+
+  it('says how many jobs are ahead, and goes once the queue is empty', async () => {
+    vi.useFakeTimers()
+    const answers = [queue(1, 1), queue(0, 1), queue(0, 0)]
+    vi.stubGlobal('fetch', vi.fn(async () => answers.shift()!))
+    const heard: number[] = []
+    const idle = waitForIdleComfy(undefined, (n) => heard.push(n))
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(await idle).toBe(true)
+    expect(heard).toEqual([2, 1])
+  })
+
+  it('gives up when stopped while it waits', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn(async () => queue(1, 0)))
+    const stop = new AbortController()
+    const idle = waitForIdleComfy(stop.signal)
+    await vi.advanceTimersByTimeAsync(100)
+    stop.abort()
+    expect(await idle).toBe(false)
   })
 })
 

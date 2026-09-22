@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { availabilityOf, inventoryFrom, missingFilesFor } from '../src/lib/availability'
+import { availabilityOf, inventoryFrom, missingFilesFor, passBlocks } from '../src/lib/availability'
+import { feasibility, modelGraph, type Hardware, type ModelFile } from '../src/lib/hardware'
+import { intentReport } from '../src/lib/intent'
+import { DETECTORS, UPSCALE_MODEL } from '../src/lib/refine'
 import { FAMILIES } from '../src/lib/workflows'
 
 const family = (id: string) => FAMILIES.find((f) => f.id === id)!
@@ -55,5 +58,107 @@ describe('availability', () => {
     const a = availabilityOf(def, inv, tiny as never, sizes as never)
     expect(a.ok).toBe(false)
     if (!a.ok) expect(a.why).toMatch(/RAM/)
+  })
+})
+
+describe('the quality passes against what ComfyUI has', () => {
+  const combo = (field: string, options: string[]) => ({ input: { required: { [field]: ['COMBO', { options }] } } })
+  const bare = { input: { required: {} } }
+  const everything = (upscalers: string[] = [UPSCALE_MODEL]) => ({
+    UpscaleModelLoader: combo('model_name', upscalers),
+    ImpactGaussianBlurMask: bare,
+    UltralyticsDetectorProvider: combo('model_name', [DETECTORS.face, DETECTORS.hand]),
+    FaceDetailer: bare,
+  })
+
+  it('reads a list ComfyUI sends in its newer COMBO shape', () => {
+    const inv = inventoryFrom(everything())
+    expect([...inv.upscalers]).toContain(UPSCALE_MODEL)
+    expect(passBlocks(inv).refine).toBeNull()
+  })
+
+  it('names the file a pass needs when ComfyUI does not list it', () => {
+    expect(passBlocks(inventoryFrom(everything([]))).refine).toContain(UPSCALE_MODEL)
+  })
+
+  it('names the node pack when the detector loader is missing', () => {
+    const { UltralyticsDetectorProvider: _gone, ...rest } = everything()
+    const blocks = passBlocks(inventoryFrom(rest))
+    expect(blocks.face).toContain('the ComfyUI Impact Subpack')
+    expect(blocks.hand).toContain('the ComfyUI Impact Subpack')
+  })
+
+  it('blocks nothing when everything is there, or when ComfyUI said nothing at all', () => {
+    expect(passBlocks(inventoryFrom(everything()))).toEqual({ refine: null, face: null, hand: null })
+    expect(passBlocks(inventoryFrom({}))).toEqual({ refine: null, face: null, hand: null })
+  })
+})
+
+describe('a family whose files only the GGUF node pack can list', () => {
+  const GGUF_LOADERS = ['UnetLoaderGGUF', 'CLIPLoaderGGUF', 'DualCLIPLoaderGGUF']
+  /** An /object_info with every file the family needs except its .gguf ones, and no GGUF loaders. */
+  function withoutPack(id: string) {
+    const needed = missingFilesFor(family(id), inventoryFrom({})).filter((f) => !/\.gguf$/i.test(f))
+    const info = objectInfo({ ckpt: needed, unet: needed, clip: needed, vae: needed, lora: needed }) as Record<string, unknown>
+    for (const n of GGUF_LOADERS) delete info[n]
+    return inventoryFrom(info)
+  }
+
+  it('puts it down to the missing node pack, not to files the reader already has', () => {
+    for (const id of ['qwen-image-edit', 'wan22-14b-t2v']) {
+      const a = availabilityOf(family(id), withoutPack(id), null, new Map())
+      expect(a.ok, id).toBe(false)
+      if (a.ok) continue
+      expect(a.why).toContain('ComfyUI-GGUF node pack')
+      expect(a.why).not.toMatch(/[\w-]\.gguf/)
+    }
+  })
+})
+
+describe('pricing one file of a family that lists several', () => {
+  const GiB = 1024 ** 3
+  const il = family('sdxl-illustrious')
+  const hw: Hardware = {
+    cpu: { cores: 8, model: 'test' },
+    ram: { total: 64 * GiB, free: 64 * GiB },
+    gpu: { name: 'test', vramTotal: 16 * GiB, vramUsed: 0, vramFree: 16 * GiB },
+    disk: null,
+    platform: 'test',
+  }
+  const file = (name: string, size: number): ModelFile => ({ name, rel: name, folder: 'checkpoints', size, mtime: 0 })
+  const sizes = new Map([
+    ['waiMatureIllustrious_v30.safetensors', file('waiMatureIllustrious_v30.safetensors', 7 * GiB)],
+    ['NoobAI-XL-v1.1.safetensors', file('NoobAI-XL-v1.1.safetensors', 12 * GiB)],
+  ])
+
+  it('writes the chosen file into the graph', () => {
+    const graph = modelGraph(il, 'NoobAI-XL-v1.1.safetensors')
+    expect(Object.values(graph).some((n) => n.inputs.ckpt_name === 'NoobAI-XL-v1.1.safetensors')).toBe(true)
+    expect(Object.values(il.graph).some((n) => n.inputs.ckpt_name === 'NoobAI-XL-v1.1.safetensors')).toBe(false)
+  })
+
+  it('prices each file at its own size', () => {
+    const bytes = (m: string) => feasibility(il, sizes, hw, modelGraph(il, m)).footprint.weightBytes
+    expect(bytes('NoobAI-XL-v1.1.safetensors') - bytes('waiMatureIllustrious_v30.safetensors')).toBe(5 * GiB)
+  })
+
+  it('ranks two files of one family on their own footprints', () => {
+    const report = intentReport(
+      { intent: 'anime', explicit: false },
+      { families: [il], installed: [...sizes.keys()], sizes, hardware: hw },
+    )
+    const footprint = (m: string) => report.ranked.find((r) => r.model === m)?.verdict?.footprint.weightBytes
+    expect(footprint('NoobAI-XL-v1.1.safetensors')).toBeDefined()
+    expect(footprint('NoobAI-XL-v1.1.safetensors')).not.toBe(footprint('waiMatureIllustrious_v30.safetensors'))
+  })
+
+  it('prices the file it is asked about when deciding a family is available', () => {
+    // The family lists four checkpoints and is offered only with all of them.
+    const inv = inventoryFrom(objectInfo({ ckpt: il.models }))
+    const bytes = (m: string) => {
+      const a = availabilityOf(il, inv, hw, sizes, m)
+      return a.ok ? a.verdict?.footprint.weightBytes : undefined
+    }
+    expect(bytes('NoobAI-XL-v1.1.safetensors')! - bytes('waiMatureIllustrious_v30.safetensors')!).toBe(5 * GiB)
   })
 })

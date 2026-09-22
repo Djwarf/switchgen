@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
-import { confineReal, guardMutation, hostAllowed, safely, sameOrigin, upgradeAllowed } from '../server/guard.mjs'
+import { confineReal, guardMutation, guardOrigin, hostAllowed, proxyWriteGuard, safely, sameOrigin, upgradeAllowed } from '../server/guard.mjs'
 import { call } from './http'
 
 const req = (headers: Record<string, string>, method = 'POST') => ({ headers, method })
@@ -137,5 +137,49 @@ describe('safely', () => {
     const r = await call(safely(() => { throw new Error('sooner') }), { url: '/api/x' })
     expect(r.status).toBe(500)
     expect(r.json().error).toBe('sooner')
+  })
+})
+
+describe('writes bound for ComfyUI through the proxy', () => {
+  // The proxy rewrites Origin to ComfyUI's own, so ComfyUI cannot tell which
+  // page sent a write. The guard in front of it holds those writes to the
+  // rule the /api routes follow.
+  const through = (url: string, headers: Record<string, string>, method = 'POST') =>
+    call(proxyWriteGuard('/comfy'), { method, url, headers })
+
+  it('refuses a same-site page on another port of this machine', async () => {
+    const r = await through('/comfy/prompt', { 'sec-fetch-site': 'same-site', origin: 'http://127.0.0.1:8080', host: '127.0.0.1:5273' })
+    expect(r.status).toBe(403)
+    expect(r.passed).toBe(false)
+  })
+
+  it('refuses an Origin that does not match Host when the browser gives no verdict', async () => {
+    const r = await through('/comfy/free', { origin: 'http://127.0.0.1:8080', host: '127.0.0.1:5273' })
+    expect(r.status).toBe(403)
+    expect(r.passed).toBe(false)
+  })
+
+  it('matches the prefix the way the proxy does, from the start of the raw URL', async () => {
+    const r = await through('/comfyprompt', { 'sec-fetch-site': 'cross-site', origin: 'http://evil.example', host: '127.0.0.1:5273' })
+    expect(r.status).toBe(403)
+    expect(r.passed).toBe(false)
+  })
+
+  it('passes this server\'s own writes, every read, and paths that are not the proxy\'s', async () => {
+    expect((await through('/comfy/prompt', { 'sec-fetch-site': 'same-origin', origin: 'http://127.0.0.1:5273', host: '127.0.0.1:5273' })).passed).toBe(true)
+    expect((await through('/comfy/view?filename=a.png', { 'sec-fetch-site': 'same-site' }, 'GET')).passed).toBe(true)
+    // /api routes run their own guard, with the body type as well.
+    expect((await through('/api/x', { 'sec-fetch-site': 'cross-site', origin: 'http://evil.example' })).passed).toBe(true)
+  })
+
+  it('shares one origin rule with the /api routes', () => {
+    expect(guardOrigin(req({ 'sec-fetch-site': 'cross-site' }, 'GET'), res())).toBe(true)
+    const r = res()
+    expect(guardOrigin(req({ 'sec-fetch-site': 'same-site' }), r)).toBe(false)
+    expect(r.statusCode).toBe(403)
+    const m = res()
+    expect(guardMutation(req({ 'sec-fetch-site': 'same-site', 'content-type': 'application/json' }), m)).toBe(false)
+    expect(m.statusCode).toBe(403)
+    expect(JSON.parse(m.body).error).toMatch(/cross-site request refused/)
   })
 })

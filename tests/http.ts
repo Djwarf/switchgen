@@ -20,23 +20,32 @@ export type Reply = {
   json: () => any
 }
 
-export function call(
-  handler: Handler,
-  opts: { method?: string; url: string; headers?: Record<string, string>; body?: unknown },
-): Promise<Reply> {
+type Request = { method?: string; url: string; headers?: Record<string, string>; body?: unknown }
+
+export function call(handler: Handler, opts: Request): Promise<Reply> {
+  return open(handler, opts).done
+}
+
+/**
+ * Like {@link call}, but the reply is handed over at once and fills as the
+ * handler writes, so a test can read a stream (server-sent events, say)
+ * before the handler ends it. `done` settles when it does.
+ */
+export function open(handler: Handler, opts: Request): { reply: Reply; done: Promise<Reply>; hangUp: () => void } {
   const method = opts.method ?? 'GET'
   const raw = opts.body === undefined ? [] : [Buffer.from(JSON.stringify(opts.body))]
   const headers: Record<string, string> = { ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}), ...opts.headers }
   const req = Object.assign(Readable.from(raw), { method, url: opts.url, headers })
 
-  return new Promise((resolve) => {
-    const reply: Reply = {
-      status: 200,
-      headers: {},
-      body: '',
-      passed: false,
-      json: () => JSON.parse(reply.body),
-    }
+  const reply: Reply = {
+    status: 200,
+    headers: {},
+    body: '',
+    passed: false,
+    json: () => JSON.parse(reply.body),
+  }
+  let hangUp = () => {}
+  const done = new Promise<Reply>((resolve) => {
     const res = Object.assign(new EventEmitter(), {
       req,
       destroyed: false,
@@ -73,11 +82,28 @@ export function call(
         reply.status = v
       },
     })
+    // The client going away, as a server hears it.
+    hangUp = () => {
+      res.destroyed = true
+      res.emit('close')
+    }
     handler(req, res, () => {
       reply.passed = true
       resolve(reply)
     })
   })
+  return { reply, done, hangUp }
+}
+
+/** The server-sent events a reply holds so far, in order. */
+export function events(reply: Reply): { event: string; data: any }[] {
+  const out: { event: string; data: any }[] = []
+  for (const block of reply.body.split('\n\n')) {
+    const event = /^event: (.*)$/m.exec(block)?.[1]
+    const data = /^data: (.*)$/m.exec(block)?.[1]
+    if (event && data !== undefined) out.push({ event, data: JSON.parse(data) })
+  }
+  return out
 }
 
 /** The middleware a SwitchGen plugin mounts, taken the way Vite's preview server takes it. */
