@@ -11,7 +11,7 @@
  * and is labelled as such; before there is a rate, there is no estimate.
  */
 import { useEffect, useState } from 'react'
-import { goToSection } from './route'
+import { goToSection, sectionForDesk } from './route'
 import { useHoldToConfirm } from './hotkeys'
 import {
   elapsedText,
@@ -24,10 +24,10 @@ import {
   type Job,
 } from './jobs'
 
-const DESK_LABEL = { images: 'Pictures', video: 'Video' } as const
+const DESK_LABEL = { images: 'Pictures', video: 'Video', reel: 'Reel' } as const
 
 function jumpTo(job: Job): void {
-  goToSection(job.desk === 'video' ? 'video' : 'pictures')
+  goToSection(sectionForDesk(job.desk))
 }
 
 /** A clock that only ticks while there is something to count. */
@@ -150,14 +150,22 @@ function StopButton({ job }: { job: Job }) {
   const hold = useHoldToConfirm(() => {
     void jobs.cancel(job.id)
   })
+  // A reel shot is one of a queue the reel walks in order, and stopping it
+  // stops the walk, so the promise that nothing else is affected would be
+  // false there.
+  const reel = job.desk === 'reel'
   return (
     <button
       type="button"
       {...hold.bind}
       disabled={job.cancelling}
       className="sg-quiet sg-hold ring shrink-0"
-      aria-label={`Hold to stop the ${DESK_LABEL[job.desk].toLowerCase()} job`}
-      title="Hold for a moment to stop this job. Nothing else is affected."
+      aria-label={reel ? 'Hold to stop the reel' : `Hold to stop the ${DESK_LABEL[job.desk].toLowerCase()} job`}
+      title={
+        reel
+          ? 'Hold for a moment to stop the reel. This shot stops and the shots after it are not made. Finished shots stay in the Archive.'
+          : 'Hold for a moment to stop this job. Nothing else is affected.'
+      }
     >
       <span className="sg-hold-wipe" style={{ width: `${Math.round(hold.progress * 100)}%` }} aria-hidden />
       <span className="relative">{job.cancelling ? 'Stopping' : 'Hold to stop'}</span>

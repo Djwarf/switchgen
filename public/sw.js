@@ -10,12 +10,18 @@
  *   /comfy/*, /api/*  NEVER cached. These are live state: the job queue, device
  *                     status, the model inventory. A stale answer here is worse
  *                     than no answer.
- *   /comfy/view?...   Cached. Generated files are immutable once written and are
- *                     addressed by filename, so the archive stays browsable and
- *                     scrolling it does not re-fetch megabytes.
+ *   /comfy/view?...   Network first, the cache as the fallback. A file is
+ *                     addressed by its name, and a name can come back: ComfyUI
+ *                     numbers a new file one past the highest it can see, so
+ *                     deleting the newest picture hands its name to the next
+ *                     render. A copy kept by name is therefore not proof of
+ *                     what is on disk now. The cache keeps the archive
+ *                     browsable when the connection drops.
  *   everything else   Shell assets: cache-first with a background refresh.
  */
-const VERSION = 'switchgen-v1'
+// v2 retired the v1 media cache, which served files cache-first and could
+// still be holding a deleted picture under a name that has since been reused.
+const VERSION = 'switchgen-v2'
 const SHELL = `${VERSION}-shell`
 const MEDIA = `${VERSION}-media`
 const MEDIA_MAX = 200 // generated files kept locally; oldest evicted past this
@@ -60,17 +66,36 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
 
-  // Generated output files are immutable — safe and worthwhile to cache.
+  // Generated files: ask the server first (see the rules above). `no-cache`
+  // makes the browser revalidate its own HTTP copy too, because ComfyUI sends
+  // /view with a Last-Modified and an ETag but no Cache-Control, which leaves
+  // the browser free to reuse a stale copy without asking. An unchanged file
+  // comes back as a 304 with no body.
   if (url.pathname === '/comfy/view') {
+    // A file opened in a tab of its own is a navigation, and not every browser
+    // lets a navigation be re-issued with other cache settings, so it is left
+    // to the browser.
+    if (request.mode === 'navigate') return
     event.respondWith((async () => {
       const cache = await caches.open(MEDIA)
-      const hit = await cache.match(request)
-      if (hit) return hit
-      const res = await fetch(request)
-      if (res.ok) {
-        cache.put(request, res.clone()).then(() => trimCache(MEDIA, MEDIA_MAX))
+      try {
+        const res = await fetch(request, { cache: 'no-cache' })
+        // Whole files only: a 206 is part of a clip, and the cache refuses it.
+        // An unchanged file is not written again.
+        if (res.status === 200) {
+          const hit = await cache.match(request)
+          const etag = res.headers.get('etag')
+          if (!hit || !etag || hit.headers.get('etag') !== etag) {
+            cache.put(request, res.clone())
+              .then(() => trimCache(MEDIA, MEDIA_MAX))
+              .catch(() => { /* storage full or refused: the page has the file */ })
+          }
+        }
+        return res
+      } catch {
+        return (await cache.match(request)) ??
+          new Response('Offline', { status: 503, statusText: 'Offline' })
       }
-      return res
     })())
     return
   }

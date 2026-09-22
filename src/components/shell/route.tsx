@@ -224,9 +224,11 @@ export function requestSearchFocus(): void {
  * A desk id (`lib/session.ts`) to the section that holds it.
  *
  * The two vocabularies are deliberately different: `images` is the store's
- * name for a desk, `Pictures` is the room's name on the door.
+ * name for a desk, `Pictures` is the room's name on the door. The reel has no
+ * store of its own but is a room, so a job from it goes back to it.
  */
-export function sectionForDesk(desk: 'images' | 'video'): Section {
+export function sectionForDesk(desk: 'images' | 'video' | 'reel'): Section {
+  if (desk === 'reel') return 'reel'
   return desk === 'video' ? 'video' : 'pictures'
 }
 

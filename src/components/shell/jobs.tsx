@@ -55,12 +55,20 @@ export function stageFor(classType: string | null | undefined): string {
 
 export type JobStatus = 'submitting' | 'queued' | 'running' | 'done' | 'error' | 'cancelled'
 
+/**
+ * Where a job came from. The two desks, plus the reel, which has no draft
+ * store of its own and so is not a `DeskId`, but is its own room: the slug has
+ * to send a reader there, not to the video desk, and stopping one of its shots
+ * stops the reel.
+ */
+export type JobDesk = DeskId | 'reel'
+
 export type Job = {
   /** Local id, assigned before anything is submitted. */
   id: string
   /** ComfyUI's prompt id, once the queue has accepted it. */
   promptId: string | null
-  desk: DeskId
+  desk: JobDesk
   kind: 'image' | 'video'
   /** What made it: "Krea 2", "Wan 2.2 5B". */
   label: string
@@ -84,7 +92,7 @@ export type Job = {
 }
 
 export type JobInit = {
-  desk: DeskId
+  desk: JobDesk
   kind: 'image' | 'video'
   label: string
   prompt: string
@@ -92,6 +100,12 @@ export type JobInit = {
   promptId?: string | null
   /** Total sampler steps, so the rule can start at a sensible width. */
   steps?: number
+  /**
+   * How to stop it, when stopping means more than cancelling one prompt. The
+   * desk that owns the job does the stopping and reports the outcome back
+   * through the usual calls; `cancel()` only marks the job as stopping.
+   */
+  stop?: () => void
 }
 
 /** What ComfyUI says about its own queue, including work we did not start. */
@@ -131,6 +145,8 @@ let server: ServerQueue = { running: 0, pending: 0, foreign: 0, known: false }
 let snapshot: JobsSnapshot = build()
 const listeners = new Set<() => void>()
 const watchers = new Map<string, () => void>()
+/** Ledger job id → the owning desk's own stop, from `JobInit.stop`. */
+const stoppers = new Map<string, () => void>()
 
 function build(): JobsSnapshot {
   const active = ledger.filter(isLive)
@@ -285,6 +301,8 @@ function start(init: JobInit): string {
     entryId: null,
   }
   ledger = [job, ...ledger].slice(0, KEEP)
+  if (init.stop) stoppers.set(job.id, init.stop)
+  for (const id of stoppers.keys()) if (!ledger.some((j) => j.id === id)) stoppers.delete(id)
   emit()
   schedule()
   return job.id
@@ -418,6 +436,16 @@ function fail(id: string, message: string, opts: { cancelled?: boolean } = {}): 
 async function cancel(id: string): Promise<void> {
   const job = ledger.find((j) => j.id === id)
   if (!job || !isLive(job)) return
+  const stop = stoppers.get(id)
+  if (stop) {
+    patch(id, (j) => ({ ...j, cancelling: true, stage: 'Stopping' }))
+    try {
+      stop()
+    } catch {
+      patch(id, (j) => ({ ...j, cancelling: false }))
+    }
+    return
+  }
   if (!job.promptId) {
     // Nothing was submitted yet; `attach` will cancel it the moment it is.
     patch(id, (j) => ({ ...j, status: 'cancelled', stage: 'Stopped', finishedAt: Date.now() }))
@@ -440,6 +468,7 @@ async function cancel(id: string): Promise<void> {
 function dismiss(id: string): void {
   release(id)
   misses.delete(id)
+  stoppers.delete(id)
   const before = ledger.length
   ledger = ledger.filter((j) => j.id !== id)
   if (ledger.length !== before) emit()
@@ -453,6 +482,7 @@ function clearFinished(): void {
   const before = ledger.length
   ledger = ledger.filter(isLive)
   misses = new Map()
+  for (const id of stoppers.keys()) if (!ledger.some((j) => j.id === id)) stoppers.delete(id)
   if (ledger.length !== before) emit()
 }
 

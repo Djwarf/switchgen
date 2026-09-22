@@ -60,6 +60,7 @@ export {
   useJob,
   useJobs,
   type Job,
+  type JobDesk,
   type JobInit,
   type JobStatus,
   type JobsSnapshot,

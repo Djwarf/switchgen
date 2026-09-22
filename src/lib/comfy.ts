@@ -291,6 +291,14 @@ type PromptState = {
   /** The done/error event, replayed to anyone who watches late. */
   terminal: ProgressEvent | null
   settling: boolean
+  /**
+   * True when some of this prompt's messages may never have reached us: the
+   * socket dropped while it was in flight, it was submitted while the socket
+   * was down, or the first watcher came late. `executed` messages are not
+   * replayed, so `files` may then hold only some of the outputs, and the
+   * /history record has to be read for the full list.
+   */
+  gap: boolean
   touched: number
   reaper: ReturnType<typeof setTimeout> | null
 }
@@ -333,6 +341,7 @@ function stateFor(promptId: string): PromptState {
       previewUrl: null,
       terminal: null,
       settling: false,
+      gap: false,
       touched: Date.now(),
       reaper: null,
     }
@@ -381,26 +390,43 @@ function emit(st: PromptState, e: ProgressEvent) {
   }
 }
 
+type Failure = { ok: false; message: string; cancelled: boolean; node: string | null }
+type Outcome = { ok: true } | Failure
+
+const STOPPED: Failure = {
+  ok: false,
+  message: 'Job stopped. Nothing was saved.',
+  cancelled: true,
+  node: null,
+}
+
+const FAILED: Failure = {
+  ok: false,
+  message: 'ComfyUI reported an error. The job did not finish.',
+  cancelled: false,
+  node: null,
+}
+
 /**
  * Finish a prompt once. Replayed to late watchers, then cleaned up.
  *
- * When a job reports success but we never saw its `executed` message — the
- * socket dropped mid-run, or the watcher attached late — the files are
- * recovered from /history rather than resolving with nothing.
+ * When a job reports success but some of its `executed` messages may have been
+ * missed (see `gap`), the files come from /history rather than from whatever
+ * the socket delivered. A reel shot writes two files, the clip and the frame
+ * the next shot starts from, and settling with only one of them loses the
+ * other for good. The same record says whether the run really succeeded, which
+ * matters when the missed message was the error.
  */
-async function settle(
-  promptId: string,
-  outcome:
-    | { ok: true }
-    | { ok: false; message: string; cancelled: boolean; node: string | null },
-) {
+async function settle(promptId: string, outcome: Outcome) {
   const st = prompts.get(promptId)
   if (!st || st.terminal || st.settling) return
   st.settling = true
 
-  if (outcome.ok && st.files.length === 0) {
+  if (outcome.ok && (st.files.length === 0 || st.gap)) {
     const run = await fetchPastRun(promptId).catch(() => null)
-    if (run) st.files = run.files
+    if (run?.status === 'cancelled') outcome = STOPPED
+    else if (run?.status === 'error') outcome = FAILED
+    else if (run) st.files = run.files
   }
 
   const event: ProgressEvent = outcome.ok
@@ -453,6 +479,8 @@ function ensureSocket(): void {
 
   ws.onclose = () => {
     if (sock === ws) sock = null
+    // Anything still in flight may now miss messages that are never replayed.
+    for (const st of prompts.values()) if (!st.terminal) st.gap = true
     setConnection('closed')
     reconnectTimer = setTimeout(ensureSocket, backoff)
     backoff = Math.min(backoff * 2, 8000)
@@ -520,18 +548,20 @@ function handleText(raw: string) {
       return
     }
 
-    case 'execution_success':
-      if (id) void settle(id, { ok: true })
+    case 'execution_success': {
+      if (!id) return
+      // ComfyUI sends this before it writes the /history record, and the
+      // `executing` message with a null node after. When the files have to
+      // come from that record, settle on the later message instead, or the
+      // lookup finds nothing yet and the job resolves without its files.
+      const st = prompts.get(id)
+      if (st && (st.gap || st.files.length === 0)) return
+      void settle(id, { ok: true })
       return
+    }
 
     case 'execution_interrupted':
-      if (id)
-        void settle(id, {
-          ok: false,
-          message: 'Job stopped. Nothing was saved.',
-          cancelled: true,
-          node: d.node_id == null ? null : String(d.node_id),
-        })
+      if (id) void settle(id, { ...STOPPED, node: d.node_id == null ? null : String(d.node_id) })
       return
 
     case 'execution_error':
@@ -602,34 +632,43 @@ function handleBinary(buf: ArrayBuffer) {
 }
 
 /**
+ * Settle one prompt from its /history record. True when the record was final
+ * and the prompt has been settled from it; false when there is no record yet,
+ * or none at all.
+ */
+async function reconcileOne(id: string): Promise<boolean> {
+  const run = await fetchPastRun(id).catch(() => null)
+  if (!run) return false
+  if (run.status === 'success') {
+    // A success record lists every output, so it replaces whatever the
+    // socket managed to deliver before it dropped.
+    const st = prompts.get(id)
+    if (st) {
+      st.files = run.files
+      st.gap = false
+    }
+    void settle(id, { ok: true })
+    return true
+  }
+  if (run.status === 'cancelled') {
+    void settle(id, STOPPED)
+    return true
+  }
+  if (run.status === 'error') {
+    void settle(id, FAILED)
+    return true
+  }
+  return false
+}
+
+/**
  * After a reconnect we may have missed the end of a job. Ask the server about
- * everything still being watched and settle whatever has finished.
+ * everything still being watched and settle whatever has finished. A prompt
+ * with no record at all is left to the lost-job watch in `run()`.
  */
 async function reconcileWatched(): Promise<void> {
   const open = [...prompts.entries()].filter(([, s]) => !s.terminal && s.listeners.size > 0)
-  for (const [id] of open) {
-    const run = await fetchPastRun(id).catch(() => null)
-    if (!run) continue
-    if (run.status === 'success') {
-      const st = prompts.get(id)
-      if (st && st.files.length === 0) st.files = run.files
-      void settle(id, { ok: true })
-    } else if (run.status === 'cancelled') {
-      void settle(id, {
-        ok: false,
-        message: 'Job stopped. Nothing was saved.',
-        cancelled: true,
-        node: null,
-      })
-    } else if (run.status === 'error') {
-      void settle(id, {
-        ok: false,
-        message: 'ComfyUI reported an error. The job did not finish.',
-        cancelled: false,
-        node: null,
-      })
-    }
-  }
+  for (const [id] of open) await reconcileOne(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -691,7 +730,10 @@ export async function submit(workflow: ApiWorkflow): Promise<string> {
 
   const body = await res.json()
   const promptId = String(body.prompt_id)
-  stateFor(promptId)
+  const st = stateFor(promptId)
+  // ComfyUI addresses this prompt's messages to our client id from now on; a
+  // socket that is not open yet drops them.
+  if (connection !== 'open') st.gap = true
   return promptId
 }
 
@@ -704,7 +746,11 @@ export async function submit(workflow: ApiWorkflow): Promise<string> {
  */
 export function watch(promptId: string, on: Listener): () => void {
   ensureSocket()
+  // A prompt this tab did not submit may already be part way through, and
+  // the outputs it reported before now are not sent again.
+  const late = !prompts.has(promptId)
   const st = stateFor(promptId)
+  if (late) st.gap = true
   st.listeners.add(on)
 
   if (st.terminal) {
@@ -721,10 +767,141 @@ export function watch(promptId: string, on: Listener): () => void {
 }
 
 /**
+ * A job ComfyUI has forgotten, as opposed to one it refused or one that failed.
+ *
+ * Deliberately not a {@link ComfyError}: that is the queue or the graph
+ * speaking, and this is the server having no record of the job at all, which
+ * wants different words. `lost` is what `faults.ts` reads to tell the two apart.
+ */
+export class LostJob extends Error {
+  readonly lost = true
+  readonly cancelled = false
+  readonly promptId: string
+
+  constructor(message: string, promptId: string) {
+    super(message)
+    this.name = 'LostJob'
+    this.promptId = promptId
+  }
+}
+
+/** How often the lost-job watch asks the server about the prompts it follows. */
+const LOST_POLL_MS = 5000
+/** Consecutive absences from /api/jobs before the direct lookup. */
+const LOST_MISSES = 2
+/** A prompt accepted seconds ago may not be listed yet. */
+const LOST_GRACE_MS = 20_000
+/** Ticks to wait for a history record the server says already exists. */
+const LOST_TERMINAL_WAITS = 3
+
+type Followed = {
+  since: number
+  sighted: boolean
+  misses: number
+  terminalWaits: number
+  lose: (err: LostJob) => void
+}
+
+/** Every prompt a `run()` is waiting on, checked together on one timer. */
+const followed = new Map<string, Followed>()
+let lostTimer: ReturnType<typeof setInterval> | null = null
+let lostChecking = false
+
+/**
+ * Watch the server's own queue for a prompt that has vanished.
+ *
+ * A prompt settles on a socket event carrying its id, and some endings never
+ * send one. A ComfyUI that restarts mid job has forgotten it, and its /history
+ * starts empty, so the reconnect pass finds nothing to settle either. Without
+ * this the caller's await never returns and the desk stays busy until reload.
+ *
+ * The evidence is two consecutive absences from the server's list of pending
+ * and running jobs, confirmed by a direct lookup that finds no record. When
+ * the lookup finds a finished job instead, its /history record settles it.
+ */
+function followForLoss(promptId: string, lose: (err: LostJob) => void): () => void {
+  followed.set(promptId, { since: Date.now(), sighted: false, misses: 0, terminalWaits: 0, lose })
+  if (lostTimer === null) lostTimer = setInterval(() => void checkForLoss(), LOST_POLL_MS)
+  return () => {
+    followed.delete(promptId)
+    if (followed.size === 0 && lostTimer !== null) {
+      clearInterval(lostTimer)
+      lostTimer = null
+    }
+  }
+}
+
+async function checkForLoss(): Promise<void> {
+  if (lostChecking || followed.size === 0) return
+  lostChecking = true
+  try {
+    let live: Set<string>
+    try {
+      const page = await listJobs({ status: ['pending', 'in_progress'], limit: 100 })
+      live = new Set(page.jobs.map((j) => j.id))
+    } catch {
+      return // an unreachable server is the offline notice's business
+    }
+
+    for (const [id, f] of [...followed]) {
+      // Each await below can outlive the run it is checking.
+      const current = () => followed.get(id) === f && !prompts.get(id)?.terminal
+      if (!current()) continue
+      if (live.has(id)) {
+        f.sighted = true
+        f.misses = 0
+        continue
+      }
+      if (!f.sighted && Date.now() - f.since < LOST_GRACE_MS) continue
+      f.misses += 1
+      if (f.misses < LOST_MISSES) continue
+
+      let server: ServerJob | null
+      try {
+        server = await getJob(id)
+      } catch {
+        continue // could not ask; try again on the next tick
+      }
+      if (!current()) continue
+
+      if (server && (server.status === 'pending' || server.status === 'in_progress')) {
+        f.sighted = true
+        f.misses = 0
+        continue
+      }
+      if (server) {
+        if (await reconcileOne(id)) continue
+        if (!current()) continue
+        f.misses = 0
+        f.terminalWaits += 1
+        if (f.terminalWaits < LOST_TERMINAL_WAITS) continue
+        f.lose(
+          new LostJob(
+            'ComfyUI says this job has ended but never sent the result. Look in the archive: the file may be on disk anyway.',
+            id,
+          ),
+        )
+        continue
+      }
+      f.lose(
+        new LostJob(
+          'We lost track of this job. ComfyUI has no record of it any more, which usually means it restarted. Nothing was saved.',
+          id,
+        ),
+      )
+    }
+  } finally {
+    lostChecking = false
+  }
+}
+
+/**
  * Submit and follow a workflow to the end.
  *
  * Resolves with the produced files. Rejects with a {@link ComfyError}; check
- * `err.cancelled` to tell a deliberate stop from a failure.
+ * `err.cancelled` to tell a deliberate stop from a failure. Rejects with a
+ * {@link LostJob} when ComfyUI no longer knows the job, so no caller has to
+ * race its own watch against this promise.
  *
  * Concurrent calls are safe — that is the whole point of the shared socket.
  * There is no AbortSignal: cancellation is `cancelJob(promptId)`, which is the
@@ -733,6 +910,7 @@ export function watch(promptId: string, on: Listener): () => void {
 export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Promise<OutputFile[]> {
   return new Promise<OutputFile[]>((resolve, reject) => {
     let stop: (() => void) | null = null
+    let unfollow: (() => void) | null = null
     let promptId: string | null = null
     let settled = false
 
@@ -740,6 +918,7 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
       if (settled) return
       settled = true
       stop?.()
+      unfollow?.()
       fn()
     }
 
@@ -771,6 +950,7 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
             /* as above */
           }
         }
+        if (!settled) unfollow = followForLoss(id, (err) => finish(() => reject(err)))
       },
       (err) => finish(() => reject(err)),
     )
@@ -787,6 +967,12 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
  * @returns true when the server actually stopped something. False means the
  *          job had already finished — treat that as success, not an error.
  *
+ * A job that was still waiting is settled here, as stopped, because nothing
+ * else ever will: dequeuing sends no message naming the prompt, only the new
+ * queue length, and writes no /history record. A running job is left to its
+ * `execution_interrupted`, because the interrupt only lands at ComfyUI's next
+ * check for it, and a job on its last node can still finish and save first.
+ *
  * Fallback: on a ComfyUI old enough not to route /api/jobs at all (the request
  * 404s, which the real endpoint never does for an unknown id) we fall back to
  * `POST /interrupt` — but ONLY when the prompt is the one currently executing,
@@ -799,7 +985,9 @@ export async function cancelJob(promptId: string): Promise<boolean> {
   })
   if (r.ok) {
     const body = await r.json().catch(() => null)
-    return Boolean(body?.cancelled)
+    const cancelled = Boolean(body?.cancelled)
+    if (cancelled) void settleIfDequeued(promptId)
+    return cancelled
   }
   if (r.status === 404 || r.status === 405) {
     if (executingPrompt !== promptId) return false
@@ -807,6 +995,26 @@ export async function cancelJob(promptId: string): Promise<boolean> {
     return legacy.ok
   }
   throw new ComfyError(`ComfyUI would not stop that job (HTTP ${r.status}).`, { promptId })
+}
+
+/**
+ * After a successful cancel, find out which kind it was. The server's answer
+ * is the same `{cancelled: true}` for both, so ask about the job itself: a
+ * dequeued job is gone without a trace, a running one is still listed until
+ * the interrupt lands, and one that has already ended has a record to settle
+ * from.
+ */
+async function settleIfDequeued(promptId: string): Promise<void> {
+  const st = prompts.get(promptId)
+  if (!st || st.terminal) return
+  let server: ServerJob | null
+  try {
+    server = await getJob(promptId)
+  } catch {
+    return // could not ask; the lost-job watch in run() still has it
+  }
+  if (server === null) void settle(promptId, STOPPED)
+  else if (server.status !== 'pending' && server.status !== 'in_progress') void reconcileOne(promptId)
 }
 
 /** The server's own view of the queue. */
@@ -825,10 +1033,17 @@ export async function listJobs(
   }
 }
 
-/** One job by id, or null when the server has never heard of it. */
+/**
+ * One job by id, or null when the server has never heard of it.
+ *
+ * Only a 404 means that. Any other failure throws, because a proxy that
+ * cannot reach ComfyUI answers 502, and reading that as "no such job" would
+ * report a job lost while the server was merely down.
+ */
 export async function getJob(promptId: string): Promise<ServerJob | null> {
   const r = await fetch(`${HTTP}/api/jobs/${encodeURIComponent(promptId)}`)
-  if (!r.ok) return null
+  if (r.status === 404) return null
+  if (!r.ok) throw new Error(`/api/jobs/${promptId} -> HTTP ${r.status}`)
   return (await r.json()) as ServerJob
 }
 

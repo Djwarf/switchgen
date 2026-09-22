@@ -24,7 +24,7 @@
  * entry in the ledger, numbered, and the slug reads "Shot 3 of 8".
  */
 import { useEffect, useState } from 'react'
-import { Shell, go, jobs, parseRoute, useRoute } from './components/shell'
+import { Shell, go, jobs, parseRoute, useRoute, type JobDesk } from './components/shell'
 import { Player } from './components/player/Player'
 import { posterUrl } from './components/archive/Poster'
 import { startArchiveSync } from './lib/archiveSync'
@@ -145,10 +145,12 @@ type Reported = {
 }
 
 type Bridge = {
-  desk: 'images' | 'video'
+  desk: JobDesk
   kind: 'image' | 'video'
   subscribe: (fn: () => void) => () => void
   read: () => Reported[]
+  /** The desk's own stop, for a desk where one job is not the whole story. */
+  stop?: () => void
   /**
    * Desk job id → ledger job id, kept on the bridge rather than inside the
    * mirror, so that a remount — StrictMode's double effect in development, or
@@ -226,11 +228,17 @@ const videoBridge: Bridge = {
  * not reported; the ledger is a record of work in flight, not of intent. The
  * label carries the shot's place in the reel, because "Wan 2.2 5B" three times
  * over tells a reader nothing about how far along the queue is.
+ *
+ * Stopping a shot from the section bar goes through the reel's own stop,
+ * which stops the walk as well as the shot. A bare cancel of the shot's prompt
+ * stops only the prompt: land it just as the shot finishes and the reel goes
+ * straight on to the next one.
  */
 const reelBridge: Bridge = {
-  desk: 'video',
+  desk: 'reel',
   kind: 'video',
   subscribe: reelRun.subscribe,
+  stop: () => reelRun.stop(),
   read: () => {
     const run = reelRun.snapshot()
     const out: Reported[] = []
@@ -279,6 +287,7 @@ function mirror(bridge: Bridge): () => void {
           prompt: report.prompt,
           promptId: report.promptId,
           steps: report.max || undefined,
+          stop: bridge.stop,
         })
         seen.set(report.key, id)
       }

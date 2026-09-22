@@ -40,11 +40,15 @@ export function Offline() {
       if (shown) setShown(false)
       if (wasDown.current) {
         wasDown.current = false
+        // Nothing has been checked yet when this posts, and a common outage
+        // here is ComfyUI being killed and restarted, which forgets every job
+        // it had. So it promises nothing about that work; each desk reports
+        // what became of its own job once the server has been asked.
         postNotice({
           key: 'connection',
           tone: 'success',
           title: 'Back',
-          body: 'The server is answering again. Anything that was running has been picked up.',
+          body: 'The server is answering again. If it restarted, any job it had is gone, and the desk that sent it will say so.',
           ttl: 5000,
         })
       }

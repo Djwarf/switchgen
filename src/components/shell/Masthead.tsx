@@ -93,12 +93,23 @@ export function Masthead({
 // ---------------------------------------------------------------------------
 
 /**
+ * Tailwind's `sm`, which is where `DeviceLine` starts to show anything; below
+ * it the dateline is the date.
+ */
+const READOUT_QUERY = '(min-width: 40rem)'
+
+/**
  * The machine, read aloud once a second.
  *
  * `lib/hardware.ts` streams CPU, RAM, the card and the disk over SSE. This is
  * a courtesy, not a fact the page depends on: when the stream never opens, or
  * stops answering, the dateline quietly carries the one-shot probe line it was
  * given instead, and nothing is said about the loss.
+ *
+ * The stream is open only while the readout can be seen: the tab is in front
+ * and the screen is wide enough to show it. Each open stream makes the server
+ * run nvidia-smi and df once a second, and a phone would otherwise keep its
+ * radio awake for figures it hides.
  */
 function useDeviceStatus(): DeviceStatus | null {
   const [status, setStatus] = useState<DeviceStatus | null>(null)
@@ -106,27 +117,55 @@ function useDeviceStatus(): DeviceStatus | null {
   useEffect(() => {
     let live = true
     let last = 0
+    let stop: (() => void) | null = null
+    let watch: ReturnType<typeof setInterval> | null = null
+    const wide = typeof window.matchMedia === 'function' ? window.matchMedia(READOUT_QUERY) : null
 
-    const stop = subscribeDeviceStatus((s) => {
-      if (!live) return
-      last = Date.now()
-      setStatus(s)
-    })
+    const close = () => {
+      if (watch !== null) clearInterval(watch)
+      watch = null
+      stop?.()
+      stop = null
+      last = 0
+    }
 
-    // A frozen readout is a lie told in figures. Five seconds of silence on a
-    // one-second stream means the wire is gone, so the line falls back rather
-    // than standing there insisting the card is still at 93%.
-    const watch = setInterval(() => {
-      if (live && last > 0 && Date.now() - last > 5000) {
-        last = 0
+    const open = () => {
+      if (stop) return
+      stop = subscribeDeviceStatus((s) => {
+        if (!live) return
+        last = Date.now()
+        setStatus(s)
+      })
+      // A frozen readout is a lie told in figures. Five seconds of silence on
+      // a one-second stream means the wire is gone, so the line falls back
+      // rather than standing there insisting the card is still at 93%.
+      watch = setInterval(() => {
+        if (live && last > 0 && Date.now() - last > 5000) {
+          last = 0
+          setStatus(null)
+        }
+      }, 2000)
+    }
+
+    const sync = () => {
+      if (document.visibilityState === 'visible' && (wide?.matches ?? true)) {
+        open()
+      } else if (stop) {
+        close()
+        // Figures from before the pause are not this second's figures.
         setStatus(null)
       }
-    }, 2000)
+    }
+
+    sync()
+    document.addEventListener('visibilitychange', sync)
+    wide?.addEventListener('change', sync)
 
     return () => {
       live = false
-      clearInterval(watch)
-      stop()
+      document.removeEventListener('visibilitychange', sync)
+      wide?.removeEventListener('change', sync)
+      close()
     }
   }, [])
 
