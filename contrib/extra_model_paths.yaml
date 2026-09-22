@@ -1,0 +1,34 @@
+# Drop this in ComfyUI's root as extra_model_paths.yaml, with base_path set to
+# the same folder as SWITCHGEN_MODELS. The folder names below are the ones the
+# app and its catalogue write to and look in; keep them as they are.
+models:
+    base_path: /mnt/storage/ai/models
+    is_default: true
+    checkpoints: |
+       Stable-Diffusion
+    diffusion_models: |
+       diffusion_models
+       unet
+    vae: |
+       VAE
+    loras: |
+       Lora
+    clip: |
+       text_encoders
+    clip_vision: |
+       clip_vision
+    controlnet: |
+       controlnet
+    embeddings: |
+       Embeddings
+    upscale_models: |
+       upscale_models
+    # The Impact Subpack finds its detectors through these three.
+    ultralytics: |
+       ultralytics
+    ultralytics_bbox: |
+       ultralytics/bbox
+    ultralytics_segm: |
+       ultralytics/segm
+    sams: |
+       sams

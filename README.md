@@ -11,6 +11,69 @@ the rest from measured runs, printing what it decided and why under the
 button. And nothing claims what was not measured: every strength, ratio and
 cost on screen is read off a run, a graph or a probe, and the copy says which.
 
+## Getting started
+
+You need a machine with an NVIDIA card, Node 22 or later, and ComfyUI. The app
+was built and measured on a 16 GB RTX 5060 Ti with 32 GB of RAM; smaller cards
+run the smaller families, and the desk says which fit before you press.
+
+### 1. Install ComfyUI
+
+ComfyUI 0.37 or later, in its own Python venv, with three node packs the
+graphs depend on:
+
+| Pack | Provides |
+|---|---|
+| [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) | `UnetLoaderGGUF`, `CLIPLoaderGGUF`: every quantised family |
+| [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack) | `FaceDetailer`: the face and hand passes |
+| [ComfyUI-Impact-Subpack](https://github.com/ltdrdata/ComfyUI-Impact-Subpack) | `UltralyticsDetectorProvider`: the detectors those passes use |
+
+Everything else the graphs use ships with ComfyUI. `npm run validate` names
+any node that is missing.
+
+Point ComfyUI at a model library with the folder layout the app expects:
+copy `contrib/extra_model_paths.yaml` into ComfyUI's root and set `base_path`.
+The folders are `Stable-Diffusion`, `diffusion_models`, `text_encoders`,
+`VAE`, `Lora`, `ultralytics/bbox`, `ultralytics/segm` and, for the picture
+reader, `wd14`. Start ComfyUI with `--output-directory` pointing at the folder
+the app should file outputs from. `contrib/comfyui.service` is a systemd user
+unit that does this, which lets the launcher start ComfyUI on demand:
+
+```bash
+cp contrib/comfyui.service ~/.config/systemd/user/   # then edit the two paths
+systemctl --user daemon-reload && systemctl --user enable --now comfyui
+```
+
+Optional, each probed and reported rather than assumed: `aria2c` for
+downloads from the catalogue, `ffmpeg` and `ffprobe` for joining a reel, and
+`onnxruntime` plus `ultralytics` in the ComfyUI venv for the picture reader.
+
+### 2. Install the app
+
+```bash
+git clone git@github.com:Djwarf/switchgen.git
+cd switchgen
+cp .env.example .env            # set the models and outputs folders, and COMFY_URL
+npm install
+npm run validate                # every graph against your ComfyUI's live schema
+bin/switchgen install           # links the launcher into ~/.local/bin
+switchgen                       # builds, starts ComfyUI if it can, serves on :5273
+```
+
+The desk offers only families whose files are installed and fit in memory.
+Fetch the rest from the catalogue behind More, which shows each family's
+missing files, their size and the server's fit verdict. Add-ons are indexed
+from your own LoRA folder with `npm run index-loras`, which reads each file's
+header and rewrites `src/lib/loraIndex.ts`; the checked-in index describes
+the folder this was built against.
+
+### 3. Use it from a phone
+
+The app binds every interface. `localhost`, this machine's hostname and
+addresses, and any `*.ts.net` name are allowed; add anything else to
+`SWITCHGEN_ALLOWED_HOSTS`. Open it once on the phone and add it to the home
+screen: it installs as an app, and the archive is the same on every device.
+
 ## The four rooms
 
 | Room | Hash | What it does |
@@ -61,11 +124,14 @@ probes the binaries below and reports what actually runs.
 
 ### Environment
 
-Every path has a default and an override.
+Every path has a default and an override. The launcher reads them from a
+`.env` file beside `package.json`; `.env.example` lists them all.
 
 | Variable | Default | Used by |
 |---|---|---|
 | `COMFY_URL` | `http://127.0.0.1:8188` | the Vite proxy, `validate`, `chain-e2e` |
+| `SWITCHGEN_PORT` | `5273` | where the app listens |
+| `SWITCHGEN_ALLOWED_HOSTS` | empty | extra hostnames the app may be reached by, comma separated |
 | `SWITCHGEN_MODELS` | `/mnt/storage/ai/models` | api, downloads, vision |
 | `SWITCHGEN_OUTPUTS` | `/mnt/storage/ai/outputs` | api, archive, reel, vision |
 | `SWITCHGEN_ARCHIVE` | `<outputs>/.switchgen/archive.json` | archive |
@@ -81,15 +147,17 @@ Every path has a default and an override.
 ## Usage
 
 ```bash
-switchgen          # start ComfyUI if needed, serve the built app on :5273, open a browser
-switchgen dev      # hot-reloading dev server
-switchgen validate # check every graph and derivation against ComfyUI's live schema
+switchgen            # start ComfyUI if needed, build if anything changed, serve on :5273, open a browser
+switchgen --no-open  # the same without opening a browser
+switchgen dev        # hot-reloading dev server
+switchgen validate   # check every graph and derivation against ComfyUI's live schema
 switchgen stop
 ```
 
-The launcher builds `dist/` only when it is missing. After changing the
-source, run `npm run build` (or `switchgen build`) before `switchgen`, or the
-old build is what gets served.
+The launcher lives at `bin/switchgen`, reads `.env` beside `package.json`,
+and rebuilds whenever a source file is newer than the last build. Changes to
+`server/*.mjs` need a restart (`switchgen stop && switchgen`), because the
+middlewares are loaded when the server starts.
 
 ## Model families
 
@@ -180,19 +248,24 @@ page says so and offers to fetch it.
 
 ## Runtime dependencies
 
-ComfyUI 0.37 or later on `:8188`; `nvidia-smi` and GNU `df` for the hardware
-line; `aria2c` for downloads; `ffmpeg` and `ffprobe` for the reel; the ComfyUI
+Node 22 or later. ComfyUI 0.37 or later on `:8188` with the three node packs
+under Getting started; `nvidia-smi` and GNU `df` for the hardware line;
+`aria2c` for downloads; `ffmpeg` and `ffprobe` for the reel; the ComfyUI
 venv's Python with `onnxruntime`, `numpy`, `Pillow` and `ultralytics` for the
 reader. Each is probed, and a feature whose binary is missing stands down with
 a sentence rather than failing later.
 
 ## Network posture
 
-Vite binds every interface and `vite.config.ts` allows the LAN address and
-the tailnet, so the app is reachable from a phone. There is no login. The
+Vite binds every interface and allows this machine's hostname and addresses
+and the tailnet, so the app is reachable from a phone. There is no login. The
 same-origin guard stops a page on another origin from driving the write
 routes from a browser, and every file path is confined to its root after
 `realpath`. That is the whole of it: keep the server on a private network.
+
+## License
+
+MIT. See `LICENSE`.
 
 ## Adding a family
 

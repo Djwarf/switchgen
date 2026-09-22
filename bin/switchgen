@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# SwitchGen launcher. Works from any checkout: paths are taken from where
+# this script lives, and every setting can be overridden in a .env file
+# beside package.json or in the environment. See README.md.
+set -euo pipefail
+
+APP="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+cd "$APP"
+
+# .env is sourced so the server middlewares see SWITCHGEN_* and COMFY_URL.
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
+
+COMFY_URL="${COMFY_URL:-http://127.0.0.1:8188}"
+PORT="${SWITCHGEN_PORT:-5273}"
+URL="http://localhost:${PORT}"
+
+comfy_up() { curl -sf -o /dev/null "$COMFY_URL/system_stats"; }
+
+ensure_comfy() {
+  if comfy_up; then return; fi
+  if systemctl --user cat comfyui >/dev/null 2>&1; then
+    systemctl --user start comfyui
+    printf "Waiting for ComfyUI at %s" "$COMFY_URL"
+    for _ in $(seq 1 90); do comfy_up && break; printf "."; sleep 1; done
+    echo " up"
+  else
+    cat >&2 <<MSG
+ComfyUI is not answering at $COMFY_URL and there is no user service to start.
+Start it yourself (see README.md, "Install ComfyUI"), or install the sample
+unit: cp contrib/comfyui.service ~/.config/systemd/user/ and edit the paths.
+The app will open anyway and retry every few seconds.
+MSG
+  fi
+}
+
+# The old launcher built only when dist/ was missing, so every change was
+# served stale until someone remembered. Now anything newer than the last
+# build triggers one.
+needs_build() {
+  [ -f dist/index.html ] || return 0
+  [ -n "$(find src server public index.html vite.config.ts package.json -newer dist/index.html -print -quit 2>/dev/null)" ]
+}
+
+case "${1:-start}" in
+  start|"")
+    [ -d node_modules ] || npm install
+    ensure_comfy
+    if needs_build; then echo "Building."; npm run build; fi
+    nohup npm run preview >/tmp/switchgen-preview.log 2>&1 &
+    for _ in $(seq 1 30); do curl -sf -o /dev/null "$URL" && break; sleep 1; done
+    echo "SwitchGen: $URL"
+    if [ -z "${SWITCHGEN_NO_OPEN:-}" ] && [ "${2:-}" != "--no-open" ]; then
+      command -v xdg-open >/dev/null && xdg-open "$URL" >/dev/null 2>&1 || true
+    fi
+    ;;
+  dev)
+    [ -d node_modules ] || npm install
+    ensure_comfy
+    npm run dev
+    ;;
+  build)    npm run build ;;
+  validate) npm run validate ;;
+  stop)
+    pkill -f "[v]ite preview" 2>/dev/null || true
+    echo "SwitchGen stopped (ComfyUI left running)"
+    ;;
+  install)
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$APP/bin/switchgen" "$HOME/.local/bin/switchgen"
+    echo "Linked $HOME/.local/bin/switchgen -> $APP/bin/switchgen"
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "Add $HOME/.local/bin to your PATH." ;; esac
+    ;;
+  *) echo "usage: switchgen {start [--no-open]|dev|build|validate|stop|install}"; exit 1 ;;
+esac

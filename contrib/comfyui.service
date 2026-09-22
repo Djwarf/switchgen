@@ -1,0 +1,27 @@
+# A systemd user unit for ComfyUI, so `switchgen` can start it on demand.
+#
+#   cp contrib/comfyui.service ~/.config/systemd/user/
+#   edit the two paths below
+#   systemctl --user daemon-reload && systemctl --user enable --now comfyui
+#
+# --output-directory must match SWITCHGEN_OUTPUTS, and the models root must be
+# wired into ComfyUI through extra_model_paths.yaml (see contrib/).
+[Unit]
+Description=ComfyUI - AI image and video generation
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ComfyUI
+ExecStart=%h/ComfyUI/venv/bin/python main.py \
+  --port 8188 \
+  --output-directory %h/ai/outputs \
+  --preview-method auto \
+  --disable-smart-memory
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

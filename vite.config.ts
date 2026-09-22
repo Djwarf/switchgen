@@ -1,3 +1,4 @@
+import os from 'node:os'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -31,19 +32,25 @@ const proxy = {
 // Reachable from the LAN and over Tailscale, not just this machine.
 // Vite binds to loopback by default, and separately refuses requests whose Host
 // header it does not recognise (DNS-rebinding protection) - so binding alone is
-// not enough: the hostnames have to be allowed too.
+// not enough: the hostnames have to be allowed too. Nothing here is specific to
+// one machine: the hostname and the addresses are read at start, any tailnet
+// name is allowed, and SWITCHGEN_ALLOWED_HOSTS adds the rest.
 const host = true // 0.0.0.0 + [::]
+const ownAddresses = Object.values(os.networkInterfaces())
+  .flat()
+  .filter((i): i is os.NetworkInterfaceInfo => !!i && !i.internal && i.family === 'IPv4')
+  .map((i) => i.address)
 const allowedHosts = [
   'localhost',
-  'freya',
-  'freya.tail8bf383.ts.net', // Tailscale MagicDNS
-  '.ts.net',                 // any host on the tailnet
-  '192.168.1.12',
-  '100.93.117.89',
+  os.hostname(),
+  '.ts.net', // any host on the tailnet (Tailscale MagicDNS)
+  ...ownAddresses,
+  ...(process.env.SWITCHGEN_ALLOWED_HOSTS ?? '').split(',').map((h) => h.trim()).filter(Boolean),
 ]
+const port = Number(process.env.SWITCHGEN_PORT) || 5273
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), switchgenApi(), switchgenArchive(), switchgenDownloads(), switchgenReel(), switchgenVision()],
-  server: { host, port: 5273, proxy, allowedHosts },
-  preview: { host, port: 5273, proxy, allowedHosts },
+  server: { host, port, proxy, allowedHosts },
+  preview: { host, port, proxy, allowedHosts },
 })
