@@ -248,10 +248,10 @@ function mergeBindings(
 // ---------------------------------------------------------------------------
 
 /** VAE spatial downsample factor. Every model installed here uses 8. */
-export const VAE_STRIDE = 8
+const VAE_STRIDE = 8
 
 /** Latent cells a frame of this pixel size gets. */
-export function latentCells(width: number, height: number): number {
+function latentCells(width: number, height: number): number {
   return Math.floor(width / VAE_STRIDE) * Math.floor(height / VAE_STRIDE)
 }
 
@@ -296,7 +296,7 @@ export function detailGain(
 export const REFINE_DENOISE = { min: 0.35, max: 0.55, default: 0.45 } as const
 
 /** Upscale model, verified present in UpscaleModelLoader.model_name. */
-export const UPSCALE_MODEL = '4x-UltraSharp.pth'
+const UPSCALE_MODEL = '4x-UltraSharp.pth'
 
 /** Detector files, verified present in UltralyticsDetectorProvider.model_name. */
 export const DETECTORS = {
@@ -788,7 +788,7 @@ export function deriveAutoDetail(
 // Hires fix
 // ---------------------------------------------------------------------------
 
-export const HIRES_DEFAULTS = { scale: 1.5, denoise: 0.45 } as const
+const HIRES_DEFAULTS = { scale: 1.5, denoise: 0.45 } as const
 
 /**
  * Two pass generation: sample at the family's native size, upscale the LATENT,
@@ -1051,7 +1051,7 @@ function upstreamLoader(graph: Graph, from: unknown): string | null {
  * 0) is the high-noise half; the other is the low. Read off the samplers
  * rather than the filenames, with the filenames as the fallback.
  */
-export function videoLoraSlots(def: FamilyDef | DerivedDef): VideoLoraSlots | null {
+function videoLoraSlots(def: FamilyDef | DerivedDef): VideoLoraSlots | null {
   const loaders = findModelLoaders(def.graph)
   if (!def.dualModel && loaders.length === 1) return { kind: 'single', loader: loaders[0] }
   if (!def.dualModel || loaders.length !== 2) return null
@@ -1130,21 +1130,6 @@ export function withVideoLoras(def: FamilyDef | DerivedDef, specs: VideoLoraSpec
     bindings: { ...def.bindings },
     derived,
   }
-}
-
-/** Rewrite one LoRA's strengths in a built graph, without re deriving it. */
-export function setLoraStrength(
-  wf: ApiWorkflow,
-  def: DerivedDef,
-  index: number,
-  strength: number,
-  clipStrength?: number,
-): void {
-  const id = def.derived.loraNodes[index]
-  const node = id ? wf[id] : undefined
-  if (!node) return
-  node.inputs.strength_model = strength
-  if ('strength_clip' in node.inputs) node.inputs.strength_clip = clipStrength ?? strength
 }
 
 // ---------------------------------------------------------------------------

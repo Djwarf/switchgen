@@ -186,22 +186,13 @@ export const MODES: Record<DeskId, readonly Mode[]> = {
 }
 
 /** Which desk a mode belongs to. A video record can never land in Pictures. */
-export function deskOf(mode: Mode): DeskId {
+function deskOf(mode: Mode): DeskId {
   return mode === 't2v' || mode === 'i2v' ? 'video' : 'images'
 }
 
 /** True when the mode needs a source picture before it can run. */
 export function needsSource(mode: Mode): boolean {
   return mode === 'i2i' || mode === 'edit' || mode === 'i2v'
-}
-
-/** Plain labels, for the source tabs and for the archive's facets. */
-export const MODE_LABEL: Record<Mode, string> = {
-  t2i: 'From words',
-  i2i: 'From a picture',
-  edit: 'Change a picture',
-  t2v: 'From words',
-  i2v: 'From a picture',
 }
 
 /**
@@ -318,7 +309,7 @@ export type Composition = {
  * loader can check a stored `touched` array against the same thing the type
  * system checks against, and the two can never drift apart.
  */
-export const TUNABLE_FIELDS = [
+const TUNABLE_FIELDS = [
   'negative',
   'positivePrefix',
   'width',
@@ -429,7 +420,7 @@ export function applyDefaults(c: Composition, d: FamilyDefaults): Composition {
 }
 
 /** Record that the reader set a field by hand. Idempotent. */
-export function markTouched(c: Composition, ...fields: TunableField[]): Composition {
+function markTouched(c: Composition, ...fields: TunableField[]): Composition {
   const next = new Set(c.touched)
   for (const f of fields) next.add(f)
   return next.size === c.touched.length ? c : { ...c, touched: [...next] }
@@ -831,7 +822,7 @@ export function deskStore(desk: DeskId): DeskStore {
 // Settings
 // ---------------------------------------------------------------------------
 
-export const SETTINGS_KEY = 'switchgen.settings.v1'
+const SETTINGS_KEY = 'switchgen.settings.v1'
 
 export type Settings = {
   /** All controls, rather than the five that matter. */

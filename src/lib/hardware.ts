@@ -52,7 +52,7 @@ export type Footprint = {
   unknown: string[]
 }
 
-export function footprintOf(def: FamilyDef, sizes: Map<string, ModelFile>): Footprint {
+function footprintOf(def: FamilyDef, sizes: Map<string, ModelFile>): Footprint {
   const names = new Set<string>()
   for (const node of Object.values(def.graph)) {
     for (const k of ['ckpt_name', 'unet_name', 'clip_name', 'vae_name', 'lora_name'] as const) {

@@ -23,7 +23,7 @@ export type Fault = {
 }
 
 /** The per-node complaints, flattened into one line. */
-export function nodeErrorDetail(nodeErrors: Record<string, unknown> | null | undefined): string | null {
+function nodeErrorDetail(nodeErrors: Record<string, unknown> | null | undefined): string | null {
   if (!nodeErrors) return null
   const lines = Object.values(nodeErrors).flatMap((n) => {
     const errs = (n as { errors?: { message?: string; details?: string }[] })?.errors ?? []

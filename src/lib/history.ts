@@ -31,9 +31,9 @@ export type { FileRef, DeskId, Mode }
 // The record
 // ---------------------------------------------------------------------------
 
-export const HISTORY_KEY = 'switchgen.archive.v2'
-export const BROKEN_KEY = 'switchgen.archive.v2.broken'
-export const HISTORY_VERSION = 2
+const HISTORY_KEY = 'switchgen.archive.v2'
+const BROKEN_KEY = 'switchgen.archive.v2.broken'
+const HISTORY_VERSION = 2
 
 /**
  * How many records are kept. Roughly 800 bytes for a picture and 1.1 KB for a
@@ -41,7 +41,7 @@ export const HISTORY_VERSION = 2
  * and about two years of heavy use. Beyond the cap the oldest unstarred
  * records fall off the end.
  */
-export const MAX_ENTRIES = 5000
+const MAX_ENTRIES = 5000
 
 /** How many unstarred records are shed when the browser reports a full quota. */
 const EVICT_ON_QUOTA = 200
@@ -770,7 +770,7 @@ export type DeleteResult =
  * The record is dropped only when the file actually went, so a failed delete
  * never loses you the settings.
  */
-export async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
+async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
   let res: Response
   try {
     res = await fetch('/api/delete', {
@@ -858,7 +858,7 @@ let indexCache = new WeakMap<HistoryEntry, string>()
  * was fixed, told there were no such records. The same for the second and third
  * file of a multi-picture run, which the archive holds but did not index.
  */
-export function searchIndex(e: HistoryEntry): string {
+function searchIndex(e: HistoryEntry): string {
   const cached = indexCache.get(e)
   if (cached !== undefined) return cached
   const built = [

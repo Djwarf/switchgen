@@ -11,6 +11,7 @@
  * locked down. Losing a reel of ten written lines to a reload would be worse
  * than losing a prompt, so this is saved the moment typing pauses.
  */
+import { REEL_PREFIX } from '../../lib/continuation'
 import { useSyncExternalStore } from 'react'
 import { store as kv, randomSeed } from '../../lib/session'
 
@@ -95,7 +96,7 @@ export function blankDraft(): ReelDraft {
     seedLocked: false,
     anchor: null,
     reanchorEvery: 0,
-    prefix: 'switchgen/reel',
+    prefix: REEL_PREFIX,
     // Empty on purpose: the desk prints an invitation, not three blank rows.
     shots: [],
   }

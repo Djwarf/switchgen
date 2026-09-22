@@ -45,11 +45,10 @@
  *
  * There is one soft middle: a prompt written as prose ("a woman kneeling on a
  * bed in evening light") uses none of the booru vocabulary these LoRAs were
- * trained on, and plain string matching is at its weakest there. When a local
- * LLM is reachable it is asked to rewrite that prose as booru tags, and the
- * reply is then intersected with the index vocabulary so nothing invented can
- * reach the ranking. Nothing is listening on the usual ports today, so that path
- * is optional, cheap to probe, and silent when absent. See {@link suggestAsync}.
+ * trained on, and plain string matching is at its weakest there. A local LLM
+ * used to be probed to rewrite such prose as tags; nothing ever listened on
+ * the ports it tried, so that path is gone. The picture reader in vision.ts
+ * covers the case from the other side: it tags the picture, not the prose.
  *
  *
  * THE BLIND SPOT, SAID OUT LOUD.
@@ -103,7 +102,7 @@ import {
  * one measurement of one stack on one checkpoint, not a law, so the third slot
  * is allowed and flagged rather than forbidden.
  */
-export const STACK_CAP = {
+const STACK_CAP = {
   /** Hard ceiling on what {@link suggest} will put in `stack`. */
   max: 3,
   /** Past this, every further suggestion carries a caution. */
@@ -112,16 +111,12 @@ export const STACK_CAP = {
     'Two measured LoRAs came out at 1.14x base sharpness. Adding a third took the same stack to 0.92x, which is below no LoRA at all. Both runs were made without trigger words, so both are floors.',
 } as const
 
-/** Sharpness is not correctness, and the copy here never says it is. */
-export const METRIC_CAVEAT =
-  'Laplacian variance measures sharpness, not anatomical correctness. A LoRA can draw a hand right and soften the skin around it, and this metric calls that a loss.'
-
 /**
  * The trigger measurement, in one place, so every sentence that cites it cites
  * the same numbers. Transcribed from the run described at the top of this file
  * and of ./loraIndex, not retyped from memory.
  */
-export const MEASURED_TRIGGER = {
+const MEASURED_TRIGGER = {
   file: 'add-micro-details-concept-illustrious-pony-noobai.safetensors',
   measuredOn: 'ponyDiffusionV6XL.safetensors',
   strength: 0.6,
@@ -221,12 +216,6 @@ export type SuggestInput = {
   installed?: InstalledLoras
   /** The one anatomy control. Omitted, treated as 'natural'. */
   anatomy?: AnatomyLevel
-  /**
-   * Booru tags some outside source read out of the prompt. {@link suggestAsync}
-   * fills this from a local LLM when one is reachable. They are scored at a
-   * discount and every hit they produce is labelled as inferred.
-   */
-  inferred?: string[]
   /** Files already in the user's stack. Not re-suggested, and counted against the cap. */
   already?: string[]
   /** Length of `ranked`. The cap on `stack` is {@link STACK_CAP}, separately. */
@@ -237,7 +226,6 @@ export type SuggestReason =
   /** The prompt uses words this LoRA was trained on. */
   | 'prompt'
   /** A local model rewrote the prompt as tags, and those matched. */
-  | 'inferred'
   /** Proposed on a measurement rather than on prompt overlap. */
   | 'measured'
   /** The anatomy control asked for it. */
@@ -257,8 +245,8 @@ export type SuggestHit = {
   /** Share of this LoRA's training images captioned with it, 0 to 1. */
   share: number
   via: 'trigger' | 'concept'
-  /** Whether the tag came from the user's text or from an inferred rewrite. */
-  source: 'prompt' | 'inferred'
+  /** Where the tag came from. Only the reader's own text, now. */
+  source: 'prompt'
 }
 
 export type Suggestion = {
@@ -310,8 +298,6 @@ export type SuggestResult = {
   notes: string[]
   /** How many installed files carry no tag data and so can never be ranked here. */
   blindSpot: number
-  /** True when an inferred rewrite contributed to the ranking. */
-  usedInferred: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -342,9 +328,6 @@ const COMPAT: Partial<Record<LoraArch, Compat>> = {
 
 /** Weight on a lineage crossing. Half the effect is the honest guess; 0.75 is the score discount. */
 const LINEAGE_FACTOR = 0.75
-
-/** How much an inferred tag counts against a tag the user actually typed. */
-const INFERRED_WEIGHT = 0.6
 
 /**
  * Below this, a candidate is one incidental tag that under a quarter of its
@@ -573,7 +556,7 @@ function triggerSentence(entry: LoraIndexEntry): string {
  *
  * The score is
  *
- *     (prompt hits + 0.6 x inferred hits) x base factor x confidence factor x level factor
+ *     prompt hits x base factor x confidence factor x level factor
  *
  * and every one of those four is visible in the returned object: `hits` carries
  * the tags and their training shares, `cautions` carries the base crossing and
@@ -606,7 +589,6 @@ export function suggest(input: SuggestInput): SuggestResult {
       rejected,
       notes,
       blindSpot: withoutTriggerData().length,
-      usedInferred: false,
     }
   }
 
@@ -617,40 +599,25 @@ export function suggest(input: SuggestInput): SuggestResult {
   const bases = compat ? [...compat.exact, ...compat.lineage] : undefined
   const exact = new Set(compat?.exact ?? [])
 
-  // Two passes over the index: the user's own words, then anything inferred from
-  // them. Kept apart so a hit can say where it came from instead of blending a
-  // model's guess into a fact about the file.
+  // One pass over the index: the reader's own words against each file's
+  // training vocabulary.
   const fromPrompt = matchPrompt(prompt, { bases, minScore: 0 })
-  const inferredText = (input.inferred ?? []).join(', ')
-  const fromInferred = inferredText ? matchPrompt(inferredText, { bases, minScore: 0 }) : []
 
   type Bucket = { entry: LoraIndexEntry; relevance: number; hits: SuggestHit[] }
   const buckets = new Map<string, Bucket>()
 
-  const absorb = (
-    matches: ReturnType<typeof matchPrompt>,
-    source: 'prompt' | 'inferred',
-    weight: number,
-  ) => {
-    for (const m of matches) {
-      let bucket = buckets.get(m.entry.file)
-      if (!bucket) {
-        bucket = { entry: m.entry, relevance: 0, hits: [] }
-        buckets.set(m.entry.file, bucket)
-      }
-      bucket.relevance += m.score * weight
-      for (const h of m.hits) {
-        // A tag the user typed outranks the same tag guessed for them.
-        if (bucket.hits.some(existing => existing.tag === h.tag)) continue
-        bucket.hits.push({ tag: h.tag, share: h.share, via: h.via, source })
-      }
+  for (const m of fromPrompt) {
+    let bucket = buckets.get(m.entry.file)
+    if (!bucket) {
+      bucket = { entry: m.entry, relevance: 0, hits: [] }
+      buckets.set(m.entry.file, bucket)
+    }
+    bucket.relevance += m.score
+    for (const h of m.hits) {
+      if (bucket.hits.some(existing => existing.tag === h.tag)) continue
+      bucket.hits.push({ tag: h.tag, share: h.share, via: h.via, source: 'prompt' })
     }
   }
-
-  absorb(fromPrompt, 'prompt', 1)
-  absorb(fromInferred, 'inferred', INFERRED_WEIGHT)
-
-  const usedInferred = fromInferred.length > 0
 
   // The staples and the anatomy level: candidates justified by a run rather than
   // by prompt overlap, which is how the one LoRA that was actually measured gets
@@ -818,8 +785,7 @@ export function suggest(input: SuggestInput): SuggestResult {
 
   for (const bucket of buckets.values()) {
     if (forced.has(bucket.entry.file)) continue
-    const anyPromptHit = bucket.hits.some(h => h.source === 'prompt')
-    consider(bucket.entry, bucket.relevance, bucket.hits, anyPromptHit ? 'prompt' : 'inferred')
+    consider(bucket.entry, bucket.relevance, bucket.hits, 'prompt')
   }
 
   for (const [file, f] of forced) {
@@ -885,12 +851,6 @@ export function suggest(input: SuggestInput): SuggestResult {
       notes.push('Nothing in this stack has a trigger word, so your prompt is sent exactly as you wrote it.')
     }
   }
-  if (usedInferred) {
-    notes.push(
-      'Your prompt is prose rather than booru tags, so a local model rewrote it as tags first. Only tags that already exist in an installed LoRA were kept, and the ones that matched are marked as inferred.',
-    )
-  }
-
   const blind = withoutTriggerData().length
   if (blind) {
     notes.push(
@@ -898,7 +858,7 @@ export function suggest(input: SuggestInput): SuggestResult {
     )
   }
 
-  return { arch, ranked, stack, triggers, rejected, notes, blindSpot: blind, usedInferred }
+  return { arch, ranked, stack, triggers, rejected, notes, blindSpot: blind }
 }
 
 /**
@@ -908,410 +868,7 @@ export function suggest(input: SuggestInput): SuggestResult {
 function matchSentence(hits: SuggestHit[], entry: LoraIndexEntry): string {
   const top = hits.slice(0, 3)
   if (!top.length) return `Ranked against ${entry.imageCount || 'its'} training images.`
-  const inferred = top.every(h => h.source === 'inferred')
   const words = listOf(top.map(h => h.tag))
   const shares = listOf(top.map(h => `${pct(h.share)} percent`))
-  const lead = inferred
-    ? `Read out of your prompt as ${words}`
-    : `Your prompt uses ${words}`
-  return `${lead}, which its training captions carried in ${shares} of ${entry.imageCount} images.`
-}
-
-// ---------------------------------------------------------------------------
-// Composing the prompt
-// ---------------------------------------------------------------------------
-
-export type ComposeInput = {
-  /** The user's words. Returned unchanged, always. */
-  prompt: string
-  /** Trigger tokens for the LoRAs being applied. */
-  triggers?: string[]
-  /** The family's own prefix, such as Pony's score tags. */
-  prefix?: string[]
-}
-
-export type ComposedPrompt = {
-  /** What to send to ComfyUI. */
-  text: string
-  /** The user's text, byte for byte as they wrote it. */
-  prompt: string
-  /** Triggers that were actually added, in order. */
-  triggers: string[]
-  /** Prefix tokens that were actually added, in order. */
-  prefix: string[]
-  /** Everything added, in the order it appears in `text`. For a UI diff. */
-  added: string[]
-  /** Tokens not added because the prompt already contained them. */
-  alreadyPresent: string[]
-}
-
-/**
- * Compose the prompt that actually gets sent.
- *
- * Order is triggers, then the family prefix, then the user's own words. The
- * trigger is what the LoRA's own captions used, so it goes where the captions
- * put it, at the front. The prefix follows because it is a quality preamble
- * rather than a subject. The user's text is last and is never touched: not
- * reordered, not deduplicated, not reworded. What was added comes back
- * separately so the UI can show the reader exactly what was put in front of
- * their sentence, which is the difference between a tool and a black box.
- *
- * The ordering itself was not measured. The presence of the trigger was: see
- * {@link MEASURED_TRIGGER}.
- */
-export function composePrompt(input: ComposeInput): ComposedPrompt {
-  const prompt = input.prompt
-  const haystack = ` ${normaliseForCompare(prompt)} `
-  const seen = new Set<string>()
-  const alreadyPresent: string[] = []
-
-  const take = (tokens: string[] | undefined): string[] => {
-    const kept: string[] = []
-    for (const raw of tokens ?? []) {
-      const token = raw.trim()
-      if (!token) continue
-      const key = normaliseForCompare(token)
-      if (!key || seen.has(key)) continue
-      seen.add(key)
-      if (haystack.includes(` ${key} `)) {
-        alreadyPresent.push(token)
-        continue
-      }
-      kept.push(token)
-    }
-    return kept
-  }
-
-  const triggers = take(input.triggers)
-  const prefix = take(input.prefix)
-  const added = [...triggers, ...prefix]
-  const text = [...added, prompt.trim()].filter(Boolean).join(', ')
-
-  return { text, prompt, triggers, prefix, added, alreadyPresent }
-}
-
-/**
- * {@link composePrompt} with the triggers looked up from a chosen stack, which
- * is the shape a caller that already has filenames wants. Only `promptTags` is
- * used, so a LoRA with a minted token contributes that token and not the
- * author's whole caption template.
- */
-export function composeForStack(args: {
-  prompt: string
-  files: string[]
-  prefix?: string[]
-}): ComposedPrompt {
-  return composePrompt({
-    prompt: args.prompt,
-    triggers: missingTriggers(args.files, args.prompt),
-    prefix: args.prefix,
-  })
-}
-
-/** Same folding ./loraIndex uses, so a token and a prompt word compare equal. */
-function normaliseForCompare(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[_]+/g, ' ')
-    .replace(/[():]/g, ' ')
-    .replace(/[^a-z0-9'\- ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-// ---------------------------------------------------------------------------
-// The optional local model
-//
-// Nothing is listening on 8080, 8000, 11434 or 5000 today. Everything below is
-// written so that stays a non event: one short probe, one cached answer, and no
-// console noise when it fails.
-//
-// Two things a reader should know before trusting this path.
-//
-// First, the page is served to the LAN and over Tailscale, so 127.0.0.1 in the
-// browser is the viewer's machine and not freya. Viewed from a phone, the probe
-// correctly finds nothing. `endpoint` exists so that case can be fixed by
-// pointing at the real host.
-//
-// Second, a server that is up but does not send CORS headers looks exactly like
-// a server that is down, because the browser rejects the fetch before any
-// response is visible. llama-server needs --cors and ollama needs OLLAMA_ORIGINS
-// to be reachable from a page. This module reports both as absent, which is the
-// truthful answer to "can I use it from here".
-// ---------------------------------------------------------------------------
-
-export type ConceptServer = {
-  /** Base URL, no trailing slash. */
-  url: string
-  kind: 'openai' | 'ollama'
-  /** Model id to ask for. Empty when the server picks its own. */
-  model: string
-}
-
-export type LlmOptions = {
-  /** Skip discovery and use this base URL. */
-  endpoint?: string
-  kind?: 'openai' | 'ollama'
-  model?: string
-  /** Milliseconds for the reachability probe. Deliberately short. */
-  probeMs?: number
-  /** Milliseconds for the extraction itself. */
-  generateMs?: number
-  signal?: AbortSignal
-}
-
-const PROBE_MS = 400
-const GENERATE_MS = 8000
-
-/**
- * Where a local model might be. `/llm` first, on the chance someone proxies one
- * through Vite the way ComfyUI is proxied, because that is the only candidate
- * that works from a phone on the tailnet.
- */
-const CANDIDATES: readonly { url: string; kind: 'openai' | 'ollama' }[] = [
-  { url: '/llm', kind: 'openai' },
-  { url: 'http://127.0.0.1:8080', kind: 'openai' },
-  { url: 'http://127.0.0.1:8000', kind: 'openai' },
-  { url: 'http://127.0.0.1:5000', kind: 'openai' },
-  { url: 'http://127.0.0.1:11434', kind: 'ollama' },
-]
-
-let cache: { at: number; server: ConceptServer | null } | null = null
-/** A miss is cheap to retry; a hit is not worth re-probing every keystroke. */
-const CACHE_MS = { hit: 300_000, miss: 30_000 }
-
-/** Forget the cached probe, for a Refresh button or a test. */
-export function resetConceptServer(): void {
-  cache = null
-}
-
-function withTimeout(ms: number, outer?: AbortSignal): { signal: AbortSignal; done: () => void } {
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), ms)
-  const relay = () => ac.abort()
-  outer?.addEventListener('abort', relay)
-  return {
-    signal: ac.signal,
-    done: () => {
-      clearTimeout(timer)
-      outer?.removeEventListener('abort', relay)
-    },
-  }
-}
-
-/**
- * Find a local OpenAI compatible or ollama server, or return null.
- *
- * Never throws and never logs. A 200 that is not the JSON shape we expect counts
- * as nothing found, which is what stops the Vite dev server's index.html
- * fallback from being mistaken for a model.
- */
-export async function probeConceptServer(options: LlmOptions = {}): Promise<ConceptServer | null> {
-  if (options.endpoint) {
-    return probeOne({ url: options.endpoint.replace(/\/$/, ''), kind: options.kind ?? 'openai' }, options)
-  }
-  const now = Date.now()
-  if (cache && now - cache.at < (cache.server ? CACHE_MS.hit : CACHE_MS.miss)) return cache.server
-
-  for (const candidate of CANDIDATES) {
-    const found = await probeOne(candidate, options)
-    if (found) {
-      cache = { at: now, server: found }
-      return found
-    }
-  }
-  cache = { at: now, server: null }
-  return null
-}
-
-async function probeOne(
-  candidate: { url: string; kind: 'openai' | 'ollama' },
-  options: LlmOptions,
-): Promise<ConceptServer | null> {
-  const path = candidate.kind === 'ollama' ? '/api/tags' : '/v1/models'
-  const t = withTimeout(options.probeMs ?? PROBE_MS, options.signal)
-  try {
-    const res = await fetch(`${candidate.url}${path}`, { signal: t.signal })
-    if (!res.ok) return null
-    const type = res.headers.get('content-type') ?? ''
-    if (!type.includes('json')) return null
-    const body: unknown = await res.json()
-    const model = options.model ?? firstModelId(body, candidate.kind)
-    if (model === null) return null
-    return { url: candidate.url, kind: candidate.kind, model }
-  } catch {
-    // Down, blocked by CORS, wrong shape, or the probe timed out. All the same
-    // answer from here: cannot be used, carry on without it.
-    return null
-  } finally {
-    t.done()
-  }
-}
-
-function firstModelId(body: unknown, kind: 'openai' | 'ollama'): string | null {
-  if (!body || typeof body !== 'object') return null
-  const rows = kind === 'ollama' ? (body as { models?: unknown }).models : (body as { data?: unknown }).data
-  if (!Array.isArray(rows) || rows.length === 0) return null
-  const first = rows[0] as Record<string, unknown>
-  const id = kind === 'ollama' ? first.name : first.id
-  return typeof id === 'string' && id ? id : null
-}
-
-/** Index vocabulary, for intersecting a model's reply with what really exists. */
-let vocabulary: Map<string, string> | null = null
-
-function vocab(): Map<string, string> {
-  if (!vocabulary) {
-    vocabulary = new Map()
-    for (const entry of LORA_INDEX) {
-      for (const t of entry.triggers) vocabulary.set(normaliseForCompare(t.tag), t.tag)
-      for (const c of entry.concepts) vocabulary.set(normaliseForCompare(c.tag), c.tag)
-    }
-  }
-  return vocabulary
-}
-
-/** The vocabulary a prompt is scored against, for a UI that wants to show it. */
-export function indexVocabulary(): string[] {
-  return [...vocab().values()].sort()
-}
-
-/**
- * True when the prompt is already written in the tag vocabulary these LoRAs were
- * trained on, which is the case where string matching is strongest and a model
- * has nothing to add. Comma separated short fragments are tags; sentences are
- * not.
- */
-export function looksLikeTags(prompt: string): boolean {
-  const parts = prompt.split(',').map(p => p.trim()).filter(Boolean)
-  if (parts.length < 3) return false
-  const short = parts.filter(p => p.split(/\s+/).length <= 3).length
-  const known = parts.filter(p => vocab().has(normaliseForCompare(p))).length
-  return short / parts.length > 0.7 || known >= 2
-}
-
-const SYSTEM_PROMPT =
-  'You convert a description of a picture into booru style tags. Reply with one line of lowercase comma separated tags and nothing else. No explanation, no numbering, no sentences. Name anatomy plainly. Between five and twenty tags.'
-
-/**
- * Ask a local model to rewrite a prose prompt as booru tags.
- *
- * The reply is intersected with the vocabulary of the installed LoRAs before it
- * is used, so a tag the model invented cannot reach the ranking: at worst it
- * contributes nothing. That is the whole safety story for this path, and it is
- * why the model does not need to be good, only present.
- *
- * Returns an empty array for every failure, including no server, a timeout, a
- * refusal and a reply in the wrong shape.
- */
-export async function extractConcepts(prompt: string, options: LlmOptions = {}): Promise<string[]> {
-  const text = prompt.trim()
-  if (!text) return []
-  const server = await probeConceptServer(options)
-  if (!server) return []
-
-  const t = withTimeout(options.generateMs ?? GENERATE_MS, options.signal)
-  try {
-    const openai = server.kind === 'openai'
-    const res = await fetch(`${server.url}${openai ? '/v1/chat/completions' : '/api/chat'}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      signal: t.signal,
-      body: JSON.stringify({
-        model: server.model,
-        stream: false,
-        temperature: 0,
-        ...(openai ? { max_tokens: 160 } : { options: { temperature: 0, num_predict: 160 } }),
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-      }),
-    })
-    if (!res.ok) return []
-    const body: unknown = await res.json()
-    return keepKnownTags(replyText(body, server.kind))
-  } catch {
-    return []
-  } finally {
-    t.done()
-  }
-}
-
-function replyText(body: unknown, kind: 'openai' | 'ollama'): string {
-  if (!body || typeof body !== 'object') return ''
-  if (kind === 'ollama') {
-    const message = (body as { message?: { content?: unknown } }).message
-    return typeof message?.content === 'string' ? message.content : ''
-  }
-  const choices = (body as { choices?: unknown }).choices
-  if (!Array.isArray(choices) || !choices.length) return ''
-  const content = (choices[0] as { message?: { content?: unknown } }).message?.content
-  return typeof content === 'string' ? content : ''
-}
-
-/**
- * Keep only the tags that an installed LoRA was really trained on, in the
- * spelling that LoRA used. Everything else the model said is dropped without
- * comment: a reasoning preamble, a bulleted list, a hallucinated tag and a
- * refusal all reduce to the same empty array.
- */
-function keepKnownTags(reply: string, limit = 24): string[] {
-  const known = vocab()
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const raw of reply.split(/[,\n]/)) {
-    const key = normaliseForCompare(raw.replace(/^[-*\d.\s]+/, ''))
-    if (!key || seen.has(key)) continue
-    const tag = known.get(key)
-    if (!tag) continue
-    seen.add(key)
-    out.push(tag)
-    if (out.length >= limit) break
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// suggestAsync
-// ---------------------------------------------------------------------------
-
-export type SuggestAsyncInput = SuggestInput & {
-  /** Omit to let discovery run. Pass `{ endpoint }` to point at a known server. */
-  llm?: LlmOptions
-  /** Set false to skip the model entirely, for a UI toggle. */
-  useLlm?: boolean
-}
-
-/**
- * {@link suggest}, plus the local model when there is one and when it would
- * help.
- *
- * It only reaches for the model when the prompt is prose rather than tags and
- * the plain lookup came back thin. That is the one case the user's question
- * points at, it is the case string matching is worst at, and it keeps the probe
- * off the path of every keystroke on a prompt that is already tagged.
- *
- * With nothing listening this costs five refused fetches, which came back in
- * 19 milliseconds together on this machine, and the miss is cached for thirty
- * seconds. A host that drops packets rather than refusing them costs the probe
- * timeout instead, five times, which is why that timeout is 400 milliseconds.
- * Either way it returns exactly what {@link suggest} returns. It never throws
- * because of
- * the model and it never says anything about the model unless the model
- * contributed.
- */
-export async function suggestAsync(input: SuggestAsyncInput): Promise<SuggestResult> {
-  const first = suggest(input)
-  if (input.useLlm === false) return first
-  if (input.inferred?.length) return first
-  if (!input.prompt.trim()) return first
-
-  const thin = first.ranked.filter(s => s.reason === 'prompt').length < 2
-  if (!thin || looksLikeTags(input.prompt)) return first
-
-  const inferred = await extractConcepts(input.prompt, input.llm ?? {})
-  if (!inferred.length) return first
-
-  return suggest({ ...input, inferred })
+  return `Your prompt uses ${words}, which its training captions carried in ${shares} of ${entry.imageCount} images.`
 }

@@ -81,11 +81,6 @@ export function serverCapabilities(): Promise<ServerCapabilities> {
   return cache
 }
 
-export function refreshServerCapabilities(): Promise<ServerCapabilities> {
-  cache = null
-  return serverCapabilities()
-}
-
 /** The same answer for a component. Null until it arrives. */
 export function useServerCapabilities(): ServerCapabilities | null {
   const [caps, setCaps] = useState<ServerCapabilities | null>(null)

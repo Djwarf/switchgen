@@ -98,7 +98,7 @@
  */
 
 import type { IndexedBase, LoraIndexEntry } from './loraIndex'
-import { LORA_INDEX, byFilename, missingTriggers, triggerNote } from './loraIndex'
+import { LORA_INDEX, } from './loraIndex'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -342,21 +342,8 @@ function build() {
   return built
 }
 
-/**
- * How rare a tag is across the indexed LoRAs, as a plain number.
- *
- * Exported because it is the one piece of arithmetic here a caller might
- * reasonably want to second guess, and because a UI that wants to explain a
- * ranking needs it. A tag no LoRA uses returns the maximum, which is correct:
- * unseen is as discriminating as it gets, though nothing will match on it.
- */
-export function tagRarity(tag: string): number {
-  const { idf, corpus } = build()
-  return idf.get(normalise(tag)) ?? Math.log(corpus)
-}
-
 /** The number of LoRAs this ranking could have drawn on. The rest carry no tags. */
-export function indexedCorpusSize(): number {
+function indexedCorpusSize(): number {
   return build().corpus
 }
 
@@ -367,7 +354,7 @@ export function indexedCorpusSize(): number {
  * irrelevant; they simply do not say what they were trained on, so no amount of
  * looking at the picture can decide whether they apply.
  */
-export function unrankableCount(): number {
+function unrankableCount(): number {
   return LORA_INDEX.length - build().corpus
 }
 
@@ -419,7 +406,7 @@ function whyFor(entry: LoraIndexEntry, conf: SuggestionConfidence, evidence: Sug
  * trustworthy output of the two and a UI that wants to explain why a LoRA the
  * user expected is absent needs it.
  */
-export function suggestLorasForTags(
+function suggestLorasForTags(
   tags: ImageTag[],
   options: SuggestOptions = {},
 ): { suggestions: LoraSuggestion[]; vetoed: VetoedLora[] } {
@@ -514,36 +501,11 @@ export function suggestLorasForTags(
  * text. `matchPrompt(promptFromTags(tags), ...)` works, though the ranking here
  * is better for this purpose because matchPrompt cannot veto.
  */
-export function promptFromTags(tags: ImageTag[], limit = 40): string {
+function promptFromTags(tags: ImageTag[], limit = 40): string {
   return tags
     .slice(0, limit)
     .map(t => t.tag.replace(/_/g, ' '))
     .join(', ')
-}
-
-/**
- * The trigger tokens a chosen stack needs that the prompt does not already have.
- *
- * A thin pass through to missingTriggers, here so the vision path has one import
- * and so this comment can sit next to it: this is the call that converts a
- * suggestion into the measured 1.313x, and a LoRA applied without it is running
- * at roughly two thirds strength. Suggesting a LoRA and not adding its trigger
- * throws away the larger part of what this file is for.
- */
-export function triggerTokensFor(files: string[], prompt: string): string[] {
-  return missingTriggers(files, prompt)
-}
-
-/**
- * Pass a suggestion through to a UI, trigger caveat included.
- *
- * triggerNote distinguishes "this LoRA needs no trigger" from "this file does
- * not say whether it needs one", and collapsing those two is the error
- * loraIndex.ts was built to prevent, so it is carried through here rather than
- * reworded.
- */
-export function explainSuggestion(s: LoraSuggestion): string {
-  return `${s.entry.stem}. ${s.why} ${triggerNote(s.entry)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +523,7 @@ export function explainSuggestion(s: LoraSuggestion): string {
  * an opinion the caller should prefer whichever had real evidence, which on the
  * edit path is this one.
  */
-export function anatomyFromRating(rating: ImageRating | null): AnatomyLevel {
+function anatomyFromRating(rating: ImageRating | null): AnatomyLevel {
   switch (rating) {
     case 'explicit': return 'emphasised'
     case 'questionable': return 'natural'
@@ -569,33 +531,6 @@ export function anatomyFromRating(rating: ImageRating | null): AnatomyLevel {
     case 'general': return 'off'
     default: return 'off'
   }
-}
-
-/**
- * Whether the picture has hands worth spending a hands LoRA or a detail pass on.
- *
- * This is the question WD14 cannot answer and the detectors can. It is also the
- * gate good-hands-for-pony needs, because that LoRA's own concept list is about
- * nudity and says nothing about hands, so tag overlap can never select it
- * correctly.
- *
- * `minShare` defaults low: a hand at 1 percent of frame is small, and small
- * hands are exactly the ones that come out wrong.
- */
-export function handsWorthFixing(facts: ImageFacts | null, minShare = 0.002): boolean {
-  if (!facts) return false
-  return facts.hand.some(h => h.areaShare >= minShare)
-}
-
-/** Whether a face is large enough in frame that a detail pass would show. */
-export function faceWorthDetailing(facts: ImageFacts | null, minShare = 0.01): boolean {
-  if (!facts) return false
-  return facts.face.some(f => f.areaShare >= minShare)
-}
-
-/** How many people the detector found. Useful for deciding on a multi subject fix. */
-export function peopleCount(facts: ImageFacts | null): number {
-  return facts?.person.length ?? 0
 }
 
 // ---------------------------------------------------------------------------
@@ -683,42 +618,6 @@ function factsFrom(row: DetectRow | undefined): ImageFacts | null {
 }
 
 /**
- * Tags for one image, with confidences.
- *
- * Accepts a path under the outputs root, a {kind, rel} reference, or the bytes
- * themselves for a picture that has not been saved anywhere yet, which is the
- * shape the edit path actually has.
- *
- * Throws when the tagger is not installed rather than returning an empty list,
- * because an empty list reads as "nothing in this picture" and that is a lie
- * every caller downstream would act on. Ask `capabilities()` first, or catch.
- */
-export async function tagImage(file: ImageSource, signal?: AbortSignal): Promise<ImageTags> {
-  const data = await post('/api/vision/tag', file, undefined, signal)
-  const rows = (data.tag as { rows?: TagRow[] } | undefined)?.rows ?? []
-  const row = rows[0]
-  if (!row) throw new Error('the tagger returned no rows')
-  if (row.error) throw new Error(row.error)
-  return {
-    width: row.width,
-    height: row.height,
-    rating: row.rating,
-    ratings: row.ratings ?? [],
-    general: row.general ?? [],
-    character: row.character ?? [],
-  }
-}
-
-/** Face, hand and person boxes for one image. No download needed for these. */
-export async function detectImage(file: ImageSource, signal?: AbortSignal): Promise<ImageFacts> {
-  const data = await post('/api/vision/detect', file, undefined, signal)
-  const rows = (data.detect as { rows?: DetectRow[] } | undefined)?.rows ?? []
-  const facts = factsFrom(rows[0])
-  if (!facts) throw new Error('the detectors returned no rows')
-  return facts
-}
-
-/**
  * One call, one child process: tags, detections, ranked LoRAs and the vetoes.
  *
  * This is the entry point the edit and refine paths want. It never throws for a
@@ -787,49 +686,6 @@ export async function inspectImage(
   }
 }
 
-/**
- * Everything the recipe layer needs from a picture, in the shapes it already
- * speaks: a prompt fragment, an anatomy level, LoRA filenames, and the trigger
- * tokens those filenames need on top of whatever prompt the user has typed.
- *
- * Offered as one function so recipe.ts can adopt the image path without
- * learning any of the types above. It defaults to refusing incidental matches,
- * because anything this returns is a candidate for being applied rather than
- * shown, and an incidental match is by construction not evidence.
- */
-export async function recipeInputFromImage(
-  file: ImageSource,
-  arch: IndexedBase,
-  existingPrompt = '',
-  options: { limit?: number; signal?: AbortSignal } = {},
-): Promise<{
-  prompt: string
-  anatomy: AnatomyLevel
-  loraFiles: string[]
-  triggers: string[]
-  suggestions: LoraSuggestion[]
-  handsNeedHelp: boolean
-  unavailable?: string
-}> {
-  const report = await inspectImage(file, {
-    bases: [arch],
-    includeIncidental: false,
-    limit: options.limit ?? 3,
-    signal: options.signal,
-  })
-  const loraFiles = report.suggestions.map(s => s.entry.file)
-  const basis = `${existingPrompt} ${report.promptFromImage}`.trim()
-  return {
-    prompt: report.promptFromImage,
-    anatomy: report.anatomy,
-    loraFiles,
-    triggers: triggerTokensFor(loraFiles, basis),
-    suggestions: report.suggestions,
-    handsNeedHelp: handsWorthFixing(report.facts),
-    unavailable: report.unavailable,
-  }
-}
-
 /** One tagged row of a batch, with the reference it was asked about. */
 export type TaggedRow = ImageTags & { kind: ImageKind; rel: string; error?: string }
 
@@ -869,11 +725,3 @@ export async function tagImages(refs: readonly ImageRef[], signal?: AbortSignal)
   }))
 }
 
-/**
- * Resolve a suggestion back to its index entry, for a caller holding only a
- * filename. A thin alias over byFilename, kept so the vision path does not have
- * to import loraIndex directly for one lookup.
- */
-export function entryFor(file: string): LoraIndexEntry | undefined {
-  return byFilename(file)
-}

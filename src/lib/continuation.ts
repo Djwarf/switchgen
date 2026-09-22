@@ -116,7 +116,7 @@ function idsOfClass(graph: GraphLike, ...classes: string[]): string[] {
 }
 
 /** The decode that feeds the clip writer. Multiple decodes resolve by who saves. */
-export function findDecodeNode(graph: GraphLike): string | null {
+function findDecodeNode(graph: GraphLike): string | null {
   const ids = idsOfClass(graph, ...DECODE_NODES)
   if (ids.length <= 1) return ids[0] ?? null
   const feedsSaver = ids.find(id =>
@@ -143,7 +143,7 @@ function findVaeRef(graph: GraphLike): Link | null {
  * ImageFromBatch adds the batch size to a negative index before clamping, so
  * the slice is the final frame rather than an empty tensor.
  */
-export function lastFrameNode(
+function lastFrameNode(
   graph: GraphLike,
   decodeNodeId: string,
   opts: { id?: string; batchIndex?: number; length?: number } = {},
@@ -161,7 +161,7 @@ export function lastFrameNode(
  * Last frame plus a SaveImage, so the shot publishes the frame the next shot
  * consumes. Mutates `graph`. Idempotent: calling it twice adds one tap.
  */
-export function addChainTap(
+function addChainTap(
   graph: GraphLike,
   opts: { prefix?: string; decodeNodeId?: string } = {},
 ): { pick: string; save: string } | null {
@@ -229,18 +229,13 @@ function setImageInput(wf: GraphLike, input: string, filename: string): boolean 
   return true
 }
 
-/** The frame a shot opens on. Returns false when the graph has no start slot. */
-export function setStartImage(wf: ApiWorkflow, filename: string): boolean {
-  return setImageInput(wf as GraphLike, 'start_image', filename)
-}
-
 /** The frame a shot is required to land on. Bookend graphs only. */
 export function setEndImage(wf: ApiWorkflow, filename: string): boolean {
   return setImageInput(wf as GraphLike, 'end_image', filename)
 }
 
 /** The appearance anchor. VACE graphs only. */
-export function setReferenceImage(wf: ApiWorkflow, filename: string): boolean {
+function setReferenceImage(wf: ApiWorkflow, filename: string): boolean {
   return setImageInput(wf as GraphLike, 'reference_image', filename)
 }
 
@@ -248,7 +243,7 @@ export function setReferenceImage(wf: ApiWorkflow, filename: string): boolean {
  * Rename a workflow's outputs so a reel's clips sort into cutting order.
  * Video writers take `prefix`, the handoff frame takes `prefix.frame`.
  */
-export function setOutputPrefix(wf: ApiWorkflow, prefix: string): void {
+function setOutputPrefix(wf: ApiWorkflow, prefix: string): void {
   for (const [id, node] of Object.entries(wf as GraphLike)) {
     if (!('filename_prefix' in node.inputs)) continue
     node.inputs.filename_prefix = id === NODE_IDS.frameSave ? `${prefix}.frame` : prefix
@@ -371,7 +366,7 @@ export function deriveBookend(def: FamilyDef): FamilyDef | null {
 }
 
 /** True when a family's weights are VACE, which is what WanVaceToVideo needs. */
-export function isVaceFamily(def: FamilyDef): boolean {
+function isVaceFamily(def: FamilyDef): boolean {
   if (idsOfClass(def.graph, 'WanVaceToVideo').length) return true
   if (def.models.some(m => /vace/i.test(m))) return true
   return Object.values(def.graph).some(n =>
@@ -523,15 +518,6 @@ export function deriveChainTap(def: FamilyDef): FamilyDef | null {
   return { ...def, id: `${def.id}__tap`, label: `${def.label}: opening shot`, graph }
 }
 
-/** Every continued shot variant a family supports. Null entries are not offered. */
-export function shotVariants(def: FamilyDef): Record<ShotVariant, FamilyDef | null> {
-  return {
-    continuation: deriveContinuation(def),
-    bookend: deriveBookend(def),
-    vace: deriveVaceShot(def),
-  }
-}
-
 /**
  * One short line for a variant a family cannot do, so the interface can say why
  * a control is missing instead of leaving a hole. Null means it is available.
@@ -550,31 +536,6 @@ export function explainUnavailable(def: FamilyDef, variant: ShotVariant): string
         : `${def.label} generates from text alone. There is no frame to pin at either end.`
     case 'vace':
       return deriveVaceShot(def) ? null : 'VACE weights are installed but no VACE family is registered yet.'
-  }
-}
-
-/** Families keyed by source id, in the shape workflows.ts uses for IMG2IMG. */
-function variantMap(pick: (def: FamilyDef) => FamilyDef | null, defs: readonly FamilyDef[]) {
-  const out: Record<string, FamilyDef> = {}
-  for (const def of defs) {
-    const derived = pick(def)
-    if (derived) out[def.id] = derived
-  }
-  return out
-}
-
-/** Build the lookup tables. Call once with FAMILIES, or with a filtered list. */
-export function continuationTables(defs: readonly FamilyDef[]): {
-  continuation: Record<string, FamilyDef>
-  bookend: Record<string, FamilyDef>
-  vace: Record<string, FamilyDef>
-  tap: Record<string, FamilyDef>
-} {
-  return {
-    continuation: variantMap(deriveContinuation, defs),
-    bookend: variantMap(deriveBookend, defs),
-    vace: variantMap(deriveVaceShot, defs),
-    tap: variantMap(deriveChainTap, defs),
   }
 }
 

@@ -149,7 +149,7 @@ export class ComfyError extends Error {
  * messages to the submitting client, so every job in this tab must use it —
  * and exactly one socket may hold it at a time (see rule 1).
  */
-export const clientId: string =
+const clientId: string =
   globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
 
 /** Build a browser-loadable URL for a file ComfyUI holds. */
@@ -655,11 +655,6 @@ export function watchConnection(on: (s: ConnectionState) => void): () => void {
   }
 }
 
-/** Jobs the server last said were waiting, from its `status` broadcast. */
-export function queueDepth(): number {
-  return queueRemaining
-}
-
 /**
  * Queue a workflow. Resolves with the prompt id as soon as ComfyUI accepts it.
  *
@@ -842,7 +837,7 @@ export async function getJob(promptId: string): Promise<ServerJob | null> {
 // ---------------------------------------------------------------------------
 
 /** Raw history page, newest last. Keys are prompt ids. */
-export function historyPage(max = 200): Promise<Record<string, any>> {
+function historyPage(max = 200): Promise<Record<string, any>> {
   return getJson<Record<string, any>>(`/history?max_items=${Math.max(1, Math.floor(max))}`)
 }
 
@@ -861,7 +856,7 @@ function timestampOf(status: any, event: string): number | null {
  * `prompt[2]` is the complete API graph that was submitted, so every parameter
  * of a past generation is recoverable from it. Verified live.
  */
-export function readPastRun(promptId: string, raw: any): PastRun | null {
+function readPastRun(promptId: string, raw: any): PastRun | null {
   const tuple = raw?.prompt
   if (!Array.isArray(tuple)) return null
   const graph = tuple[2]
@@ -894,7 +889,7 @@ export function readPastRun(promptId: string, raw: any): PastRun | null {
 }
 
 /** One past run by prompt id, or null when it is not in history. */
-export async function fetchPastRun(promptId: string): Promise<PastRun | null> {
+async function fetchPastRun(promptId: string): Promise<PastRun | null> {
   const page = await getJson<Record<string, any>>(`/history/${encodeURIComponent(promptId)}`)
   const raw = page?.[promptId]
   return raw ? readPastRun(promptId, raw) : null
@@ -939,14 +934,3 @@ export function readBoundParams(
   return out
 }
 
-/** The value of one input on the first node of a given class, if present. */
-export function readNodeInput(
-  graph: ApiWorkflow,
-  classType: string,
-  input: string,
-): unknown {
-  for (const node of Object.values(graph)) {
-    if (node.class_type === classType && input in node.inputs) return node.inputs[input]
-  }
-  return undefined
-}

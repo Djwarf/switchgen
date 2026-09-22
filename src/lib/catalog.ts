@@ -103,14 +103,6 @@ export function fetchPlan(family: string, model?: string | null): Promise<Catalo
   return json<CatalogPlan>(`/api/catalog/plan?${q}`)
 }
 
-export async function cancelDownload(id: string, keepPartial = false): Promise<void> {
-  await json('/api/download/cancel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, keepPartial }),
-  })
-}
-
 /** `1.4 GB`, `217 MB`. */
 export function bytesText(n: number | null | undefined): string {
   if (!n) return '0 MB'

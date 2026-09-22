@@ -25,7 +25,7 @@ export type UnfiledFile = {
 }
 
 /** Every media file under the outputs root that no record stands for. */
-export async function findUnfiled(): Promise<UnfiledFile[]> {
+async function findUnfiled(): Promise<UnfiledFile[]> {
   const res = await fetch('/api/outputs', { headers: { Accept: 'application/json' } })
   const type = res.headers.get('content-type') ?? ''
   if (!res.ok || !type.includes('json')) throw new Error('the outputs listing is not available here')

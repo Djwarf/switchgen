@@ -94,7 +94,6 @@ const SHIFT_NODE = /^ModelSampling/
 const CLIP_SKIP_NODE = 'CLIPSetLastLayer'
 const ADVANCED_SAMPLER = 'KSamplerAdvanced'
 
-
 /**
  * Write the sampling shift onto every ModelSampling* node in a graph.
  *
@@ -132,7 +131,7 @@ export function graphShift(wf: NodeMap): number | null {
  * as the same layer said the other way round, because "clip skip 2" is how the
  * checkpoints' own cards write it. Zero is not a layer and is ignored.
  */
-export function applyClipSkip(wf: NodeMap, clipSkip: number | null | undefined): boolean {
+function applyClipSkip(wf: NodeMap, clipSkip: number | null | undefined): boolean {
   if (typeof clipSkip !== 'number' || !Number.isFinite(clipSkip)) return false
   const n = Math.round(clipSkip)
   if (n === 0) return false
@@ -184,7 +183,7 @@ function splitPairs(wf: NodeMap): { first: ApiNode; second: ApiNode }[] {
 }
 
 /** Move the dual-model pass boundary. */
-export function applySplit(wf: NodeMap, split: number | null | undefined): boolean {
+function applySplit(wf: NodeMap, split: number | null | undefined): boolean {
   if (typeof split !== 'number' || !Number.isFinite(split)) return false
   const boundary = Math.max(1, Math.floor(split))
   const pairs = splitPairs(wf)
@@ -193,12 +192,6 @@ export function applySplit(wf: NodeMap, split: number | null | undefined): boole
     second.inputs.start_at_step = boundary
   }
   return pairs.length > 0
-}
-
-/** The pass boundary a dual-model graph ships with, or null when it has none. */
-export function graphSplit(wf: NodeMap): number | null {
-  const [pair] = splitPairs(wf)
-  return pair ? (pair.first.inputs.end_at_step as number) : null
 }
 
 export function instantiate(def: FamilyDef, p: Params): ApiWorkflow {

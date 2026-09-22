@@ -57,10 +57,6 @@ export function useArchiveSync(): ArchiveSyncState {
   return useSyncExternalStore(subscribe, getState, getState)
 }
 
-export function archiveSyncState(): ArchiveSyncState {
-  return state
-}
-
 // ------------------------------------------------------------------ wire --
 
 async function api<T>(path: string, body?: unknown): Promise<T> {

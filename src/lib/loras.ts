@@ -240,7 +240,7 @@ export type CatalogueEntry = {
  * README, not from its Civitai title: where the two disagree, `caveat` records
  * the disagreement and `arch` follows the README.
  */
-export const LORA_CATALOGUE: readonly CatalogueEntry[] = [
+const LORA_CATALOGUE: readonly CatalogueEntry[] = [
   {
     file: "add-micro-details-concept-illustrious-pony-noobai.safetensors",
     arch: "pony",
@@ -1375,11 +1375,6 @@ const CATALOGUE_BY_STEM: ReadonlyMap<string, CatalogueEntry> = new Map(
   LORA_CATALOGUE.map(e => [stem(e.file), e]),
 )
 
-/** The verified row for a file, if there is one. */
-export function catalogueFor(file: string): CatalogueEntry | null {
-  return CATALOGUE_BY_STEM.get(stem(file)) ?? null
-}
-
 /** `detailed-pussy.safetensors` becomes `Detailed pussy`. */
 function titleOf(file: string): string {
   const base = stem(file).replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim()
@@ -1568,12 +1563,6 @@ export type FitLevel = 'match' | 'untested' | 'mismatch'
 
 export type Fit = { level: FitLevel; why: string }
 
-export const FIT_LABEL: Record<FitLevel, string> = {
-  match: 'Matches',
-  untested: 'Untested',
-  mismatch: 'Wrong model',
-}
-
 /** The checkpoint a stack is being built against. */
 export type LoraTarget = {
   familyId: string
@@ -1701,10 +1690,10 @@ export const STRENGTH = { min: 0, max: 1.5, step: 0.05, default: 0.7 } as const
  * authors publish is minus three to three. Clamping those to zero would remove
  * half of what the user actually asked for.
  */
-export const SLIDER_STRENGTH = { min: -3, max: 3, step: 0.1, default: 1 } as const
+const SLIDER_STRENGTH = { min: -3, max: 3, step: 0.1, default: 1 } as const
 
 /** Negative LoRAs, applied below zero to subtract what they encode. */
-export const NEGATIVE_STRENGTH = { min: -1.5, max: 1.5, step: 0.05, default: -1 } as const
+const NEGATIVE_STRENGTH = { min: -1.5, max: 1.5, step: 0.05, default: -1 } as const
 
 export function boundsFor(info: LoraInfo | undefined): {
   min: number
@@ -1755,14 +1744,6 @@ export function moveInStack(stack: LoraStack, from: number, to: number): LoraSta
   const [moved] = next.splice(from, 1)
   next.splice(Math.min(Math.max(0, to), next.length), 0, moved)
   return next
-}
-
-/** Bytes the enabled entries add to what has to be loaded. */
-export function stackBytes(stack: LoraStack, lib: LoraLibrary): number {
-  return stack.reduce((n, e) => {
-    const info = lib.byFile.get(e.file)
-    return info && e.enabled && info.installed ? n + info.bytes : n
-  }, 0)
 }
 
 /**

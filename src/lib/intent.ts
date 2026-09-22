@@ -353,7 +353,7 @@ function titleFromFilename(model: string): string {
 }
 
 /** The reader facing name of a weight file. Registry label wins. */
-export function plainName(model: string, def?: FamilyDef): string {
+function plainName(model: string, def?: FamilyDef): string {
   const per = def?.perModel?.[model] as { label?: unknown } | undefined
   if (per && typeof per.label === 'string' && per.label) return per.label
   return PLAIN_NAMES[model] ?? titleFromFilename(model)
@@ -377,7 +377,7 @@ function archFromFamily(def: FamilyDef | undefined): Arch {
 }
 
 /** The profile for a weight file, or null when the file is not in the table. */
-export function profileFor(model: string, def?: FamilyDef): ModelProfile | null {
+function profileFor(model: string, def?: FamilyDef): ModelProfile | null {
   return PROFILES[model] ?? (def ? fallbackProfile(model, def) : null)
 }
 
@@ -528,23 +528,6 @@ function warnAbout(p: ModelProfile, brief: Brief, label: string): string | null 
 // Ranking
 // ---------------------------------------------------------------------------
 
-/**
- * Rank the installed weight files against a brief.
- *
- * Anything that will not fit in this machine's RAM is excluded outright, not
- * ranked low: offering a model that gets killed by earlyoom halfway through is
- * worse than not offering it. Use intentReport() when the UI wants to show
- * what was excluded and why.
- */
-export function rankModels(brief: Brief, opts: RankOptions = {}): Recommendation[] {
-  return intentReport(brief, opts).ranked
-}
-
-/** The single best choice, or null when nothing installed can do the job. */
-export function recommend(brief: Brief, opts: RankOptions = {}): Recommendation | null {
-  return rankModels(brief, { ...opts, limit: 1 })[0] ?? null
-}
-
 /** The full picture: what to use, what will not fit, and what has no graph. */
 export function intentReport(brief: Brief, opts: RankOptions = {}): IntentReport {
   const mode = brief.mode ?? 'image'
@@ -665,7 +648,7 @@ function headline(brief: Required<Brief>, ranked: Recommendation[], unrouted: Un
  * the base decides whether anatomy is plausible and the refine pass decides
  * whether it is correct.
  */
-export function anatomyNote(brief: Brief): string {
+function anatomyNote(brief: Brief): string {
   const regions = MASK_ONLY_REGIONS.filter((r) => r !== 'any other region').join(', ')
   if (!brief.explicit) {
     return 'Faces and hands have detectors, so they can be detailed automatically. Everything else needs a drawn mask and a refine pass.'
@@ -680,27 +663,6 @@ export function anatomyNote(brief: Brief): string {
 // them and for the "you asked for a photograph but you are on an anime base"
 // hint. Clinical vocabulary, because that is what people type.
 // ---------------------------------------------------------------------------
-
-const INTENT_WORDS: Record<Intent, readonly string[]> = {
-  photoreal: [
-    'photo', 'photograph', 'photography', 'photorealistic', 'photoreal', 'realistic', 'hyperrealistic',
-    'dslr', '35mm', '50mm', '85mm', 'bokeh', 'film grain', 'raw photo', 'candid', 'editorial',
-    'skin texture', 'studio lighting', 'polaroid', 'portrait photography',
-  ],
-  anime: [
-    'anime', 'manga', 'waifu', 'hentai', 'chibi', 'shoujo', 'shounen', 'isekai', 'doujin',
-    'booru', 'danbooru', 'ahegao', '1girl', '1boy', '2girls', '2boys', 'seinen', 'mecha musume',
-  ],
-  cartoon: [
-    'cartoon', 'toon', 'comic', 'comic book', 'caricature', 'furry', 'anthro', 'disney', 'pixar',
-    'saturday morning', 'western animation', 'looney', 'newspaper strip', 'flat colors', 'flat colours',
-  ],
-  illustration: [
-    'illustration', 'illustrated', 'painting', 'painterly', 'concept art', 'digital art', 'artstation',
-    'watercolor', 'watercolour', 'oil painting', 'gouache', 'ink drawing', 'linework', 'sketch',
-    'matte painting', 'storybook', 'semi real', 'semi-real',
-  ],
-}
 
 const EXPLICIT_WORDS: readonly string[] = [
   'nude', 'nudity', 'naked', 'topless', 'bottomless', 'undressed', 'unclothed',
@@ -723,52 +685,9 @@ function countHits(haystack: string, words: readonly string[]): number {
   return n
 }
 
-/** The look a prompt implies, or null when it implies nothing in particular. */
-export function guessIntent(prompt: string): Intent | null {
-  const text = ` ${prompt.toLowerCase()} `
-  let best: Intent | null = null
-  let bestN = 0
-  for (const opt of INTENTS) {
-    const n = countHits(text, INTENT_WORDS[opt.id])
-    if (n > bestN) {
-      bestN = n
-      best = opt.id
-    }
-  }
-  return bestN > 0 ? best : null
-}
-
 /** True when the prompt describes explicit human anatomy. */
 export function wantsExplicitAnatomy(prompt: string): boolean {
   return countHits(` ${prompt.toLowerCase()} `, EXPLICIT_WORDS) > 0
-}
-
-/** A brief read out of a prompt, falling back to what the UI already had. */
-export function briefFrom(prompt: string, fallback: Brief): Brief {
-  return {
-    intent: guessIntent(prompt) ?? fallback.intent,
-    explicit: wantsExplicitAnatomy(prompt) || fallback.explicit,
-    mode: fallback.mode,
-  }
-}
-
-/**
- * True when the chosen file is a poor match for what the prompt describes.
- * Drives a hint beside the picker, never an automatic switch: overriding a
- * deliberate choice because of a keyword match would be worse than the
- * mismatch.
- */
-export function mismatchHint(model: string, brief: Brief, def?: FamilyDef): string | null {
-  const p = profileFor(model, def)
-  if (!p) return null
-  const label = plainName(model, def)
-  if (p.style[brief.intent] <= 3) {
-    return `${label} scores low for ${brief.intent} work. ${p.styleNotes?.[brief.intent] ?? BAND(p.style[brief.intent], brief.intent)}`
-  }
-  if (brief.explicit && p.anatomy <= 3) {
-    return `${label} was trained on filtered data. Explicit anatomy will not resolve on it.`
-  }
-  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -781,23 +700,6 @@ export function mismatchHint(model: string, brief: Brief, def?: FamilyDef): stri
 // before the run, not discovered after it.
 // ---------------------------------------------------------------------------
 
-/** Architecture hints in LoRA filenames. Heuristic, and labelled as one. */
-const LORA_ARCH_HINTS: { arch: Arch; test: RegExp }[] = [
-  { arch: 'wan', test: /\bwan(2[._]?[12])?\b|wan2[._]?\d/i },
-  { arch: 'sdxl', test: /\bsdxl\b|\bxl\b|pony|illustrious|noob|booru/i },
-  { arch: 'flux', test: /\bflux\b|klein|krea/i },
-  { arch: 'chroma', test: /chroma/i },
-  { arch: 'zimage', test: /z[-_]?image/i },
-  { arch: 'qwen', test: /qwen/i },
-  { arch: 'anima', test: /anima|miaomiao/i },
-]
-
-/** The architecture a LoRA filename claims, or 'unknown'. */
-export function loraArch(loraName: string): Arch {
-  for (const h of LORA_ARCH_HINTS) if (h.test.test(loraName)) return h.arch
-  return 'unknown'
-}
-
 export type LoraFit = {
   name: string
   arch: Arch
@@ -806,60 +708,3 @@ export type LoraFit = {
   note: string
 }
 
-/** Which of the installed LoRAs can attach to this recommendation's base. */
-export function loraAdvice(
-  rec: Pick<Recommendation, 'label' | 'profile'>,
-  installedLoras: readonly string[],
-): { usable: LoraFit[]; ignored: LoraFit[]; note: string } {
-  const base = rec.profile.arch
-  const usable: LoraFit[] = []
-  const ignored: LoraFit[] = []
-
-  for (const name of installedLoras) {
-    const arch = loraArch(name)
-    if (arch === base) {
-      usable.push({ name, arch, fits: true, note: `Built for ${base}, same as ${rec.label}.` })
-    } else if (arch === 'unknown') {
-      usable.push({
-        name,
-        arch,
-        fits: null,
-        note: 'The filename does not say which architecture this was trained on. Try it at strength 1 and watch for any change at all: no change means the keys did not match.',
-      })
-    } else {
-      ignored.push({
-        name,
-        arch,
-        fits: false,
-        note: `Built for ${arch}. On a ${base} base its keys match nothing, so it loads without error and changes nothing.`,
-      })
-    }
-  }
-
-  const note = usable.length
-    ? `${usable.length} of ${installedLoras.length} installed LoRAs can attach to ${rec.label}.`
-    : `None of the installed LoRAs attach to ${rec.label}. ${LORA_GAP[base] ?? LORA_GAP.unknown}`
-
-  return { usable, ignored, note }
-}
-
-/**
- * What kind of LoRA would actually help, per architecture. Stated as kinds
- * rather than filenames: naming a specific download that may not exist is
- * worse than naming the gap.
- */
-const LORA_GAP: Record<Arch, string> = {
-  sdxl: 'The SDXL bases benefit most from a detail or skin texture LoRA at low strength, and from an anatomy correction LoRA for hands. Both are widely available for this architecture.',
-  chroma: 'Chroma LoRAs exist but are fewer than SDXL. A skin detail LoRA is the one worth hunting for.',
-  flux: 'Flux LoRAs are plentiful, though distilled Flux bases respond to them less strongly than the full weights do.',
-  zimage: 'Z-Image is new enough that the LoRA ecosystem is thin. Expect to rely on the base and the refine pass.',
-  qwen: 'Qwen Image LoRAs exist mainly for style. Anatomy is not something a style LoRA will repair here.',
-  anima: 'Anima LoRAs are rare. The base is already uncensored, so the gap matters less than it would elsewhere.',
-  wan: 'The installed LoRAs are Wan video LoRAs. They belong to the video desk and do nothing on an image base.',
-  unknown: 'Without knowing the base architecture there is no safe LoRA recommendation.',
-}
-
-/** Prompting advice for a chosen base, in one line. */
-export function promptStyleNote(rec: Pick<Recommendation, 'tagStyle'>): string {
-  return TAG_STYLE_NOTE[rec.tagStyle]
-}

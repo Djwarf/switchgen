@@ -57,7 +57,7 @@ export type DownloadJob = {
  * POST a download request and read its event stream. A refused request
  * answers JSON, and that error is thrown with the server's own sentence.
  */
-export async function streamDownload(
+async function streamDownload(
   body: Record<string, unknown>,
   onEvent: (e: DownloadEvent) => void,
   signal?: AbortSignal,
@@ -189,12 +189,12 @@ function patchRun(family: string, patch: Partial<PlanRun>): void {
   emitRuns()
 }
 
-export function subscribeDownloads(fn: () => void): () => void {
+function subscribeDownloads(fn: () => void): () => void {
   runListeners.add(fn)
   return () => { runListeners.delete(fn) }
 }
 
-export function downloadRuns(): ReadonlyMap<string, PlanRun> {
+function downloadRuns(): ReadonlyMap<string, PlanRun> {
   return runs
 }
 

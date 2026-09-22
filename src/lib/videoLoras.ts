@@ -38,7 +38,7 @@ export function partnerOf(file: string): string | null {
  * with no partner applies to both. On a one-model family the list passes
  * through, halves and all.
  */
-export function expandVideoStack(
+function expandVideoStack(
   specs: readonly LoraSpec[],
   def: FamilyDef,
   installed: ReadonlySet<string>,
