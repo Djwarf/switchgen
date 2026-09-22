@@ -89,7 +89,7 @@
  * admits it is weak is worth more than a confident wrong token.
  */
 import { createHash } from 'node:crypto'
-import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -97,8 +97,14 @@ import { fileURLToPath } from 'node:url'
 // Tuning. Every one of these is a judgement call, so each says what it costs.
 // ---------------------------------------------------------------------------
 
-/** Where the LoRAs live. Matches server/api.mjs and the ComfyUI install. */
-const LORA_DIR = process.env.SWITCHGEN_LORA_DIR ?? '/mnt/storage/ai/models/Lora'
+/**
+ * Where the LoRAs live: the Lora folder of the same models root the server
+ * reads (SWITCHGEN_MODELS, as in server/api.mjs), unless SWITCHGEN_LORA_DIR
+ * names it outright. It used to ignore SWITCHGEN_MODELS, so on any machine
+ * but the author's the indexer went looking in a folder that is not there.
+ */
+const LORA_DIR =
+  process.env.SWITCHGEN_LORA_DIR ?? join(process.env.SWITCHGEN_MODELS ?? '/mnt/storage/ai/models', 'Lora')
 
 /**
  * A tag must appear in this share of training images to be a trigger candidate.
@@ -940,6 +946,15 @@ function report(entries: Entry[]): void {
 }
 
 function main(): void {
+  // Without this the first thing a wrong folder produced was readdirSync's
+  // ENOENT stack trace, which names the folder but not the setting behind it.
+  if (!existsSync(LORA_DIR)) {
+    process.stderr.write(
+      `No LoRA folder at ${LORA_DIR}. Set SWITCHGEN_MODELS to the models root, or SWITCHGEN_LORA_DIR to the folder ` +
+        'itself. npm scripts do not read .env, so export them in the shell first. Nothing was written.\n',
+    )
+    process.exit(1)
+  }
   const { entries, dirFingerprint } = build()
   const current = readFileSync(TARGET, 'utf8')
   const begin = current.indexOf(BEGIN)

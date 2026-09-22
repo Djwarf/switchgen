@@ -19,8 +19,12 @@
  * rewiring mistake shows up as an opaque backend error at queue time rather
  * than as anything a reader could act on. A validator that checks only the
  * base graphs certifies the least interesting third of what actually runs.
+ *
+ * Before any of that, every node class those graphs use is looked up, whether
+ * or not the family's files are installed, so a missing node pack is named as
+ * a missing node pack. The exit code is 1 when anything FAILs, 2 when ComfyUI
+ * cannot be reached, and 0 otherwise; a SKIP never fails the run.
  */
-import { withVideoLoras } from '../src/lib/refine.ts'
 import { inventoryFrom, missingFilesFor } from '../src/lib/availability.ts'
 import { FAMILIES, IMG2IMG, defaultsFor, instantiate, type Params } from '../src/lib/workflows'
 import type { FamilyDef } from '../src/lib/registry'
@@ -47,6 +51,7 @@ import {
   instantiateDerived,
   instantiateRefine,
   withLoras,
+  withVideoLoras,
 } from '../src/lib/refine'
 
 const COMFY = process.env.COMFY_URL ?? 'http://127.0.0.1:8188'
@@ -57,7 +62,18 @@ function optionsOf(spec: any): string[] | null {
   return null
 }
 
-const res = await fetch(`${COMFY}/object_info`)
+// A refused connection used to end the run with fetch's own stack trace, and
+// the exit code 1 that means a graph failed. It is a sentence and exit code 2,
+// like the HTTP error below it.
+let res: Response
+try {
+  res = await fetch(`${COMFY}/object_info`)
+} catch (e) {
+  const cause = (e as { cause?: { code?: string; message?: string } }).cause
+  console.error(`Cannot reach ComfyUI at ${COMFY} (${cause?.code ?? cause?.message ?? (e as Error).message}).`)
+  console.error('Start it, or set COMFY_URL to where it listens. `bin/switchgen validate` reads COMFY_URL from .env; `npm run validate` reads only the environment.')
+  process.exit(2)
+}
 if (!res.ok) { console.error(`Cannot reach ComfyUI at ${COMFY} (HTTP ${res.status})`); process.exit(2) }
 const info: Record<string, any> = await res.json()
 
@@ -70,10 +86,85 @@ const loras = [...inv.loras]
 
 let fail = 0, skip = 0, ok = 0
 
+// ---------------------------------------------------------------------------
+// Node classes, and the packs that provide them.
+//
+// Everything below skips a family whose files ComfyUI does not list, and the
+// file list is read off the loader nodes themselves. So a missing pack never
+// looked like a missing pack: without ComfyUI-GGUF there is no UnetLoaderGGUF
+// to list the .gguf files, every quantised family was skipped as "missing" its
+// weights, the class check that would have named the node never ran, and the
+// run exited 0. Here every class any graph uses is looked up first, installed
+// files or not, including the derived graphs, which need no files to build.
+// ---------------------------------------------------------------------------
+
+/** The three packs README asks for, by the classes of theirs the graphs use. */
+const PACKS: Record<string, { url: string; classes: string[] }> = {
+  'ComfyUI-GGUF': {
+    url: 'https://github.com/city96/ComfyUI-GGUF',
+    classes: ['UnetLoaderGGUF', 'CLIPLoaderGGUF', 'DualCLIPLoaderGGUF', 'TripleCLIPLoaderGGUF'],
+  },
+  'ComfyUI-Impact-Pack': {
+    url: 'https://github.com/ltdrdata/ComfyUI-Impact-Pack',
+    classes: ['FaceDetailer', 'ImpactGaussianBlurMask'],
+  },
+  'ComfyUI-Impact-Subpack': {
+    url: 'https://github.com/ltdrdata/ComfyUI-Impact-Subpack',
+    classes: ['UltralyticsDetectorProvider'],
+  },
+}
+const packOf = (cls: string): string | null =>
+  Object.entries(PACKS).find(([, p]) => p.classes.includes(cls))?.[0] ?? (/^Impact/.test(cls) ? 'ComfyUI-Impact-Pack' : null)
+
+/** Every graph the app can send for a family, built without any of its files. */
+function graphsOf(def: FamilyDef): FamilyDef['graph'][] {
+  const out: (FamilyDef['graph'] | undefined)[] = [def.graph, IMG2IMG[def.id]?.graph]
+  if (def.mode === 'image') {
+    out.push(deriveRefine(def)?.graph, deriveAutoDetail(def, 'face')?.graph, deriveAutoDetail(def, 'hand')?.graph, deriveHiresFix(def)?.graph)
+  }
+  if (def.mode === 'video') {
+    out.push(deriveChainTap(def)?.graph, deriveContinuation(def)?.graph, deriveBookend(def)?.graph, deriveVaceShot(def)?.graph)
+  }
+  return out.filter((g): g is FamilyDef['graph'] => !!g)
+}
+
+const absent = new Map<string, Set<string>>()
+for (const def of FAMILIES) {
+  for (const graph of graphsOf(def)) {
+    for (const node of Object.values(graph)) {
+      if (info[node.class_type]) continue
+      if (!absent.has(node.class_type)) absent.set(node.class_type, new Set())
+      absent.get(node.class_type)!.add(def.label)
+    }
+  }
+}
+let nodeFail = 0
+const byPack = new Map<string | null, string[]>()
+for (const cls of absent.keys()) {
+  const pack = packOf(cls)
+  byPack.set(pack, [...(byPack.get(pack) ?? []), cls])
+}
+for (const [pack, classes] of byPack) {
+  const needers = [...new Set(classes.flatMap(c => [...absent.get(c)!]))]
+  if (pack) {
+    console.log(`FAIL  node pack ${pack} is not installed: ${classes.join(', ')} ${classes.length === 1 ? 'is' : 'are'} missing`)
+    console.log(`        install it from ${PACKS[pack]?.url ?? 'its repository'} and restart ComfyUI`)
+  } else {
+    console.log(`FAIL  ${classes.join(', ')} ${classes.length === 1 ? 'is' : 'are'} not in this ComfyUI, which may be older than these graphs need`)
+  }
+  console.log(`        needed by ${needers.join('; ')}`)
+  nodeFail++
+}
+/** When a family's files read as missing only because the pack that lists them is. */
+const unlisted = (missing: string[]) =>
+  missing.some(f => /\.gguf$/i.test(f)) && !info.UnetLoaderGGUF
+    ? 'the ComfyUI-GGUF node pack is not installed, so ComfyUI cannot list its .gguf files'
+    : null
+
 for (const def of FAMILIES) {
   const model = def.models.find(m => installed.has(m)) ?? def.models[0]
   const missing = missingFilesFor(def, inv)
-  if (missing.length) { console.log(`SKIP  ${def.label}: missing ${missing.join(', ')}`); skip++; continue }
+  if (missing.length) { console.log(`SKIP  ${def.label}: ${unlisted(missing) ?? `missing ${missing.join(', ')}`}`); skip++; continue }
 
   const d = defaultsFor(def, model)
   const wf = instantiate(def, {
@@ -130,6 +221,27 @@ for (const def of FAMILIES) {
   for (const k of need) {
     if (k === 'model' && def.dualModel) continue
     if (!def.bindings[k]?.length) errs.push(`no "${k}" binding, so the UI control would do nothing`)
+  }
+  // A binding to a node that is not there writes nothing, and one to an input
+  // the node does not take is refused at queue time. Either way the control
+  // on screen changes nothing, and nothing above notices, because instantiate
+  // skips a node it cannot find.
+  for (const [key, binds] of Object.entries(def.bindings)) {
+    for (const [id, input] of binds ?? []) {
+      const node = wf[id]
+      if (!node) { errs.push(`the "${key}" binding points at node ${id}, which is not in the graph`); continue }
+      const nd = info[node.class_type]
+      if (nd && !(input in { ...(nd.input?.required ?? {}), ...(nd.input?.optional ?? {}) })) {
+        errs.push(`the "${key}" binding writes "${input}" on node ${id} (${node.class_type}), which takes no such input`)
+      }
+    }
+  }
+  // The frame rate a clip is filed and played at is the one its encoder
+  // wrote. A video family whose fps binding reaches only the conditioning
+  // quotes a rate the file does not have.
+  if (def.mode === 'video') {
+    const encoder = (def.bindings.fps ?? []).some(([id, input]) => input === 'fps' && /^Save/.test(wf[id]?.class_type ?? ''))
+    if (!encoder) errs.push('the "fps" binding does not reach a Save node\'s fps input, so the clip is not written at the rate the desk shows')
   }
 
   if (errs.length) { fail++; console.log(`FAIL  ${def.label}`); errs.forEach(e => console.log(`        ${e}`)) }
@@ -296,7 +408,8 @@ for (const def of FAMILIES) {
 
   // --- region refine: the anatomy fix -------------------------------------
   const refine = deriveRefine(def)
-  if (refine !== null !== caps.refine) {
+  const refines = refine !== null
+  if (refines !== caps.refine) {
     console.log(`FAIL  ${def.label}: capabilitiesOf().refine disagrees with deriveRefine()`)
     qFail++
   }
@@ -462,7 +575,19 @@ function checkChainGraph(wf: ApiWorkflow): string[] {
   return checkGraph(wf).filter(e => !annotated.has(e.split(' ')[1] ?? '') || !e.includes('"image"='))
 }
 
-function checkChain(name: string, wf: ApiWorkflow | null, expect: string[], extra: string[] = []): void {
+/**
+ * `carries` says whether the family's own graph has what the shot needs, read
+ * independently of the derivation under test. A null derivation for a family
+ * that carries the shot is a regression, not a skip: it is how the reel would
+ * quietly lose "continue from the last frame" with every check still green.
+ */
+function checkChain(name: string, wf: ApiWorkflow | null, expect: string[], extra: string[] = [], carries = false): void {
+  if (!wf && carries) {
+    cFail++
+    console.log(`FAIL  ${name}`)
+    console.log('        the derivation returned nothing, but the family\'s graph has what this shot needs')
+    return
+  }
   if (!wf) { console.log(`SKIP  ${name}: the family cannot carry this shot`); cSkip++; return }
   const errs = [...checkChainGraph(wf), ...extra]
   const seen = classesOf(wf)
@@ -508,6 +633,13 @@ function tapErrors(graph: Record<string, { class_type: string; inputs: Record<st
  */
 const HANDOFF = `${CHAIN_PREFIX}/${NODE_IDS.frameSave}_00001_.png [output]`
 
+/**
+ * Nodes with a start_image slot, as the live schema has them. Stated here
+ * rather than imported from lib/continuation.ts, so a change to that module's
+ * own list cannot also change what this check expects.
+ */
+const FRAME_HOSTS = ['Wan22ImageToVideoLatent', 'WanImageToVideo', 'WanFirstLastFrameToVideo']
+
 const videoParamsFor = (def: FamilyDef, model: string): Params => {
   const d = defaultsFor(def, model)
   return { ...baseParamsFor(def, model), length: d.length || undefined, fps: d.fps || undefined }
@@ -516,12 +648,20 @@ const videoParamsFor = (def: FamilyDef, model: string): Params => {
 for (const def of FAMILIES) {
   if (def.mode !== 'video') continue
   if (!runnable(def)) {
-    console.log(`SKIP  ${def.label}: continued shots (weights not installed)`)
+    console.log(`SKIP  ${def.label}: continued shots (${unlisted(missingFilesFor(def, inv)) ?? 'weights not installed'})`)
     cSkip++
     continue
   }
   const model = def.models.find(m => installed.has(m)) ?? def.models[0]!
   const params = videoParamsFor(def, model)
+  const has = classesOf(def.graph)
+  const carries = {
+    // Every video graph decodes frames, so every one can publish its last.
+    tap: [...has].some(c => /^VAEDecode/.test(c)),
+    continuation: FRAME_HOSTS.some(c => has.has(c)),
+    bookend: has.has('WanImageToVideo') || has.has('WanFirstLastFrameToVideo'),
+    vace: has.has('WanVaceToVideo') || def.models.some(m => /vace/i.test(m)),
+  }
 
   // --- the opening shot: a plain family graph plus the tap -----------------
   const tap = deriveChainTap(def)
@@ -530,6 +670,7 @@ for (const def of FAMILIES) {
     tap ? instantiate(tap, needsOpeningFrame(def) ? { ...params, image: HANDOFF } : params) : null,
     ['ImageFromBatch', 'SaveImage'],
     tap ? tapErrors(tap.graph) : [],
+    carries.tap,
   )
 
   // --- the continued shot: opens on a supplied frame -----------------------
@@ -555,6 +696,7 @@ for (const def of FAMILIES) {
             : 'nothing is wired into a start_image slot, so the opening frame would be ignored',
         ].filter(Boolean)
       : [],
+    carries.continuation,
   )
 
   // --- the bookend: pinned at both ends ------------------------------------
@@ -583,6 +725,7 @@ for (const def of FAMILIES) {
             : '',
         ].filter(Boolean)
       : [],
+    carries.bookend,
   )
 
   // --- the VACE shot: gated until a VACE family is registered --------------
@@ -592,6 +735,7 @@ for (const def of FAMILIES) {
     vace ? instantiate(vace, { ...params, image: HANDOFF }) : null,
     ['WanVaceToVideo', 'TrimVideoLatent'],
     vace ? tapErrors(vace.graph) : [],
+    carries.vace,
   )
 
   // --- the seam, through the live path -------------------------------------
@@ -604,14 +748,21 @@ for (const def of FAMILIES) {
       shots: [{ prompt: 'the opening shot', ...(needsOpeningFrame(def) ? { startImage: 'opening-frame.png' } : {}) }, { prompt: 'the shot that continues it' }],
   })
   const [first, second] = plan.jobs
-  // A family with no image conditioning cannot open a shot on a supplied frame.
-    // wan22-14b-t2v is exactly that: correct behaviour, so skip rather than fail.
-    if (second && second.start.from !== 'previous') {
-      console.log(`SKIP  ${def.label}: two-shot seam: this family cannot continue from a frame`)
-      cSkip += 2
-    } else if (!first || !second) {
+  if (!first || !second) {
     console.log(`FAIL  ${def.label}: two-shot seam: shotPlan returned ${plan.jobs.length} jobs, not 2`)
     cFail++
+  } else if (second.start.from !== 'previous') {
+    // A family with no slot for a frame cannot continue one, and wan22-14b-t2v
+    // is exactly that: correct, so a skip. A family that has the slot and
+    // still plans shot 2 to start elsewhere has lost the reel's whole promise.
+    if (carries.continuation) {
+      console.log(`FAIL  ${def.label}: two-shot seam`)
+      console.log(`        shot 2 starts from "${second.start.from}", so the reel would not continue`)
+      cFail++
+    } else {
+      console.log(`SKIP  ${def.label}: two-shot seam: this family cannot continue from a frame`)
+      cSkip += 2
+    }
   } else {
     checkChain(`${def.label}: two-shot seam, shot 1`, instantiateShot(first, null), ['ImageFromBatch'])
 
@@ -630,9 +781,6 @@ for (const def of FAMILIES) {
         ...seamErrs,
         ...(shot2
           ? [
-              second.start.from === 'previous'
-                ? ''
-                : `shot 2 starts from "${second.start.from}", so the reel would not continue`,
               Object.values(shot2).some(n => n.class_type === 'LoadImage' && n.inputs.image === HANDOFF)
                 ? ''
                 : 'the handoff filename never reached a LoadImage',
@@ -647,8 +795,6 @@ for (const def of FAMILIES) {
   }
 }
 
-console.log(`\n${ok} ok, ${fail} failed, ${skip} skipped (base graphs)`)
-console.log(`${i2iOk} ok, ${i2iFail} failed, ${i2iSkip} skipped (image-to-image variants)`)
 // ---------------------------------------------------------------------------
 // Add-on chains on video families.
 //
@@ -657,7 +803,9 @@ console.log(`${i2iOk} ok, ${i2iFail} failed, ${i2iSkip} skipped (image-to-image 
 // already carries. Every runnable video family is chained with one installed
 // Wan add-on and the result checked node by node, plus the two things the
 // derivation promises: the right number of loaders appeared, and every
-// sampler still resolves to a loader through the chain.
+// sampler reaches its weights through one of them. A count alone passes a
+// loader added and left dangling, which ComfyUI prunes without a word, so the
+// add-on the reader chose would do nothing.
 // ---------------------------------------------------------------------------
 
 let vOk = 0, vFail = 0, vSkip = 0
@@ -680,15 +828,27 @@ for (const def of FAMILIES) {
   const after = Object.values(wf).filter(n => n.class_type === 'LoraLoaderModelOnly').length
   const want = before + (def.dualModel ? 2 : 1)
   if (after !== want) errs.push(`expected ${want} LoraLoaderModelOnly nodes after chaining, found ${after}`)
+  const added = new Set(derived.derived.loraNodes)
   for (const [id, n] of Object.entries(wf)) {
     if (!/Sampler|Guider|Scheduler/.test(n.class_type) || !('model' in n.inputs)) continue
     let cur = n.inputs.model as unknown
     let hops = 0
+    let reached = false
+    let through = false
     while (Array.isArray(cur) && hops++ < 12) {
       const up = wf[cur[0] as string]
       if (!up) { errs.push(`node ${id}: model chain reaches missing node ${cur[0]}`); break }
-      if (/^(CheckpointLoaderSimple|UNETLoader|UnetLoaderGGUF)$/.test(up.class_type)) break
+      if (added.has(cur[0] as string)) through = true
+      if (/^(CheckpointLoaderSimple|UNETLoader|UnetLoaderGGUF)$/.test(up.class_type)) { reached = true; break }
       cur = up.inputs.model
+    }
+    if (!reached && !errs.some(e => e.startsWith(`node ${id}:`))) {
+      errs.push(`node ${id} (${n.class_type}): its model chain never reaches a weights loader`)
+    }
+    // A scheduler reads the model for its sigmas only; the add-on has to be on
+    // what samples.
+    if (/Sampler|Guider/.test(n.class_type) && !through) {
+      errs.push(`node ${id} (${n.class_type}): samples without the add-on, which sits on no path to it`)
     }
   }
   if (errs.length) {
@@ -701,8 +861,14 @@ for (const def of FAMILIES) {
   }
 }
 
+console.log('')
+if (nodeFail) console.log(`${nodeFail} failed (node classes)`)
+console.log(`${ok} ok, ${fail} failed, ${skip} skipped (base graphs)`)
+console.log(`${i2iOk} ok, ${i2iFail} failed, ${i2iSkip} skipped (image-to-image variants)`)
 console.log(`${qOk} ok, ${qFail} failed, ${qSkip} skipped (quality derivations)`)
 console.log(`${cOk} ok, ${cFail} failed, ${cSkip} skipped (continuation derivations)`)
 console.log(`${vOk} ok, ${vFail} failed, ${vSkip} skipped (video add-on chains)`)
-fail += i2iFail + qFail + cFail
-process.exit(fail ? 1 : 0)
+// Every tally, the video add-on chains included: they were printed and then
+// left out of this sum, so a broken chain exited 0.
+const failed = nodeFail + fail + i2iFail + qFail + cFail + vFail
+process.exit(failed ? 1 : 0)

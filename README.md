@@ -17,7 +17,16 @@ You need a machine with an NVIDIA card, Node 22 or later, and ComfyUI. The app
 was built and measured on a 16 GB RTX 5060 Ti with 32 GB of RAM; smaller cards
 run the smaller families, and the desk says which fit before you press.
 
-### 1. Install ComfyUI
+### 1. Get the app
+
+```bash
+git clone git@github.com:Djwarf/switchgen.git
+cd switchgen
+```
+
+Every command below runs from this checkout.
+
+### 2. Install ComfyUI
 
 ComfyUI 0.37 or later, in its own Python venv, with three node packs the
 graphs depend on:
@@ -25,49 +34,90 @@ graphs depend on:
 | Pack | Provides |
 |---|---|
 | [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) | `UnetLoaderGGUF`, `CLIPLoaderGGUF`: every quantised family |
-| [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack) | `FaceDetailer`: the face and hand passes |
+| [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack) | `FaceDetailer`, `ImpactGaussianBlurMask`: the face and hand passes, and the soft edge of region refine |
 | [ComfyUI-Impact-Subpack](https://github.com/ltdrdata/ComfyUI-Impact-Subpack) | `UltralyticsDetectorProvider`: the detectors those passes use |
 
-Everything else the graphs use ships with ComfyUI. `npm run validate` names
-any node that is missing.
+Everything else the graphs use ships with ComfyUI. `bin/switchgen validate`
+(step 3) looks up every node class the graphs use before it looks at any
+weights, and names a missing pack as a missing pack.
 
 Point ComfyUI at a model library with the folder layout the app expects:
 copy `contrib/extra_model_paths.yaml` into ComfyUI's root and set `base_path`.
 The folders are `Stable-Diffusion`, `diffusion_models`, `text_encoders`,
-`VAE`, `Lora`, `ultralytics/bbox`, `ultralytics/segm` and, for the picture
-reader, `wd14`. Start ComfyUI with `--output-directory` pointing at the folder
-the app should file outputs from. `contrib/comfyui.service` is a systemd user
-unit that does this, which lets the launcher start ComfyUI on demand:
+`VAE`, `Lora`, `upscale_models`, `ultralytics/bbox`, `ultralytics/segm` and,
+for the picture reader, `wd14`.
+
+The passes offered on a finished picture need four files of their own, named
+in `src/lib/refine.ts` and `server/vision.mjs`. The catalogue does not fetch
+them:
+
+| File | Folder | Used by |
+|---|---|---|
+| `4x-UltraSharp.pth` | `upscale_models` | region refine, which enlarges the masked region before drawing it again |
+| `face_yolov8m.pt` | `ultralytics/bbox` | the face pass, and the picture reader |
+| `hand_yolov8s.pt` | `ultralytics/bbox` | the hand pass, and the picture reader |
+| `person_yolov8m-seg.pt` | `ultralytics/segm` | the picture reader |
+
+The upscaler is at
+[huggingface.co/Kim2091/UltraSharp](https://huggingface.co/Kim2091/UltraSharp)
+(`4x-UltraSharp.pth`). The three detectors are the ones the Impact Subpack's
+`install.py` downloads from
+[huggingface.co/Bingsu/adetailer](https://huggingface.co/Bingsu/adetailer).
+ComfyUI-Manager runs that script when it installs the pack; a pack cloned by
+hand has not run it. Run it yourself with the ComfyUI venv's Python, with
+`COMFYUI_MODEL_PATH` set to the model library, so the files land where the
+picture reader looks for them (it reads the library, not ComfyUI's own
+`models` folder):
 
 ```bash
+cd /path/to/ComfyUI/custom_nodes/ComfyUI-Impact-Subpack
+COMFYUI_MODEL_PATH=/path/to/models /path/to/ComfyUI/venv/bin/python install.py
+```
+
+Without the upscaler ComfyUI refuses region refine, and `switchgen validate`
+fails every region refine check with `"model_name"="4x-UltraSharp.pth" not in
+[...]`. Without a detector it does the same for the face or hand pass.
+
+Start ComfyUI with `--output-directory` pointing at the folder the app should
+file outputs from. `contrib/comfyui.service` is a systemd user unit that does
+this, which lets the launcher start ComfyUI on demand:
+
+```bash
+mkdir -p ~/.config/systemd/user
 cp contrib/comfyui.service ~/.config/systemd/user/   # then edit the two paths
 systemctl --user daemon-reload && systemctl --user enable --now comfyui
 ```
 
 Optional, each probed and reported rather than assumed: `aria2c` for
-downloads from the catalogue, `ffmpeg` and `ffprobe` for joining a reel, and
-`onnxruntime` plus `ultralytics` in the ComfyUI venv for the picture reader.
+downloads from the catalogue, `ffmpeg` and `ffprobe` for joining a reel and
+for thumbnails, and `onnxruntime` plus `ultralytics` in the ComfyUI venv for
+the picture reader.
 
-### 2. Install the app
+### 3. Install the app
 
 ```bash
-git clone git@github.com:Djwarf/switchgen.git
-cd switchgen
 cp .env.example .env            # set the models and outputs folders, and COMFY_URL
 npm install
-npm run validate                # every graph against your ComfyUI's live schema
+bin/switchgen validate          # every graph against your ComfyUI's live schema
 bin/switchgen install           # links the launcher into ~/.local/bin
 switchgen                       # builds, starts ComfyUI if it can, serves on :5273
 ```
+
+The launcher reads `.env`; npm scripts do not. `npm run validate` works as
+well, with `COMFY_URL` exported in the shell when ComfyUI is not on
+`127.0.0.1:8188`.
 
 The desk offers only families whose files are installed and fit in memory.
 Fetch the rest from the catalogue behind More, which shows each family's
 missing files, their size and the server's fit verdict. Add-ons are indexed
 from your own LoRA folder with `npm run index-loras`, which reads each file's
 header and rewrites `src/lib/loraIndex.ts`; the checked-in index describes
-the folder this was built against.
+the folder this was built against. It reads `SWITCHGEN_LORA_DIR`, or the
+`Lora` folder under `SWITCHGEN_MODELS`, from the environment, so export
+them first. The tests carry their own index rows, so a regenerated index
+does not change what `npm test` checks.
 
-### 3. Use it from a phone
+### 4. Use it from a phone
 
 The app binds every interface. `localhost`, this machine's hostname and
 addresses, and any `*.ts.net` name are allowed; add anything else to
@@ -101,19 +151,21 @@ schemas, which `npm run validate` checks against the live server.
 
 ### The local server
 
-Five Vite middlewares in `server/` mount under `/api` in both `vite dev` and
+Six Vite middlewares in `server/` mount under `/api` in both `vite dev` and
 `vite preview`. Every mutating route runs the same-origin guard in
 `server/guard.mjs`: the browser's `Sec-Fetch-Site` verdict when present, else
 `Origin` must match `Host`, and the body must be the type the route reads. A
 request with neither header (curl, a script) is allowed. `GET /api/capabilities`
-probes the binaries below and reports what actually runs.
+probes the binaries below and reports what actually runs. A JSON answer of
+1 KB or more is gzipped when the browser accepts it.
 
 | Route | Server | Purpose |
 |---|---|---|
 | `GET /api/capabilities` | api | What this server can do, probed not assumed |
-| `GET /api/hardware`, `GET /api/hardware/stream` | api | CPU, RAM, GPU, disk; one-shot and SSE |
-| `GET /api/models` | api | Every weight file under the models root |
-| `POST /api/delete` | api | Unlink one output or model, confined to its root |
+| `GET /api/hardware`, `GET /api/hardware/stream` | api | CPU, RAM, GPU, disk; one-shot, and SSE from one sampler shared by every viewer |
+| `GET /api/models` | api | Every weight file under the models root, leaving out any still being fetched (an `.aria2` file beside it) |
+| `POST /api/delete` | api | Unlink one output or model, confined to its root, and an output's thumbnails with it |
+| `GET /api/thumb?rel=&w=` | thumbs | A WebP of one output, 256, 512 or 1024 pixels wide, made with ffmpeg and kept under `<outputs>/.switchgen/thumbs`; a picture it cannot shrink is redirected to the full file |
 | `GET /api/archive`, `GET /api/archive/stream` | archive | The shared archive as a revision log, and its event stream |
 | `POST /api/archive/upsert`, `/remove`, `/restore` | archive | Write records; the server assigns revisions and edition numbers |
 | `GET /api/outputs` | archive | Every media file under the outputs root |
@@ -125,18 +177,22 @@ probes the binaries below and reports what actually runs.
 ### Environment
 
 Every path has a default and an override. The launcher reads them from a
-`.env` file beside `package.json`; `.env.example` lists them all.
+`.env` file beside `package.json`; `.env.example` lists them all. npm scripts
+(`npm run dev`, `validate`, `index-loras`) read only the environment, so
+export them first, or use `switchgen dev` and `switchgen validate`.
 
 | Variable | Default | Used by |
 |---|---|---|
-| `COMFY_URL` | `http://127.0.0.1:8188` | the Vite proxy, `validate`, `chain-e2e` |
-| `SWITCHGEN_PORT` | `5273` | where the app listens |
+| `COMFY_URL` | `http://127.0.0.1:8188` | the Vite proxy, the launcher, `validate`, `chain-e2e` |
+| `SWITCHGEN_PORT` | `5273` | where the app listens, and where the launcher looks for it |
+| `SWITCHGEN_NO_OPEN` | empty | the launcher: any value starts without opening a browser |
 | `SWITCHGEN_ALLOWED_HOSTS` | empty | extra hostnames the app may be reached by, comma separated |
-| `SWITCHGEN_MODELS` | `/mnt/storage/ai/models` | api, downloads, vision |
-| `SWITCHGEN_OUTPUTS` | `/mnt/storage/ai/outputs` | api, archive, reel, vision |
+| `SWITCHGEN_MODELS` | `/mnt/storage/ai/models` | api, downloads, vision, `index-loras` |
+| `SWITCHGEN_OUTPUTS` | `/mnt/storage/ai/outputs` | api, archive, thumbs, reel, vision |
 | `SWITCHGEN_ARCHIVE` | `<outputs>/.switchgen/archive.json` | archive |
+| `SWITCHGEN_THUMBS` | `<outputs>/.switchgen/thumbs` | thumbs |
 | `SWITCHGEN_CATALOG` | `server/catalog.json` | downloads |
-| `SWITCHGEN_ARIA2C`, `SWITCHGEN_FFMPEG`, `SWITCHGEN_FFPROBE` | `/usr/bin/...` | downloads, reel, capabilities |
+| `SWITCHGEN_ARIA2C`, `SWITCHGEN_FFMPEG`, `SWITCHGEN_FFPROBE` | `/usr/bin/...` | downloads, reel, thumbs, capabilities |
 | `HF_TOKEN_FILE` | `~/.cache/huggingface/token` | downloads, for gated files, only ever sent to HuggingFace |
 | `SWITCHGEN_COMFY`, `SWITCHGEN_COMFY_INPUT` | `/mnt/storage/repos/ComfyUI`, `<comfy>/input` | vision |
 | `SWITCHGEN_PYTHON` | `<comfy>/venv/bin/python` | vision |
@@ -148,10 +204,12 @@ Every path has a default and an override. The launcher reads them from a
 
 ```bash
 switchgen            # start ComfyUI if needed, build if anything changed, serve on :5273, open a browser
-switchgen --no-open  # the same without opening a browser
+switchgen --no-open  # the same without opening a browser (also: switchgen start --no-open)
 switchgen dev        # hot-reloading dev server
 switchgen validate   # check every graph and derivation against ComfyUI's live schema
-switchgen stop
+switchgen build      # build without serving
+switchgen stop       # stop this checkout's server; ComfyUI is left running
+switchgen install    # link the launcher into ~/.local/bin
 ```
 
 The launcher lives at `bin/switchgen`, reads `.env` beside `package.json`,
@@ -245,19 +303,21 @@ page says so and offers to fetch it.
 | Command | What it does |
 |---|---|
 | `npm run dev` / `build` / `preview` | Vite |
+| `npm start` | `bin/switchgen start` |
 | `npm run lint` | oxlint |
-| `npm run validate` | Every base graph, image-to-image variant, quality derivation, continuation derivation and video add-on chain, checked node by node against ComfyUI's live `/object_info` |
+| `npm test` | Vitest: the pure modules under `src/lib`, the reel engine with ComfyUI stood in, and the server middlewares against temporary folders. Needs no ComfyUI, no models and no running app |
+| `npm run validate` | Every node class the graphs use, naming a missing node pack, then every base graph, image-to-image variant, quality derivation, continuation derivation and video add-on chain, checked node by node against ComfyUI's live `/object_info`. Exits 1 when anything fails and 2 when ComfyUI cannot be reached |
 | `npm run index-loras` | Reads every safetensors header in the LoRA folder and writes `src/lib/loraIndex.ts`: bases, triggers and training vocabulary, with no network calls |
 | `npx tsx scripts/chain-e2e.ts` | A live two-shot reel on the 5B family, end to end, against the GPU |
 
 ## Runtime dependencies
 
 Node 22 or later. ComfyUI 0.37 or later on `:8188` with the three node packs
-under Getting started; `nvidia-smi` and GNU `df` for the hardware line;
-`aria2c` for downloads; `ffmpeg` and `ffprobe` for the reel; the ComfyUI
-venv's Python with `onnxruntime`, `numpy`, `Pillow` and `ultralytics` for the
-reader. Each is probed, and a feature whose binary is missing stands down with
-a sentence rather than failing later.
+and the four pass files under Getting started; `nvidia-smi` and GNU `df` for
+the hardware line; `aria2c` for downloads; `ffmpeg` and `ffprobe` for the reel
+and thumbnails; the ComfyUI venv's Python with `onnxruntime`, `numpy`, `Pillow`
+and `ultralytics` for the reader. Each is probed, and a feature whose binary is
+missing stands down with a sentence rather than failing later.
 
 ## Network posture
 
@@ -281,5 +341,7 @@ to know.
 ## Verifying a change
 
 ```bash
-npx tsc -b && npx oxlint && npm run validate && npm run build
+npx tsc -b && npx oxlint && npm test && npm run validate && npm run build
 ```
+
+CI runs all of it except `validate`, which needs a live ComfyUI.
