@@ -62,7 +62,10 @@ ensure_comfy() {
     cat >&2 <<MSG
 ComfyUI is not answering at $COMFY_URL and there is no user service to start.
 Start it yourself (see README.md, "Install ComfyUI"), or install the sample
-unit: cp contrib/comfyui.service ~/.config/systemd/user/ and edit the paths.
+unit, editing the two paths in the copy before enabling it:
+  mkdir -p ~/.config/systemd/user
+  cp "$APP/contrib/comfyui.service" ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now comfyui
 The app will open anyway and retry every few seconds.
 MSG
   fi

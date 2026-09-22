@@ -156,6 +156,12 @@ function annotateDep(dep, index) {
   // machine's own Z-Image text encoder is one), and resuming onto it would
   // append the catalogue file's tail to it and destroy both.
   const atDest = !!hit && hit.rel === dep.dest
+  // Such a file counts as installed. A graph loads a file by its name, so
+  // that is the file the family will use, and the fetch will not touch it.
+  // Counted as missing, it blocked the whole family: the fit check refused,
+  // and a forced fetch stopped at it before reaching the files that really
+  // were missing. The flag stays, so the verdict can say what is there.
+  const conflict = atDest && !complete && !hit.resumable
   return {
     filename: dep.filename,
     kind: dep.kind,
@@ -168,11 +174,11 @@ function annotateDep(dep, index) {
     gated: !!dep.gated,
     optional: !!dep.optional,
     note: dep.note || '',
-    installed: complete,
+    installed: complete || conflict,
     installedPath: hit ? hit.rel : null,
     installedBytes: hit ? hit.size : 0,
     partial: atDest && !complete && hit.resumable,
-    conflict: atDest && !complete && !hit.resumable,
+    conflict,
   }
 }
 
@@ -300,11 +306,12 @@ function fitVerdict(fam, ann, hw) {
       blockers.push(`${f.filename} answered HTTP ${f.httpStatus} when its URL was last checked.`)
     }
     if (f.conflict) {
-      blockers.push(
-        `${f.dest} is already on disk at ${human(f.installedBytes)}` +
-        (f.sizeBytes ? `, not the ${human(f.sizeBytes)} this family expects,` : '') +
+      reasons.push(
+        `${f.dest} is on disk at ${human(f.installedBytes)}` +
+        (f.sizeBytes ? `, not the ${human(f.sizeBytes)} the catalogue lists,` : '') +
         ` and it is not a fetch that stopped part way. It is probably another version of the file under the ` +
-        `same name, so it is left alone: move it aside to fetch this one.`)
+        `same name, so it is kept and used as it is, and the catalogue's own is not fetched. To fetch that one, ` +
+        `move this file aside first.`)
     }
   }
 
@@ -596,6 +603,38 @@ function fetchFile(job, onProgress) {
   })().catch(reject) })
 }
 
+/** The other live job on this job's file, if another plan has one. */
+function sharing(job) {
+  for (const j of jobs.values()) if (j !== job && j.dest === job.dest) return j
+  return null
+}
+
+/**
+ * Wait while another plan has this job's file, until its turn on the file is
+ * over or this plan is stopped. Its progress is passed on meanwhile, because
+ * the file is being fetched, just not by this plan.
+ */
+async function awaitTurn(other, job, plan, onProgress) {
+  const { signal } = plan.abort
+  if (signal.aborted) return
+  let stop
+  const stopped = new Promise(resolve => { stop = resolve })
+  signal.addEventListener('abort', stop, { once: true })
+  const mirror = setInterval(() => {
+    job.done = other.done
+    if (other.total) job.total = other.total
+    job.speed = other.speed
+    job.etaSec = other.etaSec
+    onProgress(job)
+  }, 500)
+  try {
+    await Promise.race([other.settled, stopped])
+  } finally {
+    clearInterval(mirror)
+    signal.removeEventListener('abort', stop)
+  }
+}
+
 /**
  * Run a queue of files through aria2c, streaming SSE for each. `plan` is the
  * request's own stop switch (see stopPlan), checked before each file starts
@@ -627,9 +666,26 @@ async function runPlan(res, queue, familyId, plan) {
       if (plan.cancelled) throw new Error('cancelled')
       const full = confine(MODELS, job.dest)
       if (!full) throw new Error('destination escapes the models root')
-      // Trust the wire over the catalogue for the progress denominator.
-      const token = job.gated && tokenAllowedFor(job.url) ? await hfToken() : null
-      const { size, status, offsite } = await remoteSize(job.url, token, plan.abort.signal)
+      // Families share files: one text encoder serves more than a dozen of
+      // them. The check when a fetch is asked for sees only the file each
+      // running plan is on at that moment, so two plans could still reach one
+      // file, and the second read the first one's control file as a partial
+      // of its own and started a second aria2c on the same bytes. The
+      // transfer was made twice, and stopping either plan deleted the file
+      // the other was still writing. This plan waits its turn instead. The
+      // look is made before anything here yields, and this job is already
+      // in the table, so two plans cannot each find the other and both wait.
+      let landed = false
+      for (let other = sharing(job); other; other = sharing(job)) {
+        await awaitTurn(other, job, plan, j => sse(res, 'progress', publicJob(j)))
+        if (plan.cancelled) throw new Error('cancelled')
+        landed = other.state === 'done'
+      }
+      // Trust the wire over the catalogue for the progress denominator. A
+      // file the other plan has just landed is not fetched, so it is not asked
+      // about either.
+      const token = !landed && job.gated && tokenAllowedFor(job.url) ? await hfToken() : null
+      const { size, status, offsite } = landed ? {} : await remoteSize(job.url, token, plan.abort.signal)
       if (plan.cancelled) throw new Error('cancelled')
       if (size) job.total = size
       if (status && status >= 400) throw new Error(`${job.filename} answered HTTP ${status}`)
@@ -638,8 +694,10 @@ async function runPlan(res, queue, familyId, plan) {
       }
       const already = await fs.stat(full).catch(() => null)
       // A control file beside it means aria2c has not finished it, whatever its size.
+      // One the other plan landed while this one waited was checked by that
+      // plan against the wire's size, and needs no second check.
       const resumable = await exists(full + '.aria2')
-      if (already && !resumable && job.total && already.size >= job.total) {
+      if (already && !resumable && (landed || (job.total && already.size >= job.total))) {
         job.done = already.size
         job.state = 'done'
         bytes += job.done
@@ -790,16 +848,19 @@ export const downloadsMiddleware = async (req, res, next) => {
       // resume later. Only a file with aria2c's control file beside it is a
       // partial. Anything else at that path was there before this fetch, a
       // finished file or another one under the same name, and is not the
-      // cancel's to delete.
+      // cancel's to delete. Nor is a partial another plan is on: it is either
+      // fetching that file or waiting to take it over from this one (see
+      // awaitTurn), and deleting it lost that plan's whole transfer.
       const full = confine(MODELS, job.dest)
       const removed = []
-      if (full && b.keepPartial !== true && await exists(full + '.aria2')) {
+      const shared = !!sharing(job)
+      if (full && b.keepPartial !== true && !shared && await exists(full + '.aria2')) {
         for (const f of [full, full + '.aria2']) {
           try { await fs.unlink(f); removed.push(path.relative(MODELS, f)) } catch {}
         }
         installedCache = { at: 0, byName: new Map() }
       }
-      return send(res, 200, { cancelled: b.id, removed, keptPartial: b.keepPartial === true })
+      return send(res, 200, { cancelled: b.id, removed, keptPartial: b.keepPartial === true || shared })
     }
 
     // ---- POST /api/download -----------------------------------------------

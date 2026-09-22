@@ -155,17 +155,28 @@ async function sizeOf(p) {
 }
 
 /**
- * Is a fetched file all there? Being on disk is not enough: aria2c writes
- * under the final name, so a fetch cut short leaves a file that exists and
- * does not load, and nothing in the app would fetch it again. aria2c keeps its
- * control file beside a download until the last byte lands, and with several
- * connections it fills pieces out of order, so a file can reach full size
- * while still a partial. A file cut short some other way is caught by its
- * size, with the same 0.5% of slack the downloader's own check allows.
+ * Is a fetched file all there, and if not, can a fetch mend it? Being on disk
+ * is not enough: aria2c writes under the final name, so a fetch cut short
+ * leaves a file that exists and does not load, and nothing in the app would
+ * fetch it again. aria2c keeps its control file beside a download until the
+ * last byte lands, and with several connections it fills pieces out of order,
+ * so a file can reach full size while still a partial. A file cut short some
+ * other way is caught by its size, with the same 0.5% of slack the
+ * downloader's own check allows.
+ *
+ * 'partial' and 'short' are told apart because a fetch treats them
+ * differently. The downloader resumes a file with aria2c's control file
+ * beside it, and refuses to touch any other file already there, so a short
+ * file without one (copied in by hand, or its control file deleted) cannot be
+ * mended by fetching again: it has to be moved aside first.
+ *
+ * @returns {Promise<'absent' | 'whole' | 'partial' | 'short'>}
  */
-async function whole(p, bytes) {
+async function fileState(p, bytes) {
   const [size, partial] = await Promise.all([sizeOf(p), exists(p + '.aria2')])
-  return size != null && !partial && size >= bytes * 0.995
+  if (size == null) return 'absent'
+  if (partial) return 'partial'
+  return size >= bytes * 0.995 ? 'whole' : 'short'
 }
 
 /**
@@ -185,6 +196,7 @@ async function resolveImages(list) {
     if (typeof rel !== 'string' || !rel.trim()) { bad.push({ index: i, error: 'rel must be a non-empty string' }); continue }
     // A control character in a path is never legitimate here and is the one
     // thing that could change how a child reads its argument list.
+    // oxlint-disable-next-line no-control-regex -- matching them is the point
     if (/[\u0000-\u001f]/.test(rel)) { bad.push({ index: i, error: 'path contains a control character' }); continue }
     if (!IMAGE.test(rel)) { bad.push({ index: i, error: 'not an image extension' }); continue }
     const full = await confineReal(root, rel)
@@ -428,9 +440,16 @@ function runPython(request, signal) {
  */
 async function capabilities() {
   const [modelSource, tagsSource] = WD14_SOURCE.files
-  const [python, model, tagsCsv, modelStarted] = await Promise.all([
-    exists(PYTHON), whole(WD14_MODEL, modelSource.sizeBytes), whole(WD14_TAGS, tagsSource.sizeBytes), exists(WD14_MODEL),
+  const [python, modelState, tagsState] = await Promise.all([
+    exists(PYTHON), fileState(WD14_MODEL, modelSource.sizeBytes), fileState(WD14_TAGS, tagsSource.sizeBytes),
   ])
+  const model = modelState === 'whole'
+  const tagsCsv = tagsState === 'whole'
+  const modelStarted = modelState !== 'absent'
+  // Short files a fetch would refuse to touch (see fileState).
+  const stuck = [[modelState, WD14_MODEL], [tagsState, WD14_TAGS]]
+    .filter(([state]) => state === 'short')
+    .map(([, file]) => file)
   const [modelBytes, detectors] = await Promise.all([
     sizeOf(WD14_MODEL),
     (async () => {
@@ -452,15 +471,25 @@ async function capabilities() {
     device: 'cpu',
     roots: { ...ROOTS },
     // Everything a client needs to offer the fetch through POST /api/download,
-    // which already confines writes to the models root.
-    install: tagger ? null : { ...WD14_SOURCE, missing: [!model && 'model.onnx', !tagsCsv && 'selected_tags.csv'].filter(Boolean) },
+    // which already confines writes to the models root. Nothing is offered
+    // while a short file stands in the way: that fetch would be refused, and
+    // the reason says what to do instead.
+    install: tagger || stuck.length
+      ? null
+      : { ...WD14_SOURCE, missing: [!model && 'model.onnx', !tagsCsv && 'selected_tags.csv'].filter(Boolean) },
     reason: tagger
       ? null
       : !python
         ? `no interpreter at ${PYTHON}; set SWITCHGEN_PYTHON to one that has onnxruntime`
-        : modelStarted && !model
-          ? 'the tagger download did not finish; fetch it again to complete it'
-          : `the tagger is not downloaded yet; it is ${(modelSource.sizeBytes / 1048576).toFixed(0)} MB`,
+        : stuck.length === 1
+          ? `${stuck[0]} is on disk but short of its full size, and is not a download that stopped part way, ` +
+            'so a fetch will not replace it; move it aside, then fetch the tagger'
+          : stuck.length
+            ? `${stuck.join(' and ')} are on disk but short of their full size, and are not downloads that ` +
+              'stopped part way, so a fetch will not replace them; move them aside, then fetch the tagger'
+            : modelStarted && !model
+              ? 'the tagger download did not finish; fetch it again to complete it'
+              : `the tagger is not downloaded yet; it is ${(modelSource.sizeBytes / 1048576).toFixed(0)} MB`,
   }
 }
 

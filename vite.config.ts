@@ -13,7 +13,7 @@ import { switchgenReel } from './server/reel.mjs'
 import { switchgenThumbs } from './server/thumbs.mjs'
 import { switchgenVision } from './server/vision.mjs'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
-import { upgradeAllowed } from './server/guard.mjs'
+import { proxyWriteGuard, upgradeAllowed } from './server/guard.mjs'
 
 // ComfyUI runs as a systemd user service on :8188.
 // Proxy through Vite so the browser sees one origin (no CORS, no mixed content).
@@ -36,10 +36,28 @@ const proxy = {
     // makes Vite answer 404 and close the socket.
     bypass: (req: IncomingMessage) => (upgradeAllowed(req, allowedHosts) ? undefined : false),
   },
+  // Writes here are checked for origin before they reach this entry, by
+  // guardComfyWrites below: the Origin rewrite hides the sending page from
+  // ComfyUI's own check.
   '/comfy': {
     target: COMFY, changeOrigin: true, headers,
     rewrite: (p: string) => p.replace(/^\/comfy/, ''),
   },
+}
+
+/**
+ * Hold writes bound for ComfyUI to the origin rule the /api routes follow
+ * (proxyWriteGuard in server/guard.mjs). A plugin's own middleware runs ahead
+ * of Vite's proxy, in the dev server and in preview alike, so a refused write
+ * is answered 403 here and never forwarded.
+ */
+function guardComfyWrites(): Plugin {
+  const guard = proxyWriteGuard('/comfy')
+  return {
+    name: 'switchgen-comfy-guard',
+    configureServer(server) { server.middlewares.use(guard) },
+    configurePreviewServer(server) { server.middlewares.use(guard) },
+  }
 }
 
 // Reachable from the LAN and over Tailscale, not just this machine.
@@ -99,6 +117,7 @@ function stampServiceWorker(): Plugin {
 
 export default defineConfig({
   plugins: [
+    guardComfyWrites(),
     react(),
     tailwindcss(),
     switchgenApi(),
@@ -130,9 +149,15 @@ export default defineConfig({
       },
     },
   },
-  server: { host, port, proxy, allowedHosts },
+  // cors: false. Vite's default gives every page served from localhost,
+  // 127.0.0.1 or [::1], on any port, leave to read what this server answers,
+  // and passes those pages' preflights, so their scripts could read /comfy
+  // (the pictures, the history) and /api, and send JSON writes that only the
+  // origin checks stood in front of. The app's pages come from this server's
+  // own origin and need no CORS at all.
+  server: { host, port, proxy, allowedHosts, cors: false },
   // strictPort: with the port taken, preview used to move to the next free
   // one without a word, and the launcher found the old server still answering
   // on this one. Failing is the honest answer; bin/switchgen reports it.
-  preview: { host, port, strictPort: true, proxy, allowedHosts },
+  preview: { host, port, strictPort: true, proxy, allowedHosts, cors: false },
 })

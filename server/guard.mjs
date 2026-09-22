@@ -274,6 +274,17 @@ export function upgradeAllowed(req, allowedHosts) {
 }
 
 /**
+ * Refuse a write that did not come from one of this server's own pages.
+ * Answers 403 itself and returns false; a read, or a write that passes,
+ * returns true and is left for the caller to handle.
+ */
+export function guardOrigin(req, res) {
+  if (!MUTATING.has(req.method) || sameOrigin(req)) return true
+  send(res, 403, { error: 'cross-site request refused: this server takes writes only from its own pages' })
+  return false
+}
+
+/**
  * The check every mutating route runs before it reads a byte of body.
  *
  * Answers the request itself and returns false when it must not proceed. The
@@ -283,16 +294,39 @@ export function upgradeAllowed(req, allowedHosts) {
  */
 export function guardMutation(req, res, accept = ['application/json']) {
   if (!MUTATING.has(req.method)) return true
-  if (!sameOrigin(req)) {
-    send(res, 403, { error: 'cross-site request refused: this server takes writes only from its own pages' })
-    return false
-  }
+  if (!guardOrigin(req, res)) return false
   const ct = String(req.headers['content-type'] ?? '').toLowerCase()
   if (!accept.some(a => ct.startsWith(a))) {
     send(res, 415, { error: `body must be ${accept.join(' or ')}` })
     return false
   }
   return true
+}
+
+/**
+ * The origin rule, for writes that go through the proxy to ComfyUI.
+ *
+ * The proxy rewrites Origin to ComfyUI's own address, because ComfyUI refuses
+ * a request whose Origin and Host differ and the browser's Origin names this
+ * server. The rewrite also blinds ComfyUI's own check to the page that sent
+ * the request. That check refuses only what the browser marks cross-site,
+ * and a page on another port of this machine's address is same-site, so any
+ * such page could queue a workflow, unload the models, stop a render, upload
+ * files or call the manager's routes. Writes are held to the rule the /api
+ * routes follow instead. Reads pass as they did; turning off Vite's CORS
+ * (vite.config.ts) keeps another origin's scripts from reading what comes
+ * back.
+ *
+ * Only the origin is checked. ComfyUI's own routes take multipart uploads as
+ * well as JSON, so the body type is left to them. `prefix` is matched the way
+ * Vite's proxy matches its keys, from the start of the raw URL, so nothing
+ * the proxy forwards can pass under a spelling this check does not see.
+ */
+export function proxyWriteGuard(prefix) {
+  return (req, res, next) => {
+    if (String(req.url ?? '').startsWith(prefix) && !guardOrigin(req, res)) return
+    next()
+  }
 }
 
 // ------------------------------------------------------------------- tools --

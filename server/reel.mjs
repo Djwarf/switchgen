@@ -51,6 +51,7 @@ const PROBE_MS = 20000
  * one, naming a file outside the outputs root that the confinement never saw.
  * There is no legitimate reason for a generated clip to carry one.
  */
+// oxlint-disable-next-line no-control-regex -- matching them is the point
 const CONTROL = /[\u0000-\u001f\u007f]/
 
 // ------------------------------------------------------------------ plumbing
@@ -590,7 +591,7 @@ export function switchgenReel() {
           const compat = compatibility(clips)
           return send(res, 200, {
             root: OUTPUTS,
-            clips: clips.map(({ full, ...rest }) => rest),
+            clips: clips.map(({ full: _full, ...rest }) => rest),
             total: {
               seconds: clips.reduce((s, c) => s + c.duration, 0),
               frames: clips.reduce((s, c) => s + (c.frames ?? 0), 0),

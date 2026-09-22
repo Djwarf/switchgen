@@ -16,7 +16,9 @@
  *                     deleting the newest picture hands its name to the next
  *                     render. A copy kept by name is therefore not proof of
  *                     what is on disk now. The cache keeps the archive
- *                     browsable when the connection drops.
+ *                     browsable when the connection drops. A clip a player
+ *                     streams in byte ranges is left to the browser, and
+ *                     is not kept.
  *   /api/thumb?...    The one /api path kept, by the same rule and for the
  *                     same reason: a thumbnail is named by its file, so the
  *                     server is asked first every time, and it answers from
@@ -95,6 +97,13 @@ self.addEventListener('fetch', (event) => {
     // lets a navigation be re-issued with other cache settings, so it is left
     // to the browser.
     if (request.mode === 'navigate') return
+    // A clip played in a <video> asks for byte ranges, and its request is
+    // no-cors. Re-issuing a no-cors request with any settings at all (the
+    // cache setting below) rebuilds its headers under the no-cors rules, and
+    // those drop Range: every seek fetched the whole clip again, and every
+    // clip opened was kept whole in the media cache. So a ranged request, and
+    // anything a media element asks for, goes to the browser untouched.
+    if (request.headers.has('range') || request.destination === 'video' || request.destination === 'audio') return
     const name = thumb ? THUMBS : MEDIA
     const max = thumb ? THUMBS_MAX : MEDIA_MAX
     event.respondWith((async () => {

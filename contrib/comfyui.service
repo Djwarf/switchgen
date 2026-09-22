@@ -1,5 +1,6 @@
 # A systemd user unit for ComfyUI, so `switchgen` can start it on demand.
 #
+#   mkdir -p ~/.config/systemd/user
 #   cp contrib/comfyui.service ~/.config/systemd/user/
 #   edit the two paths below
 #   systemctl --user daemon-reload && systemctl --user enable --now comfyui
