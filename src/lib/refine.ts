@@ -47,7 +47,8 @@
  * Dependency direction: this module imports workflows.ts. Do not import this
  * module from workflows.ts or registry.ts.
  */
-import type { ApiWorkflow } from './comfy'
+import type { ApiWorkflow, FileRef } from './comfy'
+import type { HistoryEntry } from './history'
 import type { Binding, FamilyDef } from './registry'
 import { instantiate, type Params } from './workflows'
 
@@ -295,10 +296,19 @@ export function detailGain(
 /** The useful denoise band for a region re render. */
 export const REFINE_DENOISE = { min: 0.35, max: 0.55, default: 0.45 } as const
 
-/** Upscale model, verified present in UpscaleModelLoader.model_name. */
-const UPSCALE_MODEL = '4x-UltraSharp.pth'
+/**
+ * Upscale model, verified present in UpscaleModelLoader.model_name on the
+ * machine this was written on. Another machine may not have it, so the desks
+ * check it against /object_info (availability.ts, passBlocks) before offering
+ * a region pass.
+ */
+export const UPSCALE_MODEL = '4x-UltraSharp.pth'
 
-/** Detector files, verified present in UltralyticsDetectorProvider.model_name. */
+/**
+ * Detector files, verified present in UltralyticsDetectorProvider.model_name on
+ * the machine this was written on. Checked the same way before a face or hand
+ * pass is offered.
+ */
 export const DETECTORS = {
   face: 'bbox/face_yolov8m.pt',
   hand: 'bbox/hand_yolov8s.pt',
@@ -1191,6 +1201,69 @@ export function capabilitiesOf(def: FamilyDef | DerivedDef): Capabilities {
     hires: deriveHiresFix(def) !== null,
     loras: canTakeLoras(def),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Which finished pictures can be made again from their record
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a picture's graph can be rebuilt from its archive record.
+ *
+ * The face, hand, larger render and "make another" rows all re-render a
+ * picture from its record. A region pass is filed against the ORIGINAL picture
+ * with the region prompt, and nothing on the record says which region or what
+ * mask: rebuilt, it redraws the whole original frame at the region's strength
+ * and throws the refine away. It is filed with the variant `refine` for that
+ * reason. A variant this build does not know came from a newer one sharing the
+ * archive, and what it ran cannot be read off this record here either.
+ *
+ * Region passes filed before `refine` existed say image to image with no pixel
+ * budget, which plain image to image always files. A record recovered from
+ * ComfyUI that does not say how it was sized looks the same, and cannot be
+ * rebuilt faithfully either.
+ *
+ * Here rather than on one desk, so every surface that offers to run a record
+ * again (the desk's own rows, the archive's "Load these settings") asks the
+ * same question.
+ */
+export function rebuildable(entry: Pick<HistoryEntry, 'variant' | 'mode' | 'megapixels'>): boolean {
+  const v = entry.variant
+  if (v !== null && v !== 'img2img' && v !== 'nolora' && v !== 'i2v') return false
+  return !(entry.mode === 'i2i' && entry.megapixels == null)
+}
+
+/**
+ * Where a region pass was drawn: the record of that picture, the output file
+ * it names, the copy in ComfyUI's input folder, or nothing left.
+ */
+export type RegionOrigin =
+  | { kind: 'record'; entry: HistoryEntry }
+  | { kind: 'output'; ref: FileRef; fromEntryId?: string }
+  | { kind: 'input'; name: string; fromEntryId?: string }
+  | { kind: 'gone' }
+
+/**
+ * The picture a region pass was drawn on, found again.
+ *
+ * Null for anything that is not a region pass. The record it came from is
+ * preferred, when it is still in the archive and its file is still on disk;
+ * then the output file the source names; then the copy the pass itself loaded
+ * from ComfyUI's input folder, which is all an uploaded picture ever had.
+ * Else it is gone, and the caller says so rather than opening an empty bench.
+ */
+export function regionOrigin(
+  entry: Pick<HistoryEntry, 'variant' | 'source'>,
+  records: readonly HistoryEntry[],
+): RegionOrigin | null {
+  if (entry.variant !== 'refine') return null
+  const src = entry.source
+  const fromEntryId = src?.fromEntryId || undefined
+  const from = fromEntryId ? records.find((r) => r.id === fromEntryId) : undefined
+  if (from && !from.missing) return { kind: 'record', entry: from }
+  if (src?.ref) return { kind: 'output', ref: src.ref, fromEntryId }
+  if (src?.name) return { kind: 'input', name: src.name, fromEntryId }
+  return { kind: 'gone' }
 }
 
 /**

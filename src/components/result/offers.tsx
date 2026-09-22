@@ -32,6 +32,7 @@
  * never a claim about anatomical correctness, and the surface prints the caveat
  * next to them rather than leaving the reader to assume otherwise.
  */
+import type { PassBlocks } from '../../lib/availability'
 import { MEASURED } from '../../lib/recipe'
 import {
   capabilitiesOf,
@@ -150,6 +151,33 @@ export type OfferOptions = {
    * file itself and stay.
    */
   rebuild?: boolean
+  /**
+   * The graph the region bench would draw with, when that is not `def`.
+   *
+   * The bench draws a region with a plain family graph, never with the passes
+   * the picture already had, so a picture made with "Render it bigger" can
+   * still have a region redrawn. Asked of `def`, which carries that larger
+   * render, the refine derivation says no, and the row vanished from every
+   * such picture while the bench itself worked on it. Null means no installed
+   * model can redraw a region.
+   */
+  region?: FamilyDef | DerivedDef | null
+  /**
+   * What stops a pass from running on this ComfyUI, naming the missing file or
+   * node pack. A row whose pass is blocked is left out and its sentence is
+   * printed instead: ComfyUI refuses the job over the file, and a row that
+   * queues a refused job is worse than none.
+   */
+  blocks?: Partial<PassBlocks>
+  /**
+   * Set when the picture is itself a region pass. Such a picture cannot be
+   * made again from its record, which files the region's words against the
+   * whole picture it was drawn on and keeps no mask. "Make another" then
+   * reopens the region bench on that picture instead: `from` names it, or is
+   * null when it is no longer here, and the row gives way to a sentence
+   * saying so.
+   */
+  regionPass?: { from: string | null } | null
 }
 
 /** "The detector found 2 hands, the larger 3.1% of the frame." or that it found none. */
@@ -170,9 +198,9 @@ function foundSentence(facts: ImageFacts | null | undefined, part: 'hand' | 'fac
  *
  * `def` is the graph the picture was made with, which on a recipe is `plan.def`:
  * the derived def with image to image and the LoRA chain already applied. That
- * matters, because a def that already carries a hires pass cannot also carry a
- * refine, and asking the real graph is how this surface finds that out instead
- * of assuming.
+ * matters for the passes that re-render the picture, which have to derive
+ * from the real graph. The region row is the exception: the bench draws with
+ * a graph of its own, which `opts.region` hands in when it differs.
  *
  * A null def means the desk does not know what made this picture, which is the
  * case for a picture opened out of the archive before its family is resolved.
@@ -187,20 +215,23 @@ export function offersFor(
   const out: ResultOffer[] = []
   const caps = def ? capabilitiesOf(def) : null
   const rebuild = opts.rebuild !== false
+  const blocks = opts.blocks ?? {}
+  const regionDef = opts.region === undefined ? def : opts.region
+  const region = regionDef ? deriveRefine(regionDef) : null
 
-  if (def && caps?.refine) {
+  if (region && !blocks.refine) {
     out.push({
       id: 'refine',
       label: 'Sharpen a region',
       what:
         'Mark one part of the picture. It is cut out, enlarged to full working resolution, drawn again and composited back. The only thing that adds real detail where no detector can find the region for you.',
       measured: `Measured ${ratio(MEASURED_REFINE.ratio)} sharpness on ${MEASURED_REFINE.region}. Sharpness, not anatomical correctness.`,
-      ...costOf(deriveRefine(def)),
+      ...costOf(region),
       group: 'improve',
     })
   }
 
-  if (def && rebuild && caps?.handDetail) {
+  if (def && rebuild && caps?.handDetail && !blocks.hand) {
     out.push({
       id: 'hand',
       label: 'Fix the hands',
@@ -213,7 +244,7 @@ export function offersFor(
     })
   }
 
-  if (def && rebuild && caps?.faceDetail) {
+  if (def && rebuild && caps?.faceDetail && !blocks.face) {
     out.push({
       id: 'face',
       label: 'Fix the face',
@@ -250,6 +281,17 @@ export function offersFor(
       costNote: 'One ordinary generation.',
       group: 'carry',
     })
+  } else if (opts.regionPass?.from && region && !blocks.refine) {
+    out.push({
+      id: 'again',
+      label: 'Make another like this',
+      what: `This picture is one region of ${opts.regionPass.from}, drawn again. The archive does not keep the mask, so a region pass cannot be made again from its record. This opens the region bench on ${opts.regionPass.from} with the same words: paint the area and draw it.`,
+      measured: null,
+      // Nothing runs until the region is painted and drawn on the bench.
+      cost: null,
+      costNote: null,
+      group: 'carry',
+    })
   }
 
   if (opts.canSource !== false) {
@@ -265,6 +307,30 @@ export function offersFor(
   }
 
   return out
+}
+
+/**
+ * Sentences for rows {@link offersFor} left out for a reason the reader can
+ * act on: a pass whose file is missing here, or a region pass whose picture
+ * is gone. A row that is absent because the graph cannot carry the pass says
+ * nothing, as before.
+ */
+export function offerNotes(def: FamilyDef | DerivedDef | null, opts: OfferOptions = {}): string[] {
+  const out: string[] = []
+  const blocks = opts.blocks ?? {}
+  const caps = def ? capabilitiesOf(def) : null
+  const regionDef = opts.region === undefined ? def : opts.region
+  const region = regionDef ? deriveRefine(regionDef) : null
+  const rebuild = opts.rebuild !== false
+  if (region && blocks.refine) out.push(blocks.refine)
+  if (def && rebuild && caps?.faceDetail && blocks.face) out.push(blocks.face)
+  if (def && rebuild && caps?.handDetail && blocks.hand) out.push(blocks.hand)
+  if (!rebuild && opts.regionPass && !opts.regionPass.from) {
+    out.push(
+      'This picture is one region of another picture, drawn again, and that picture is no longer here. There is nothing to draw the region on again, so nothing is offered to make another.',
+    )
+  }
+  return [...new Set(out)]
 }
 
 /**

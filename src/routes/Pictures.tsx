@@ -29,8 +29,16 @@ import { Reading } from '../components/result/Reading'
 import type { ImageFacts, VisionReport } from '../lib/vision'
 import { AddOnOffers } from '../components/compose/AddOnOffers'
 import { RecipeProse } from '../components/compose/RecipeProse'
-import { faultOf, type Fault as DeskFault } from '../lib/faults'
-import { availabilityOf, inventoryFrom } from '../lib/availability'
+import { faultBody, faultOf, faultTitle, faultWhere, type Fault as DeskFault } from '../lib/faults'
+import {
+  NO_PASS_BLOCKS,
+  availabilityOf,
+  inventoryFrom,
+  missingWhy,
+  packNeededFor,
+  passBlocks,
+  type PassBlocks,
+} from '../lib/availability'
 import { measureImage as measure } from '../lib/images'
 import { clamp } from '../lib/num'
 import { ServerDown } from '../components/ServerDown'
@@ -64,6 +72,7 @@ import {
 } from '../lib/comfy'
 import {
   BY_ID,
+  FAMILIES,
   IMG2IMG,
   defaultsFor,
   deriveImg2Img,
@@ -110,6 +119,8 @@ import {
   deriveRefine,
   hiresStepsFor,
   instantiateRefine,
+  rebuildable,
+  regionOrigin,
   withLoras,
   writeExtras,
   type DerivedDef,
@@ -119,12 +130,13 @@ import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitF
 import {
   LOOKS,
   decide,
+  passesFor,
+  plainWords,
   positiveFor,
   regionAddOns,
   suggestAnatomy,
   type AnatomyLevel,
   type Look,
-  type PassOffer,
   type Recipe,
   type RecipeNote,
   type RecipeLora
@@ -298,6 +310,8 @@ type Catalogue = {
   installed: string[]
   /** Real file sizes, so the intent ranking can weigh a model against the RAM. */
   sizes: Map<string, ModelFile>
+  /** What stops each quality pass from running on this ComfyUI, by name. */
+  passBlocks: PassBlocks
 }
 
 /** The same weight file of the same family. */
@@ -361,13 +375,28 @@ async function readCatalogue(): Promise<Catalogue> {
     if (!def || (def.mode !== 'image' && def.mode !== 'edit')) continue
 
     // Every file the graph references must exist, or the run fails with an
-    // opaque backend error. Name the missing file instead; then the memory.
-    const avail = availabilityOf(def, inv, hardware, sizes)
+    // opaque backend error. Name the missing file instead; then the memory,
+    // priced on this file rather than the family's default.
+    const avail = availabilityOf(def, inv, hardware, sizes, model)
     if (!avail.ok) {
       unavailable.push({ name: model, why: avail.why })
       continue
     }
     styles.push(styleOf(def, model, avail.verdict))
+  }
+
+  // A weight file ComfyUI cannot list because the node that reads it is not
+  // installed never reaches the loop above: it is on disk, and it looked like
+  // nothing at all. The instruction editing model is a .gguf, so without the
+  // GGUF node pack "Change a picture" simply vanished. It is named here with
+  // the pack it needs.
+  for (const def of FAMILIES) {
+    if (def.mode !== 'image' && def.mode !== 'edit') continue
+    for (const model of def.models) {
+      if (installed.has(model) || !sizes.has(model)) continue
+      if (!packNeededFor(model, inv)) continue
+      unavailable.push({ name: model, why: missingWhy([model], inv) })
+    }
   }
 
   styles.sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label))
@@ -380,6 +409,7 @@ async function readCatalogue(): Promise<Catalogue> {
     hardware,
     installed: [...installed],
     sizes,
+    passBlocks: passBlocks(inv),
   }
 }
 
@@ -477,6 +507,9 @@ let queue: RunPlan[] = []
 let driving = false
 let stopped = false
 
+/** The one fault this desk writes itself. Fault gives it its own title. */
+const NO_FILE = 'The job finished but wrote no file. Check ComfyUI’s own log for the reason.'
+
 function busy(state: PressState): boolean {
   const s = state.job?.status
   return s === 'submitting' || s === 'queued' || s === 'running'
@@ -527,7 +560,7 @@ async function drive() {
         if (!picture) {
           emit({
             fault: {
-              message: 'The job finished but wrote no file. Check ComfyUI’s own log for the reason.',
+              message: NO_FILE,
               cancelled: false,
               lost: false,
               node: null,
@@ -591,6 +624,15 @@ async function drive() {
 function onProgress(ev: ProgressEvent, plan: RunPlan) {
   if (!press.job) return
   if (ev.phase === 'queued') {
+    // Stop was held while the job was still being sent, when there was no id
+    // to cancel yet. This is the first moment there is one. Set to "Queued"
+    // here, the job used to go on and render, and be filed, as if nobody had
+    // asked; now it is cancelled, and run() settles it as a stop.
+    if (stopped) {
+      patchJob({ promptId: ev.promptId, stage: 'Stopping' })
+      void cancelJob(ev.promptId).catch(() => undefined)
+      return
+    }
     patchJob({ promptId: ev.promptId, status: 'queued', stage: 'Queued' })
     return
   }
@@ -601,7 +643,9 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
   if (ev.phase !== 'running') return
 
   const cls = ev.node ? plan.graph[ev.node]?.class_type : null
-  const stage = stageFor(cls, ev.value, ev.max)
+  // A job asked to stop may still report a step or two before the cancel
+  // lands. It says it is stopping until it has.
+  const stage = stopped ? 'Stopping' : stageFor(cls, ev.value, ev.max)
   const sampling = ev.max > 1
   const pct = sampling
     ? clamp(ev.value / ev.max, press.job.pct, 0.97)
@@ -614,9 +658,15 @@ async function stopRun() {
   queue = []
   const id = press.job?.promptId
   if (!id) {
-    patchJob({ status: 'cancelled', finishedAt: Date.now() })
+    // Still being sent, so there is nothing to cancel yet: the "queued" event
+    // cancels it the moment ComfyUI names it (see onProgress). The job stays
+    // busy until then. Marked cancelled here, the Run button came back while
+    // the send was still in flight, did nothing when pressed, and the job
+    // went on to render.
+    patchJob({ stage: 'Stopping' })
     return
   }
+  patchJob({ stage: 'Stopping' })
   try {
     await cancelJob(id)
   } catch {
@@ -659,31 +709,15 @@ type Held = {
   overrides: Overrides
   seed0: number
   correction: string | null
+  /**
+   * The mode all of that was set in. The archive can change the mode while
+   * the desk is away ("Use as source" puts the draft on image to image), and
+   * a prompt typed by hand for one mode means something else in another.
+   */
+  mode: Mode
 }
 
 let held: Held | null = null
-
-/**
- * Whether the desk can rebuild the graph that made this picture.
- *
- * The face, hand, larger render and "make another" rows all re-render the
- * picture from its record. A region pass is filed against the ORIGINAL picture
- * with the region prompt, and nothing on the record says which region or what
- * mask: rebuilt, it redraws the whole original frame at the region's strength
- * and throws the refine away. It is filed with the variant `refine` for that
- * reason. A variant this build does not know came from a newer one sharing the
- * archive, and what it ran cannot be read off this record here either.
- *
- * Region passes filed before `refine` existed say image to image with no pixel
- * budget, which plain image to image always files. A record recovered from
- * ComfyUI that does not say how it was sized looks the same, and cannot be
- * rebuilt faithfully either.
- */
-function rebuildable(entry: HistoryEntry): boolean {
-  const v = entry.variant
-  if (v !== null && v !== 'img2img' && v !== 'nolora' && v !== 'i2v') return false
-  return !(entry.mode === 'i2i' && entry.megapixels == null)
-}
 
 /**
  * The trained prefix to file on a record, when the prompt sent really opened
@@ -730,6 +764,16 @@ function useReducedMotion(): boolean {
 // Shapes
 // ---------------------------------------------------------------------------
 
+
+/**
+ * What the bench needs of a picture to open on it: the file, the size the
+ * record says, and who made it. A record has all of it; a picture known only
+ * by its file has the file.
+ */
+type RegionPicture = Pick<
+  HistoryEntry,
+  'file' | 'width' | 'height' | 'id' | 'prompt' | 'modelLabel' | 'model' | 'familyId'
+>
 
 /**
  * A finished picture, copied into ComfyUI's input folder and measured, ready
@@ -781,7 +825,7 @@ function editRecipe(input: {
   source: string | null
   seed: number
   cat: Catalogue
-  /** Free memory as last read, which is fresher than the catalogue's. */
+  /** Free memory as read for this visit, which is fresher than the catalogue's. */
   hardware: Hardware | null
   lib: LoraLibrary
   addOns?: { accepted?: readonly string[]; declined?: readonly string[] }
@@ -824,10 +868,12 @@ function editRecipe(input: {
     if (chained) planDef = chained
     else warnings.push(`${style.label} cannot take add-ons, so none were applied.`)
   }
-  const triggers = triggersFor(
-    loras.map((l) => ({ file: l.file, strength: l.strength, enabled: true })),
-    input.lib,
-    target,
+  const triggers = plainWords(
+    triggersFor(
+      loras.map((l) => ({ file: l.file, strength: l.strength, enabled: true })),
+      input.lib,
+      target,
+    ),
   ).filter((t) => !prompt.toLowerCase().includes(t.toLowerCase()))
   const report = intentReport(
     { intent: input.look as Intent, explicit: input.anatomy !== 'off', mode: 'edit' },
@@ -853,8 +899,11 @@ function editRecipe(input: {
 
   const capabilities = capabilitiesOf(planDef)
   // The catalogue's verdict was taken when the page loaded. Judge the fit
-  // against the latest reading instead, so the warning is about now.
-  const verdict = input.hardware ? feasibility(def, cat.sizes, input.hardware) : style.verdict
+  // against this visit's reading instead, and on the graph that will be
+  // queued: the add-ons the reader took load on top of the model.
+  const verdict = input.hardware
+    ? feasibility(def, cat.sizes, input.hardware, instantiate(planDef, params))
+    : style.verdict
   if (verdict && verdict.level !== 'ok') warnings.push(verdict.reason)
   // No word about the detail setting. This desk does not show it, so a
   // warning about a control the reader cannot see here would only confuse.
@@ -885,8 +934,6 @@ function editRecipe(input: {
     })
   }
 
-  const offer = (available: boolean, why: string): PassOffer => ({ available, auto: false, why })
-
   return {
     ok: true,
     look: input.look,
@@ -904,22 +951,18 @@ function editRecipe(input: {
     missingLoras: [],
     refineLoras: [],
     offers,
-    passes: {
-      face: offer(
-        capabilities.faceDetail,
-        'Re renders every detected face at 768 and pastes it back.',
-      ),
-      hand: offer(
-        capabilities.handDetail,
-        'Re renders every detected hand with more freedom than a face. Not measured here.',
-      ),
-      refine: offer(
-        capabilities.refine,
-        'Draw a mask over a region and it is cropped, upscaled and rendered alone.',
-      ),
-      hires: offer(capabilities.hires, 'Renders the same picture larger, at low denoise.'),
-    },
+    passes: passesFor(
+      capabilities,
+      {
+        face: 'Re renders every detected face at 768 and pastes it back.',
+        hand: 'Re renders every detected hand with more freedom than a face. Not measured here.',
+        refine: 'Draw a mask over a region and it is cropped, upscaled and rendered alone.',
+        hires: 'Renders the same picture larger, at low denoise.',
+      },
+      cat.passBlocks,
+    ),
     capabilities,
+    verdict,
     notes,
     warnings,
     report,
@@ -1024,8 +1067,33 @@ export function Pictures() {
 
   // Kept for the next visit. See `held`.
   useEffect(() => {
-    held = { look, anatomy, anatomySaid, pinned, overrides: ov.value, seed0, correction }
-  }, [look, anatomy, anatomySaid, pinned, ov.value, seed0, correction])
+    held = { look, anatomy, anatomySaid, pinned, overrides: ov.value, seed0, correction, mode: c.mode }
+  }, [look, anatomy, anatomySaid, pinned, ov.value, seed0, correction, c.mode])
+
+  /**
+   * A prompt typed by hand behind More replaces the whole prompt sent. Typed
+   * for a picture made from words it describes a picture; on "Change a
+   * picture" the prompt is an instruction. Carried across that line, it was
+   * sent in place of the instruction the reader then typed, with nothing on
+   * the main screen to say so. So crossing into or out of changing a picture
+   * hands the prompt back to the recipe, out loud. This covers a mode changed
+   * while the desk was away as well: the held mode is where it starts from.
+   *
+   * Done while rendering, the way React adjusts state to a changed input, so
+   * no render with the prompt in the wrong mode is ever committed.
+   */
+  const [seenMode, setSeenMode] = useState<Mode>(() => held?.mode ?? c.mode)
+  if (seenMode !== c.mode) {
+    setSeenMode(c.mode)
+    if ((seenMode === 'edit') !== (c.mode === 'edit') && ov.value.positive !== undefined) {
+      ov.clear('positive')
+      setCorrection(
+        c.mode === 'edit'
+          ? 'The prompt you typed by hand behind More was for making a picture, so it is set aside. What you type as the change is what is sent.'
+          : 'The prompt you typed by hand behind More was an instruction for changing a picture, so it is set aside. The desk builds the prompt from your words again.',
+      )
+    }
+  }
 
   const [refining, setRefining] = useState(false)
   const [refineSource, setRefineSource] = useState<RefineSource | null>(null)
@@ -1091,38 +1159,38 @@ export function Pictures() {
 
   useEffect(() => watchConnection((s) => setOffline(s === 'closed')), [])
 
-  // --- free memory, read afresh -------------------------------------------
+  // --- free memory, read once a visit --------------------------------------
   /**
    * The catalogue is read once per page load, and the page is an installed app
-   * that stays open for hours. Its memory reading went stale with it, and the
-   * ranking and the warnings compared the weights against how much was free
-   * when the tab was opened. So free memory is read again on every visit to
-   * the desk, whenever the page comes back into view, and after every job,
-   * which is when the most memory changes hands.
+   * that stays open for hours, so its memory reading went stale with it. Free
+   * memory is read again when the reader comes to the desk, and that one
+   * reading ranks the models and words the warnings for the whole visit.
+   *
+   * It is not read again after a job, or when the tab comes back into view.
+   * os.freemem() counts the weights ComfyUI keeps loaded after a job as used,
+   * so a reading taken after one saw several gigabytes less free than before,
+   * the model that had just run was marked down for its own cache, and the
+   * next press of the same button, with nothing touched, could render on a
+   * different model, or warn the reader to close other applications about
+   * memory that model was holding. One reading per visit cannot move under
+   * the reader between two presses. A visit that opens while ComfyUI is still
+   * holding weights reads low for the same reason; that needs the server to
+   * report what ComfyUI itself holds, which it does not yet.
    */
-  const [freshHardware, setFreshHardware] = useState<Hardware | null>(null)
-  const [hardwareAsk, setHardwareAsk] = useState(0)
-  const jobEnded = state.job?.finishedAt ?? null
+  const [visitHardware, setVisitHardware] = useState<Hardware | null>(null)
   useEffect(() => {
     let alive = true
     probeHardware().then(
       (hw) => {
-        if (alive) setFreshHardware(hw)
+        if (alive) setVisitHardware(hw)
       },
       () => {},
     )
     return () => {
       alive = false
     }
-  }, [hardwareAsk, jobEnded])
-  useEffect(() => {
-    const onShow = () => {
-      if (document.visibilityState === 'visible') setHardwareAsk((n) => n + 1)
-    }
-    document.addEventListener('visibilitychange', onShow)
-    return () => document.removeEventListener('visibilitychange', onShow)
   }, [])
-  const hardware = freshHardware ?? cat?.hardware ?? null
+  const hardware = visitHardware ?? cat?.hardware ?? null
 
   // The LoRA catalogue, read once. Until it lands the recipe resolves nothing
   // and says so in print rather than pretending the stack was applied.
@@ -1164,6 +1232,21 @@ export function Pictures() {
   const styles = useMemo(() => cat?.styles ?? [], [cat])
   const pictureStyles = useMemo(() => styles.filter((s) => s.def.mode === 'image'), [styles])
   const editStyle = useMemo(() => styles.find((s) => s.def.mode === 'edit') ?? null, [styles])
+
+  /**
+   * Why "Change a picture" is not on offer, when the model that would do it is
+   * on disk and something else is missing: a file it loads, the node pack that
+   * reads it, or the memory to hold it. Without this the choice simply was not
+   * there, and nothing said what to install.
+   */
+  const editGap = useMemo(() => {
+    if (!cat || editStyle) return null
+    const gap = cat.unavailable.find((u) => familyOwning(u.name)?.mode === 'edit')
+    if (!gap) return null
+    const name = PLAIN_NAMES[gap.name] ?? titleFromFilename(gap.name)
+    const why = `${gap.why.charAt(0).toLowerCase()}${gap.why.slice(1)}`
+    return `Change a picture is not offered: ${name} ${why}${why.endsWith('.') ? '' : '.'}`
+  }, [cat, editStyle])
 
   // An intent nothing installed can serve is corrected out loud.
   useEffect(() => {
@@ -1239,6 +1322,27 @@ export function Pictures() {
   const sourceName = c.source?.name ?? ''
   const usingSource = needsSource(c.mode) && !!sourceName
 
+  /**
+   * True while a picture is in the well and the pinned model cannot work from
+   * one.
+   *
+   * The pin survives a visit to another room, and "Use as source" there puts
+   * the desk on image to image. A pin that can only draw from words then left
+   * decide() nothing to choose from, and the button said nothing installed
+   * could work from a picture, while six installed families could. The pin is
+   * set aside, not dropped: back on "From words" it is used again.
+   */
+  const pinSetAside = useMemo(() => {
+    if (!pinned || !usingSource || c.mode !== 'i2i') return false
+    const def = familyOwning(pinned)
+    return !def || !(IMG2IMG[def.id] ?? deriveImg2Img(def))
+  }, [pinned, usingSource, c.mode])
+  /** Said for as long as the pin is set aside, and gone the moment it is not. */
+  const pinNote =
+    pinSetAside && pinned
+      ? `${PLAIN_NAMES[pinned] ?? titleFromFilename(pinned)} is pinned, and it cannot work from a picture, so the desk chooses another model while a picture is in the well. Choose From words and the pin is used again.`
+      : null
+
   const recipe: Recipe = useMemo(() => {
     if (!cat) {
       return waitingRecipe(c.prompt, look as Look, anatomy, 'Reading the model list from ComfyUI.')
@@ -1272,21 +1376,42 @@ export function Pictures() {
       sourceImage: usingSource ? sourceName : undefined,
       hardware,
       sizes: cat.sizes,
-      installed: pinned ? [pinned] : cat.installed,
+      installed: pinned && !pinSetAside ? [pinned] : cat.installed,
       loras: lib,
       seed: seed0,
       // The reader's own decisions, threaded in so they survive this recompute.
       // decide() runs on every keystroke; a decision held anywhere but here
       // would be silently overwritten by the next suggestion.
       addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
+      passBlocks: cat.passBlocks,
     })
-  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, lib, seed0, editStyle,
+  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, pinSetAside, lib, seed0, editStyle,
       c.addOnsAccepted, c.addOnsDeclined, hardware])
 
   const plan = recipe.ok ? recipe : null
 
   /** The recipe with whatever the reader took back by hand folded onto it. */
   const settled = useMemo(() => (plan ? settle(plan, ov.value, lib) : null), [plan, ov.value, lib])
+
+  /**
+   * The recipe as it is printed under the button, with its memory warning
+   * priced on the graph the button will queue.
+   *
+   * decide() prices the graph it built. An add-on stack edited behind More
+   * builds another one, with other files to load, and the warning described
+   * the recipe's graph rather than the one that runs. Only the memory warning
+   * changes; everything else the recipe says still holds.
+   */
+  const shown: Recipe = useMemo(() => {
+    if (!plan || !settled?.rebuilt || !hardware || !cat) return recipe
+    const verdict = feasibility(plan.base, cat.sizes, hardware, buildGraph(settled))
+    const before = plan.verdict && plan.verdict.level !== 'ok' ? plan.verdict.reason : null
+    const after = verdict.level !== 'ok' ? verdict.reason : null
+    if (before === after) return recipe
+    const warnings = plan.warnings.filter((w) => w !== before)
+    if (after) warnings.push(after)
+    return { ...plan, verdict, warnings }
+  }, [recipe, plan, settled, hardware, cat])
 
   /** The catalogue row for the chosen file, for the plate's dagger and the bench. */
   const style = useMemo(
@@ -1823,7 +1948,15 @@ export function Pictures() {
     return refineDefault
   }, [refineOptions, refinePick, refineDefault])
 
-  const canRefine = refineOptions.length > 0
+  /**
+   * Why no region can be drawn on this ComfyUI, naming the file or node pack
+   * the region graph loads and ComfyUI does not have. The upscaler is not in
+   * every install, and the region links used to open the bench anyway, which
+   * queued a job ComfyUI refused over a file the page never mentioned.
+   */
+  const regionBlock = cat?.passBlocks.refine ?? null
+
+  const canRefine = refineOptions.length > 0 && !regionBlock
 
   /**
    * True when the region is drawn by the model the desk is set to. Only then
@@ -1941,7 +2074,7 @@ export function Pictures() {
    * so. Trusting it put the crop, the mask and the composite in the pre upscale
    * space and pasted a correct patch into the wrong part of the frame.
    */
-  const openRefine = useCallback(async (entry: HistoryEntry) => {
+  const openRefine = useCallback(async (entry: RegionPicture, words?: string) => {
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
     setRefinePicked([])
@@ -1967,7 +2100,7 @@ export function Pictures() {
         width: measured.width,
         height: measured.height,
         entryId: entry.id,
-        prompt: entry.prompt,
+        prompt: words ?? entry.prompt,
         madeBy: entry.modelLabel || null,
         maker: entry.model ? { familyId: entry.familyId, model: entry.model } : null,
       })
@@ -1991,7 +2124,7 @@ export function Pictures() {
    * time the well shows it (see the copy effect above), so `source.name` is all
    * LoadImage needs and there is nothing to upload again.
    */
-  const openRefineFromSource = useCallback(async (src: SourceRef) => {
+  const openRefineFromSource = useCallback(async (src: SourceRef, words?: string) => {
     if (!src.name) return
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
@@ -2036,7 +2169,7 @@ export function Pictures() {
         // Carried when the picture came from the archive; empty for a plain
         // upload, which genuinely has no record behind it.
         entryId: src.fromEntryId ?? '',
-        prompt: store.get().prompt,
+        prompt: words ?? store.get().prompt,
         madeBy: made?.modelLabel || null,
         maker: made?.model ? { familyId: made.familyId, model: made.model } : null,
       })
@@ -2048,6 +2181,33 @@ export function Pictures() {
       if (refineToken.current === token) setOpeningRefine(false)
     }
   }, [])
+
+  /**
+   * "Make another like this" on a region pass.
+   *
+   * A region pass cannot be run again from its record: the record files the
+   * region's words against the whole picture they were drawn on and keeps no
+   * mask, so rebuilt it redrew the whole of that picture. This opens the
+   * bench on that picture instead, with the region's words ready, and the
+   * reader paints the area again. Where the picture has gone, the row that
+   * leads here is not offered and ResultActions says why.
+   */
+  const openRegionAgain = useCallback(
+    (entry: HistoryEntry) => {
+      const origin = regionOrigin(entry, allRecords())
+      if (!origin || origin.kind === 'gone') return
+      if (origin.kind === 'record') return void openRefine(origin.entry, entry.prompt)
+      if (origin.kind === 'output') {
+        // Only the file is known, not what made it, so no maker is claimed.
+        return void openRefine(
+          { file: origin.ref, width: null, height: null, id: origin.fromEntryId ?? '', prompt: entry.prompt, modelLabel: '', model: '', familyId: '' },
+          entry.prompt,
+        )
+      }
+      void openRefineFromSource({ name: origin.name, fromEntryId: origin.fromEntryId }, entry.prompt)
+    },
+    [openRefine, openRefineFromSource],
+  )
 
   // A record handed over from the Archive, which is a different route and so
   // cannot call openRefine directly. Runs once per request: takeRegionRequest()
@@ -2209,6 +2369,31 @@ export function Pictures() {
     setRefineResult(cur)
   }, [state])
 
+  /**
+   * The graph a region of the picture on the plate would be drawn with, for
+   * its "Sharpen a region" row: its own model when that can redraw a region,
+   * else the first that can. Never the picture's own graph, which carries any
+   * larger render it had, and a graph with a larger render in it cannot take a
+   * region, so the row vanished from every such picture although the bench
+   * draws with a plain graph and worked on it. Null when nothing installed
+   * can redraw a region.
+   */
+  const resultRegion = useMemo(() => {
+    if (!current || !refineOptions.length) return null
+    const own = refineOptions.find((o) => o.def.id === current.familyId && o.model === current.model)
+    return (own ?? refineOptions[0]).def
+  }, [current, refineOptions])
+
+  /** Set when the picture on the plate is a region pass: what it was drawn on, by name. */
+  const resultRegionPass = useMemo(() => {
+    if (!current) return null
+    const origin = regionOrigin(current, records)
+    if (!origin) return null
+    if (origin.kind === 'gone') return { from: null }
+    const no = origin.kind === 'record' ? origin.entry.no : 0
+    return { from: no > 0 ? `No. ${no.toLocaleString('en-GB')}` : 'the picture it came from' }
+  }, [current, records])
+
   const refineBlocked =
     refineFault ??
     // The catalogue comes first. The archive can now open this bench straight
@@ -2219,9 +2404,7 @@ export function Pictures() {
       ? 'Reading the list of installed models from ComfyUI.'
       : !refineDef
         ? 'None of your installed models can redraw part of a picture. They all sample through a fixed schedule with no way to redraw just an area.'
-        : openingRefine
-          ? 'Getting the picture ready.'
-          : null)
+        : (regionBlock ?? (openingRefine ? 'Getting the picture ready.' : null)))
 
   // --- the advanced panel, mounted only while More is open ----------------
   const advanced = (
@@ -2301,6 +2484,14 @@ export function Pictures() {
           </div>
         )}
 
+        {pinNote && (
+          <div className="mb-4">
+            <Notice tone="correction" title="Correction">
+              {pinNote}
+            </Notice>
+          </div>
+        )}
+
         {/*
           What you are doing is the first question, not a parameter. It sits
           here, above the desk, rather than inside one: `c.mode === 'edit'`
@@ -2316,6 +2507,7 @@ export function Pictures() {
             value={c.mode}
             onChange={setMode}
           />
+          {editGap ? <p className="mt-1.5 text-caption italic text-grey-500">{editGap}</p> : null}
         </div>
 
         {c.mode === 'edit' ? (
@@ -2323,7 +2515,7 @@ export function Pictures() {
             prompt={c.prompt}
             onPrompt={writePrompt}
             promptRef={promptRef}
-            recipe={recipe}
+            recipe={shown}
             source={c.source}
             sourceBusy={uploading}
             sourceError={sourceError}
@@ -2383,7 +2575,7 @@ export function Pictures() {
               })
             }
             onRemoveAddOn={dropAddOn}
-            recipe={recipe}
+            recipe={shown}
             // A picture left in the store after choosing "From words" is not
             // used by the run, so it is not shown either: the well, the "The
             // change" label and the "Make the change" button all follow what
@@ -2564,13 +2756,18 @@ export function Pictures() {
                 }}
                 def={resultDef}
                 rebuild={rebuildable(current)}
+                region={resultRegion}
+                blocks={cat?.passBlocks ?? NO_PASS_BLOCKS}
+                regionPass={resultRegionPass}
                 canSource={canI2I}
                 facts={facts.get(current.id) ?? null}
                 busy={running}
                 blocked={offline ? 'ComfyUI is not answering, so nothing can be queued.' : null}
                 onAction={(id) => {
                   if (id === 'refine') return void openRefine(current)
-                  if (id === 'again') return rerun(current, null)
+                  if (id === 'again') {
+                    return rebuildable(current) ? rerun(current, null) : openRegionAgain(current)
+                  }
                   if (id === 'source') {
                     takeRecord(current)
                     setMode('i2i')
@@ -2777,46 +2974,30 @@ function EditDesk({
   )
 }
 
+/**
+ * A failed job, in the words every desk uses (lib/faults.ts).
+ *
+ * This desk used to call every failure "rejected", say ComfyUI "would not
+ * accept it", and send the reader to "the highlighted setting". Nothing here
+ * highlights a setting, and a job that ComfyUI took and that then broke part
+ * way, or whose error was missed on the socket and settled from its history,
+ * was not rejected. The Video desk already said "did not finish" for those.
+ */
 function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }) {
-  if (fault.cancelled) {
-    return (
-      <Notice tone="correction" title="Correction">
-        Job stopped. Nothing was saved. <Link onClick={onDismiss}>Dismiss</Link>
-      </Notice>
-    )
-  }
-
-  if (fault.lost) {
-    return (
-      <Notice tone="warning" title="We lost track of that job">
-        {fault.message} The desk is free again, so you can try again.{' '}
-        <Link onClick={onDismiss}>Dismiss</Link>
-      </Notice>
-    )
-  }
-
-  const text = `${fault.message} ${fault.detail ?? ''}`.toLowerCase()
-  if (text.includes('out of memory') || text.includes('cuda') || text.includes('alloc')) {
-    return (
-      <Notice tone="error" title="The card ran out of memory">
-        This size needs more than the card has free. Try a smaller shape, or close anything else
-        using the GPU. <Link onClick={onDismiss}>Dismiss</Link>
-      </Notice>
-    )
-  }
-
+  const title = fault.message === NO_FILE ? 'No picture came back' : faultTitle(fault)
+  const tone = fault.cancelled ? 'correction' : fault.lost ? 'warning' : 'error'
+  const oom = title === 'The card ran out of memory'
+  // The shared wording for memory mentions a shorter clip, which this desk
+  // does not make.
+  const body = oom
+    ? 'This size needs more than the card has free. Try a smaller shape, or close anything else using the GPU.'
+    : faultBody(fault)
+  const where = faultWhere(fault)
   return (
-    <Notice tone="error" title="That job was rejected">
-      ComfyUI would not accept it: {fault.detail ?? fault.message}
-      {fault.nodeType && (
-        <span className="block text-caption">
-          The trouble is in {fault.nodeType}
-          {fault.node ? ` (node ${fault.node})` : ''}.
-        </span>
-      )}
-      <span className="block">
-        Check the highlighted setting and try again. <Link onClick={onDismiss}>Dismiss</Link>
-      </span>
+    <Notice tone={tone} title={title}>
+      {body}
+      {where ? <span className="block text-caption">{where}</span> : null}{' '}
+      <Link onClick={onDismiss}>Dismiss</Link>
     </Notice>
   )
 }

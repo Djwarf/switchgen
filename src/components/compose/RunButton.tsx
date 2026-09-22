@@ -14,6 +14,15 @@
  * picture" into "Hold to stop", so a second Enter, or one Enter held a moment
  * too long, stopped the job the first had just started.
  *
+ * A stop that lands while the key or the pointer is still down must not turn
+ * into a new job. The button stays the same element, with focus, as it turns
+ * back into "Make the picture", so an Enter still held fires its auto-repeat
+ * into it as clicks, a held Space clicks it on release, and a mouse let go
+ * after the stop lands clicks it too. Each of those queued the same recipe
+ * again, which turned a stop into a restart. The press that began on the
+ * running button is followed until it is let go, and nothing it does reaches
+ * the idle one. The first fresh press after that starts a job as usual.
+ *
  * A screen reader activates a button with a bare click and no key or pointer
  * events at all, so it could not stop a job. A click with no pointer behind it
  * arms the stop instead, and a second one within a few seconds confirms it:
@@ -34,6 +43,15 @@ import {
 
 /** How long an armed stop waits for its confirming press. */
 const ARMED_MS = 3000
+
+/**
+ * How long after the release of a stopping press its click is still taken for
+ * part of that press. A mouse click follows its release at once; a tap's comes
+ * after the browser has decided it was a tap. A fresh press clears the mark
+ * before its own click arrives, so only the click that belongs to the release
+ * is refused.
+ */
+const RELEASE_CLICK_MS = 500
 
 const THIN = ' '
 
@@ -85,6 +103,16 @@ export function RunButton({
   const [receipt, setReceipt] = useState<string | null>(null)
   const timer = useRef<number | null>(null)
   const seen = useRef<number | null>(null)
+  /** An activation key went down on the running button and has not come up. */
+  const keyHeld = useRef(false)
+  /** A pointer went down on the running button and has not been let go. */
+  const pointerHeld = useRef(false)
+  /**
+   * When the release of one of those presses landed on the idle button. The
+   * click the browser fires after that release is not a request for a job. See
+   * RELEASE_CLICK_MS for why it is a moment and not a flag.
+   */
+  const releasedAt = useRef<number | null>(null)
 
   useEffect(() => {
     if (lastMs == null || seen.current === lastMs) return
@@ -125,26 +153,47 @@ export function RunButton({
 
   const isActivation = (e: ReactKeyboardEvent) => e.key === 'Enter' || e.key === ' '
 
+  /** The press that stopped the last job is over, wherever it ended. */
+  const forgetPress = () => {
+    keyHeld.current = false
+    pointerHeld.current = false
+  }
+
   if (running) {
     return (
       <div>
         <button
           type="button"
           aria-label={armed ? 'Press again to stop this job' : 'Hold to stop this job'}
-          onPointerDown={beginHold}
-          onPointerUp={endHold}
-          onPointerLeave={endHold}
-          onPointerCancel={endHold}
+          onPointerDown={() => {
+            pointerHeld.current = true
+            beginHold()
+          }}
+          onPointerUp={() => {
+            pointerHeld.current = false
+            endHold()
+          }}
+          onPointerLeave={() => {
+            // Let go somewhere else, so no click will follow on this button.
+            pointerHeld.current = false
+            endHold()
+          }}
+          onPointerCancel={() => {
+            pointerHeld.current = false
+            endHold()
+          }}
           onKeyDown={(e: ReactKeyboardEvent) => {
             if (!isActivation(e)) return
             // Default prevented either way, so the key never turns into a click.
             e.preventDefault()
+            keyHeld.current = true
             if (e.repeat) return
             beginHold()
           }}
           onKeyUp={(e: ReactKeyboardEvent) => {
             if (!isActivation(e)) return
             e.preventDefault()
+            keyHeld.current = false
             endHold()
           }}
           onClick={(e: ReactMouseEvent) => {
@@ -193,7 +242,42 @@ export function RunButton({
         type="button"
         className="press"
         disabled={disabled}
+        onKeyDown={(e: ReactKeyboardEvent) => {
+          if (!isActivation(e)) return
+          // The auto-repeat of a key that was held to stop the last job. Enter
+          // clicks on every repeat, so each one is refused here.
+          if (e.repeat) {
+            e.preventDefault()
+            return
+          }
+          // A key that goes down fresh is a new press, whatever came before.
+          forgetPress()
+          releasedAt.current = null
+        }}
+        onKeyUp={(e: ReactKeyboardEvent) => {
+          if (!isActivation(e) || !keyHeld.current) return
+          // Space clicks on release. This release ends the stop, not a start.
+          keyHeld.current = false
+          e.preventDefault()
+          releasedAt.current = performance.now()
+        }}
+        onPointerDown={() => {
+          forgetPress()
+          releasedAt.current = null
+        }}
+        onPointerUp={() => {
+          if (!pointerHeld.current) return
+          pointerHeld.current = false
+          releasedAt.current = performance.now()
+        }}
+        onPointerLeave={() => {
+          pointerHeld.current = false
+        }}
+        onBlur={forgetPress}
         onClick={() => {
+          const released = releasedAt.current
+          releasedAt.current = null
+          if (released !== null && performance.now() - released < RELEASE_CLICK_MS) return
           // A stop armed for the last job is not carried into this one.
           setArmed(false)
           onRun()

@@ -355,7 +355,7 @@ function Method() {
       <Kicker>How the figures were taken</Kicker>
       <p className="mt-1 text-caption leading-snug text-grey-700">{MEASURED.method}</p>
       <p className="mt-1.5 text-caption leading-snug text-grey-700">
-        Baseline {MEASURED.baselineLaplacian} with no LoRA on the frame. Every ratio printed in this
+        Baseline {MEASURED.baselineLaplacian} with no add-ons at all. Every ratio printed in this
         panel is against that number.
       </p>
       <p className="mt-1.5 text-caption italic leading-snug text-grey-700">{MEASURED.metricCaveat}</p>

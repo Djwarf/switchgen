@@ -56,7 +56,7 @@
  * refine.ts. Nothing imports it except the UI.
  */
 import { FAMILIES, defaultsFor, type FamilyDef } from './workflows'
-import { feasibility, type Hardware, type Level, type ModelFile, type Verdict } from './hardware'
+import { feasibility, modelGraph, type Hardware, type Level, type ModelFile, type Verdict } from './hardware'
 import { MASK_ONLY_REGIONS } from './refine'
 
 // ---------------------------------------------------------------------------
@@ -576,7 +576,9 @@ export function intentReport(brief: Brief, opts: RankOptions = {}): IntentReport
       if (!profile) continue
 
       const label = plainName(model, def)
-      const verdict = sizes && hw ? feasibility(def, sizes, hw) : null
+      // Priced on this file, not the family's default: a family lists several
+      // checkpoints and quants, and they are not the same size.
+      const verdict = sizes && hw ? feasibility(def, sizes, hw, modelGraph(def, model)) : null
       if (verdict && !verdict.selectable) {
         blocked.push({ model, label, familyId: def.id, why: verdict.reason })
         continue

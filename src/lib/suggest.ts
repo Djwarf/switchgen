@@ -176,7 +176,7 @@ const STAPLES: { file: string; bases: IndexedBase[]; why: string }[] = [
     file: MEASURED_TRIGGER.file,
     bases: ['pony', 'illustrious', 'sdxl'],
     why:
-      'Measured on Pony V6 at strength 0.6: 2.132x base sharpness with its trigger in the prompt, 1.625x without it. It is the only LoRA here measured both ways.',
+      'Measured on Pony V6 at strength 0.6: 2.132x base sharpness with its word in the prompt, 1.625x without it. It is the only add-on here measured both ways.',
   },
 ]
 
@@ -533,16 +533,33 @@ function strengthFor(entry: LoraIndexEntry, info: LoraInfo | null): {
 }
 
 /**
+ * "Its word, X, is added to the prompt for you." The one sentence for that
+ * fact, on the desk's offers and on the region bench alike. Some add-ons
+ * answer to several captions at once, and those are called words.
+ */
+export function addedSentence(phrase: string): string {
+  const words = phrase.trim()
+  if (!words) return ''
+  return words.includes(',')
+    ? `Its words, ${words}, are added to the prompt for you.`
+    : `Its word, ${words}, is added to the prompt for you.`
+}
+
+/**
  * The trigger sentence for one LoRA. The five confidence levels say genuinely
  * different things and collapsing them is the mistake the index was built to
  * prevent: "no trigger data" is not "no trigger needed", and treating it as one
  * silently drops a third of the effect.
+ *
+ * This is read on the desk, word for word, under each add-on offered, so it
+ * speaks of the add-on and its word. It is the same sentence the region bench
+ * prints for the same fact (recipe.ts, authorNote).
  */
 function triggerSentence(entry: LoraIndexEntry): string {
   switch (entry.confidence) {
     case 'strong':
     case 'likely':
-      return `Its trigger ${entry.triggerPhrase} gets added to the prompt, because a LoRA whose trigger is missing runs on its weights alone.`
+      return addedSentence(entry.triggerPhrase)
     case 'weak':
     case 'none':
     case 'no-data':
@@ -641,7 +658,7 @@ export function suggest(input: SuggestInput): SuggestResult {
     forced.set('anatomy-helper.safetensors', {
       reason: 'anatomy-level',
       why:
-        'Asked for by the anatomy setting. In the measured two LoRA stack it held 1.14x base sharpness alongside add-micro-details, and on its own it costs sharpness at every strength tried, which is why it is capped at 0.4. Both runs were made without trigger words, so both are floors.',
+        'Asked for by the anatomy setting. In the measured pair of add-ons it held 1.14x base sharpness alongside add-micro-details, and on its own it costs sharpness at every strength tried, which is why it is capped at 0.4. Both runs were made without the add-ons’ words in the prompt, so both are floors.',
       score: STAPLE_SCORE * 0.9,
     })
   }
@@ -660,7 +677,7 @@ export function suggest(input: SuggestInput): SuggestResult {
 
     if (already.has(entry.file.toLowerCase())) return
     if (onDisk && !onDisk.has(entry.file.toLowerCase())) {
-      rejected.push({ file: entry.file, label, why: 'Indexed but not in the LoRA folder now, so ComfyUI cannot load it.' })
+      rejected.push({ file: entry.file, label, why: 'Indexed but not in the add-ons folder now, so ComfyUI cannot load it.' })
       return
     }
 

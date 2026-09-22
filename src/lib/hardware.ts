@@ -87,6 +87,27 @@ function footprintOf(graph: FamilyDef['graph'], sizes: Map<string, ModelFile>): 
   }
 }
 
+/**
+ * The family's graph with this weight file in it, for pricing one file of a
+ * family that lists several.
+ *
+ * The family's own graph names its default file. Priced as it stands, every
+ * other file of the family, a second quant or a different checkpoint of the
+ * same lineage, was judged at the default's size, so a Q8 read as fitting on
+ * the strength of a Q4 and the other way round. A two-model family carries a
+ * matched pair and is priced whole, as instantiate() leaves it.
+ */
+export function modelGraph(def: FamilyDef, model: string): FamilyDef['graph'] {
+  const slots = def.bindings.model ?? []
+  if (def.dualModel || !model || !slots.length) return def.graph
+  const graph = { ...def.graph }
+  for (const [id, input] of slots) {
+    const node = graph[id]
+    if (node) graph[id] = { ...node, inputs: { ...node.inputs, [input]: model } }
+  }
+  return graph
+}
+
 export type Level = 'ok' | 'tight' | 'risky' | 'blocked'
 
 export type Verdict = {

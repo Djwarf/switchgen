@@ -42,7 +42,7 @@ import {
   type LoraStack,
   type LoraTarget,
 } from '../../lib/loras'
-import type { Plan } from '../../lib/recipe'
+import { plainWords, type Plan } from '../../lib/recipe'
 import {
   IMG2IMG,
   deriveImg2Img,
@@ -214,7 +214,9 @@ function retrigger(
     .map((p) => p.trim())
     .filter((p) => p && !old.has(p.toLowerCase()))
   const have = new Set(kept.map((p) => p.toLowerCase()))
-  const add = triggersFor(to, lib, target).filter((t) => !have.has(t.toLowerCase()))
+  // The same words decide() would send, so a stack edited by hand cannot put
+  // a model card's markdown into the prompt where the recipe would not.
+  const add = plainWords(triggersFor(to, lib, target)).filter((t) => !have.has(t.toLowerCase()))
   return [...kept, ...add].join(', ')
 }
 
@@ -262,7 +264,17 @@ export function settle(plan: Plan, ov: Overrides, lib: LoraLibrary = EMPTY_LIBRA
     clipStrength: s.clipStrength,
   }))
 
-  const passes = ov.passes ?? NO_PASSES
+  // A pass is on only where the plan can run it. A pass switched on for one
+  // plan outlives it: the overrides are held across a change of mode and a
+  // visit to another room, and the edit model carries no detail pass, nor
+  // does a ComfyUI without the detector. Left on, the graph was built without
+  // it while the record filed it as run, and the cost counted it.
+  const wanted = ov.passes ?? NO_PASSES
+  const passes: Passes = {
+    face: wanted.face && plan.passes.face.available,
+    hand: wanted.hand && plan.passes.hand.available,
+    hires: wanted.hires && plan.passes.hires.available,
+  }
   const anyPass = passes.face || passes.hand || passes.hires
 
   // One graph when nothing was touched: the recipe's own. A rebuild only

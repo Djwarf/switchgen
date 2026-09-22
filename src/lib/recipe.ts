@@ -28,7 +28,8 @@
  * default strengths. They are not a claim that the picture is more correct, and
  * no copy produced here says that they are.
  */
-import type { Hardware, ModelFile } from './hardware'
+import { feasibility, type Hardware, type ModelFile, type Verdict } from './hardware'
+import type { PassBlocks } from './availability'
 import {
   intentReport,
   wantsExplicitAnatomy,
@@ -50,7 +51,7 @@ import {
   type LoraStack,
   type LoraTarget,
 } from './loras'
-import { suggest as suggestLoras } from './suggest'
+import { addedSentence, suggest as suggestLoras } from './suggest'
 import { byFilename as indexedLora } from './loraIndex'
 
 /**
@@ -64,7 +65,7 @@ function indexedTrigger(file: string): string | null {
   return e.confidence === 'strong' || e.confidence === 'likely' ? e.triggerPhrase : null
 }
 import { canTakeLoras, capabilitiesOf, withLoras, type Capabilities, type DerivedDef } from './refine'
-import { FAMILIES, defaultsFor, deriveImg2Img, IMG2IMG, type FamilyDef, type Params } from './workflows'
+import { FAMILIES, defaultsFor, deriveImg2Img, IMG2IMG, instantiate, type FamilyDef, type Params } from './workflows'
 
 // ---------------------------------------------------------------------------
 // The three questions
@@ -203,11 +204,16 @@ export type RecipeLora = {
 
 /** A pass the result can offer once the picture exists. */
 export type PassOffer = {
-  /** The family's graph supports it. False means the button is not drawn. */
+  /** The family's graph supports it and ComfyUI has what it loads. False means the button is not drawn. */
   available: boolean
   /** Whether {@link decide} thinks it should run without being asked. */
   auto: boolean
   why: string
+  /**
+   * The graph could carry it, but a file or node pack it loads is missing
+   * here, said in one sentence that names it. Absent when nothing is missing.
+   */
+  blocked?: string
 }
 
 export type RecipePasses = {
@@ -255,6 +261,12 @@ export type Plan = {
 
   passes: RecipePasses
   capabilities: Capabilities
+  /**
+   * The memory verdict for the graph this plan builds: the chosen file, not
+   * the family's default, with every add-on in the chain. Null when the
+   * machine has not been measured.
+   */
+  verdict: Verdict | null
 
   /** Every decision, in the order it was made. */
   notes: RecipeNote[]
@@ -308,6 +320,12 @@ export type RecipeInput = {
   addOns?: { accepted?: readonly string[]; declined?: readonly string[] }
   /** Omitted, one is rolled. */
   seed?: number
+  /**
+   * What stops a quality pass from running on this ComfyUI, from
+   * availability.passBlocks. A pass with a sentence here is not offered, and
+   * the sentence says what to install.
+   */
+  passBlocks?: Partial<PassBlocks>
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +367,43 @@ function prefixFor(def: FamilyDef, model: string): { tokens: string[]; why: stri
     return { tokens, why: 'Quality prefix this file was trained with, from the registry.' }
   }
   return { tokens: [], why: '' }
+}
+
+/**
+ * Words fit to go into a prompt, out of the words the add-ons answer to.
+ *
+ * The catalogue's hand-written words were scraped from model cards, and a few
+ * rows carry the card's markdown instead, such as "## 🧠 Usage (Python)". Sent
+ * as a prompt word it conditions the picture on a heading, and printed on the
+ * bench it tells the reader that heading is the add-on's word. A word that
+ * opens like a heading, runs over a line, or is the card's usage title is
+ * left out, and the add-on runs without a word, as it does when it has none.
+ */
+export function plainWords(words: readonly string[]): string[] {
+  return words.filter((w) => {
+    const t = w.trim()
+    return !!t && !t.startsWith('#') && !/[\r\n]/.test(t) && !/\busage\s*\(/i.test(t)
+  })
+}
+
+/**
+ * The four passes, as the result will offer them. A pass the graph can carry
+ * is still withheld when ComfyUI lacks a file it loads, and the sentence that
+ * names the file goes with it, so the panel can say why the row is missing.
+ */
+export function passesFor(
+  capabilities: Capabilities,
+  why: Record<keyof RecipePasses, string>,
+  blocks: Partial<PassBlocks> = {},
+): RecipePasses {
+  const one = (can: boolean, text: string, blocked: string | null | undefined): PassOffer =>
+    can && blocked ? { available: false, auto: false, why: text, blocked } : { available: can, auto: false, why: text }
+  return {
+    face: one(capabilities.faceDetail, why.face, blocks.face),
+    hand: one(capabilities.handDetail, why.hand, blocks.hand),
+    refine: one(capabilities.refine, why.refine, blocks.refine),
+    hires: one(capabilities.hires, why.hires, null),
+  }
 }
 
 /** The LoRA stack a level asks for, before anything is checked against disk. */
@@ -517,7 +572,8 @@ export function decide(input: RecipeInput): Recipe {
   notes.push(note('model', `${pick.label}: ${pick.why}`))
   if (pick.caveat) notes.push(note('model', pick.caveat))
   if (pick.warning) warnings.push(pick.warning)
-  if (pick.verdict && pick.verdict.level !== 'ok') warnings.push(pick.verdict.reason)
+  // The memory warning waits for step 7b, where the graph that will run is
+  // priced with its add-ons on it rather than the file on its own.
 
   const baseDef = pick.def
   const model = pick.model
@@ -767,7 +823,7 @@ export function decide(input: RecipeInput): Recipe {
     const e = indexedTrigger(pick.file)
     return e ? [e] : []
   })
-  const triggers = [...triggersFor(stack, lib, target), ...suggestedTriggers]
+  const triggers = plainWords([...triggersFor(stack, lib, target), ...suggestedTriggers])
     .filter((t, n, a) => a.indexOf(t) === n)
     .filter(t => !lower.includes(t.toLowerCase()))
   if (prefix.tokens.length) notes.push(note('prompt', prefix.why))
@@ -796,34 +852,29 @@ export function decide(input: RecipeInput): Recipe {
     params.megapixels = I2I.megapixels
   }
 
+  // 7b. Memory, priced on the graph that will be queued. The ranking priced
+  // this file on its own; the add-on chain loads on top of it, and a stack of
+  // them is gigabytes the ranking never saw.
+  const verdict =
+    input.hardware && input.sizes ? feasibility(baseDef, input.sizes, input.hardware, instantiate(def, params)) : null
+  if (verdict && verdict.level !== 'ok') warnings.push(verdict.reason)
+
   // 8. Passes. Nothing here runs on its own. The face pass measured 0.714 on
   // the same metric as the stacks above, which is not an endorsement, and the
   // hand pass was not measured at all. Both are real fixes for the two regions
   // that fail first, so they are offered on the finished picture, where the
   // reader can see whether the hands came out wrong before spending a pass.
   const capabilities = capabilitiesOf(def)
-  const passes: RecipePasses = {
-    face: {
-      available: capabilities.faceDetail,
-      auto: false,
-      why: `Re renders every detected face at 768 and pastes it back. Measured ${pct(MEASURED.faceDetailer.ratio)} whole frame sharpness, so it is offered rather than run blind.`,
+  const passes = passesFor(
+    capabilities,
+    {
+      face: `Re renders every detected face at 768 and pastes it back. Measured ${pct(MEASURED.faceDetailer.ratio)} whole frame sharpness, so it is offered rather than run blind.`,
+      hand: 'Re renders every detected hand with more freedom than a face, because hands come out wrong rather than merely soft. Not measured here.',
+      refine: 'Draw a mask over a region and it is cropped, upscaled to full working resolution and rendered alone. The only thing that adds real detail to a region with no detector.',
+      hires: 'Renders the same picture larger, at low denoise, from the finished latent.',
     },
-    hand: {
-      available: capabilities.handDetail,
-      auto: false,
-      why: 'Re renders every detected hand with more freedom than a face, because hands come out wrong rather than merely soft. Not measured here.',
-    },
-    refine: {
-      available: capabilities.refine,
-      auto: false,
-      why: 'Draw a mask over a region and it is cropped, upscaled to full working resolution and rendered alone. The only thing that adds real detail to a region with no detector.',
-    },
-    hires: {
-      available: capabilities.hires,
-      auto: false,
-      why: 'Renders the same picture larger, at low denoise, from the finished latent.',
-    },
-  }
+    input.passBlocks,
+  )
   notes.push(
     note('passes', 'Face, hands, a masked region and a larger render are offered on the finished picture, not before it.'),
   )
@@ -847,6 +898,7 @@ export function decide(input: RecipeInput): Recipe {
     offers,
     passes,
     capabilities,
+    verdict,
     notes,
     warnings,
     report,
@@ -870,7 +922,7 @@ function heldForRefine(lib: LoraLibrary, target: LoraTarget, inStack: Set<string
     // The word the prompt actually gets, which is the caption index's when it
     // has a confident one and the catalogue's otherwise: the same choice
     // triggersFor makes when the add-on is chained.
-    const word = triggersFor([{ file: info.file, strength: 1, enabled: true }], lib)[0] ?? ''
+    const word = plainWords(triggersFor([{ file: info.file, strength: 1, enabled: true }], lib))[0] ?? ''
     out.push({
       file: info.file,
       label: info.label,
@@ -883,8 +935,8 @@ function heldForRefine(lib: LoraLibrary, target: LoraTarget, inStack: Set<string
 }
 
 function authorNote(info: LoraInfo, word: string): string {
-  const added = word.trim() ? ` Its word, ${word.trim()}, is added to the prompt for you.` : ''
-  return `${info.does}${added} Strength ${info.recommended} is the author's recommendation, not a measurement taken here.`
+  const added = addedSentence(word)
+  return `${info.does}${added ? ` ${added}` : ''} Strength ${info.recommended} is the author's recommendation, not a measurement taken here.`
 }
 
 /**
@@ -949,7 +1001,7 @@ export function positiveFor(input: {
       const t = indexedTrigger(l.name)
       return t ? [t] : []
     })
-  const triggers = [...triggersFor(stack, input.lib, target), ...captioned, ...(input.extra ?? [])]
+  const triggers = plainWords([...triggersFor(stack, input.lib, target), ...captioned, ...(input.extra ?? [])])
     .filter((t, n, a) => a.indexOf(t) === n)
     .filter(t => !lower.includes(t.toLowerCase()))
   const prefix = prefixFor(input.def, input.model).tokens

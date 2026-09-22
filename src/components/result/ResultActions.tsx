@@ -32,9 +32,11 @@ import { Caution, Kicker, RING } from '../refine/bits'
 import type { DerivedDef } from '../../lib/refine'
 import type { ImageFacts } from '../../lib/vision'
 import type { FamilyDef } from '../../lib/workflows'
+import type { PassBlocks } from '../../lib/availability'
 import {
   SHARPNESS_CAVEAT,
   offerFigures,
+  offerNotes,
   offersFor,
   type OfferOptions,
   type ResultActionId,
@@ -58,6 +60,12 @@ export type ResultActionsProps = {
   canSource?: boolean
   /** False withholds the rows that re-render the picture from its record. See OfferOptions.rebuild. */
   rebuild?: boolean
+  /** The graph the region bench draws with, when it is not `def`. See OfferOptions.region. */
+  region?: FamilyDef | DerivedDef | null
+  /** Passes this ComfyUI cannot run, each with the sentence naming why. See OfferOptions.blocks. */
+  blocks?: Partial<PassBlocks>
+  /** The picture is a region pass. See OfferOptions.regionPass. */
+  regionPass?: { from: string | null } | null
   /** What the detectors found, when the picture has been read. See OfferOptions.facts. */
   facts?: ImageFacts | null
   /** The press is working. Every row is held, and the reason is printed once. */
@@ -72,6 +80,9 @@ export function ResultActions({
   def,
   canSource = true,
   rebuild = true,
+  region,
+  blocks,
+  regionPass = null,
   facts = null,
   busy = false,
   blocked = null,
@@ -86,18 +97,21 @@ export function ResultActions({
   // absolute terms and wrong to repeat on every render of a desk this sits
   // inside, so it is keyed on the things that can change the answer: the graph,
   // the picture, and the size the hires row quotes.
-  const offers = useMemo(() => {
-    if (!url) return []
+  const { offers, notes } = useMemo(() => {
+    if (!url) return { offers: [], notes: [] }
     const opts: OfferOptions = {
       size: width && height ? { width, height } : null,
       canSource,
       facts,
       rebuild,
+      region,
+      blocks,
+      regionPass,
     }
-    return offersFor(def, opts)
-  }, [url, def, width, height, canSource, facts, rebuild])
+    return { offers: offersFor(def, opts), notes: offerNotes(def, opts) }
+  }, [url, def, width, height, canSource, facts, rebuild, region, blocks, regionPass])
 
-  if (!picture || !offers.length) return null
+  if (!picture || (!offers.length && !notes.length)) return null
 
   const improve = offers.filter(o => o.group === 'improve')
   const carry = offers.filter(o => o.group === 'carry')
@@ -143,6 +157,18 @@ export function ResultActions({
             Carries this recipe forward. Nothing to fill in again.
           </p>
           <Rows offers={carry} held={held} onAction={onAction} />
+        </div>
+      ) : null}
+
+      {/* Why a row the reader might look for is not there, when the reason is
+          something they can put right. */}
+      {notes.length ? (
+        <div className="mt-3 space-y-1">
+          {notes.map((n) => (
+            <p key={n} className="text-caption leading-snug text-grey-700">
+              {n}
+            </p>
+          ))}
         </div>
       ) : null}
 

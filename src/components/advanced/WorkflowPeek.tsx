@@ -45,7 +45,7 @@ export function WorkflowPeek({
         figure={`${nodes} nodes`}
         note={
           settled.rebuilt
-            ? 'Rebuilt from the family graph because a pass or the LoRA chain changed it.'
+            ? 'Rebuilt from the family graph because a pass or the add-on chain changed it.'
             : 'The graph the recipe built, unchanged.'
         }
       />

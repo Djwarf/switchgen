@@ -38,6 +38,14 @@ export function PassPanel({
   onPasses: (next: Passes) => void
 }) {
   const caps = plan.capabilities
+  // A pass the graph can carry is still left out when ComfyUI lacks a file it
+  // loads: the job would be refused over that file. The sentence naming the
+  // file is printed instead, so the missing row has a reason on the page.
+  const face = plan.passes.face.available
+  const hand = plan.passes.hand.available
+  const blocked = [plan.passes.face.blocked, plan.passes.hand.blocked, plan.passes.refine.blocked].filter(
+    (b, i, all): b is string => !!b && all.indexOf(b) === i,
+  )
   const p = settled.passes
   const steps = settled.params.steps
   const sized = !settled.params.image
@@ -46,6 +54,7 @@ export function PassPanel({
   const toggle = (key: keyof Passes) => onPasses({ ...p, [key]: !p[key] })
 
   const none = !caps.faceDetail && !caps.handDetail && !caps.hires
+  const shown = face || hand || caps.hires
 
   return (
     <section className="mb-7">
@@ -60,9 +69,9 @@ export function PassPanel({
           {plan.label} samples through a custom schedule with no denoise control, so no detail pass
           can run on it. It is chosen for what it draws, not for what can be done to it afterwards.
         </Note>
-      ) : (
+      ) : !shown ? null : (
         <ul className="border-t border-grey-300">
-          {caps.faceDetail ? (
+          {face ? (
             <Check
               on={p.face}
               onToggle={() => toggle('face')}
@@ -71,7 +80,7 @@ export function PassPanel({
               cost="about one extra pass per face found"
             />
           ) : null}
-          {caps.handDetail ? (
+          {hand ? (
             <Check
               on={p.hand}
               onToggle={() => toggle('hand')}
@@ -96,6 +105,14 @@ export function PassPanel({
         </ul>
       )}
 
+      {blocked.length ? (
+        <div className="mt-2 space-y-1">
+          {blocked.map((b) => (
+            <Note key={b}>{b}</Note>
+          ))}
+        </div>
+      ) : null}
+
       {settled.cost > 1 ? (
         <p className="mt-2 text-caption tabular-nums leading-snug text-grey-700">
           Roughly {settled.cost.toFixed(2)}x the time of a plain picture, at least. A detector that
@@ -105,9 +122,11 @@ export function PassPanel({
 
       <div className="mt-3 border-t border-grey-300 pt-2">
         <Note>
-          {caps.refine
+          {plan.passes.refine.available
             ? 'A masked region re render is the fourth pass, and it is not here because there is nothing to draw a mask on yet. The finished picture offers it, along with these three.'
-            : 'This family cannot carry a masked region re render, so the finished picture will not offer one.'}
+            : caps.refine
+              ? 'A masked region re render is the fourth pass. It cannot run here until what is named above is installed.'
+              : 'This family cannot carry a masked region re render, so the finished picture will not offer one.'}
         </Note>
         {p.face || p.hand || p.hires ? (
           <Note>
