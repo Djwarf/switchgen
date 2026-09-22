@@ -14,6 +14,7 @@
 import { REEL_PREFIX } from '../../lib/continuation'
 import { useSyncExternalStore } from 'react'
 import { store as kv, randomSeed } from '../../lib/session'
+import type { ShotState } from './engine'
 
 export const REEL_KEY = 'switchgen.reel.v1'
 const SAVE_DEBOUNCE_MS = 400
@@ -34,8 +35,18 @@ export type ReelShot = {
   prompt: string
   /** Frames. null follows the reel's own length. */
   length: number | null
-  /** null follows the reel's seed ladder. */
+  /** null follows the reel's seed ladder. A seed somebody typed for this shot. */
   seed: number | null
+  /**
+   * The seed this shot's rendered take was made with, kept while the reel's
+   * seed is fixed. The ladder hands out seeds by position, so without it a
+   * cut, an added shot or a move gave every later shot a new seed, and a
+   * fixed reel re-rendered takes nobody had touched as different ones. Only
+   * a fixed reel reads it, and it is let go when the reel goes back to
+   * Random or is given a new seed, so it never pins a take nobody asked to
+   * keep. Null when there is nothing to keep.
+   */
+  keptSeed: number | null
   /** null follows the reel's negative. */
   negative: string | null
   /** A name for the margin, when "Shot 4" is not enough. */
@@ -76,7 +87,42 @@ export function newId(): string {
 }
 
 export function newShot(prompt = ''): ReelShot {
-  return { id: newId(), prompt, length: null, seed: null, negative: null, label: null, start: null, end: null }
+  return {
+    id: newId(),
+    prompt,
+    length: null,
+    seed: null,
+    keptSeed: null,
+    negative: null,
+    label: null,
+    start: null,
+    end: null,
+  }
+}
+
+/**
+ * The seed a shot's job is planned with: its own, else on a fixed reel the one
+ * its take was made with, else undefined, which puts it on the reel's ladder.
+ */
+export function shotSeed(shot: ReelShot, seedLocked: boolean): number | undefined {
+  return shot.seed ?? (seedLocked ? shot.keptSeed : null) ?? undefined
+}
+
+/**
+ * The seeds to keep before the strip is rearranged on a fixed reel: for every
+ * shot that follows the ladder and has a rendered take, the seed that take was
+ * made with.
+ */
+export function seedsToKeep(
+  shots: readonly ReelShot[],
+  states: Readonly<Record<string, ShotState>>,
+): Map<string, number> {
+  const keep = new Map<string, number>()
+  for (const shot of shots) {
+    const made = states[shot.id]?.status === 'done' ? states[shot.id]?.made : null
+    if (shot.seed === null && made) keep.set(shot.id, made.seed)
+  }
+  return keep
 }
 
 export function blankDraft(): ReelDraft {
@@ -136,6 +182,7 @@ function readShot(v: unknown): ReelShot | null {
     prompt: str(s.prompt, ''),
     length: typeof s.length === 'number' ? s.length : null,
     seed: typeof s.seed === 'number' ? s.seed : null,
+    keptSeed: typeof s.keptSeed === 'number' && Number.isFinite(s.keptSeed) ? s.keptSeed : null,
     negative: maybeStr(s.negative),
     label: maybeStr(s.label),
     start: readFrame(s.start),
@@ -255,7 +302,9 @@ export const reel = {
   duplicate(id: string): string | null {
     const source = draft.shots.find((s) => s.id === id)
     if (!source) return null
-    const copy: ReelShot = { ...source, id: newId(), start: null, end: source.end }
+    // The take belongs to the shot it was made for. The copy has none, so it
+    // takes its place on the ladder rather than repeat that take.
+    const copy: ReelShot = { ...source, id: newId(), keptSeed: null, start: null, end: source.end }
     mapShots((shots) => {
       const at = shots.findIndex((s) => s.id === id)
       return [...shots.slice(0, at + 1), copy, ...shots.slice(at + 1)]
@@ -274,6 +323,18 @@ export const reel = {
 
   restore(shot: ReelShot, index: number): void {
     mapShots((shots) => [...shots.slice(0, index), shot, ...shots.slice(index)])
+  },
+
+  /** Keep each listed shot's take seed (see ReelShot.keptSeed). One write for the lot. */
+  keepSeeds(seeds: ReadonlyMap<string, number>): void {
+    if (!seeds.size) return
+    mapShots((shots) => shots.map((s) => (seeds.has(s.id) ? { ...s, keptSeed: seeds.get(s.id) ?? null } : s)))
+  },
+
+  /** Let every kept take seed go, so each shot follows the ladder again. */
+  releaseSeeds(): void {
+    if (!draft.shots.some((s) => s.keptSeed !== null)) return
+    mapShots((shots) => shots.map((s) => (s.keptSeed === null ? s : { ...s, keptSeed: null })))
   },
 
   /** Move one shot by `delta` places. Clamped, so the ends simply hold. */

@@ -203,7 +203,8 @@ export function Bench(p: BenchProps) {
         </div>
         <p className="mt-1 text-caption italic text-grey-500">
           Shot 1 takes this seed, shot 2 takes the next, and so on up the reel. On Random, every render draws a new
-          one, so rendering a shot again gives a different take. Fix it and the same reel comes back the same way.
+          one, so rendering a shot again gives a different take. Fix it and the same reel comes back the same way,
+          and a rendered shot keeps its seed when shots around it are cut, added or moved.
         </p>
       </Field>
 

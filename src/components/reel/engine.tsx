@@ -33,11 +33,11 @@
  */
 import { useSyncExternalStore } from 'react'
 
-import { releaseComfyMemory, type ClipMemory } from '../../lib/clipMemory'
+import { releaseComfyMemory, waitForIdleComfy, type ClipMemory } from '../../lib/clipMemory'
 import {
   cancelJob,
+  fetchPastRun,
   getJob,
-  pastRuns,
   relPath,
   run,
   type OutputFile,
@@ -55,7 +55,7 @@ import {
   type ShotJob,
 } from '../../lib/continuation'
 import { history } from '../../lib/history'
-import { recordOf, store as kv, type Composition } from '../../lib/session'
+import { onStorage, recordOf, store as kv, type Composition } from '../../lib/session'
 
 export type ShotStatus = 'waiting' | 'queued' | 'running' | 'done' | 'error' | 'stopped'
 
@@ -130,8 +130,8 @@ export type RunContext = {
   compositionFor: (job: ShotJob) => Composition
   /**
    * The memory verdict for one clip (lib/clipMemory). A refused clip is never
-   * sent, and a clip whose verdict says release has ComfyUI's cached models
-   * released immediately before it is queued.
+   * sent, and a clip whose verdict says release waits for ComfyUI's queue to
+   * empty, has its cached models released, and is queued straight after.
    */
   memory?: (job: ShotJob) => ClipMemory
 }
@@ -176,6 +176,8 @@ let state: RunState = IDLE
 const listeners = new Set<() => void>()
 /** One walk at a time. A second press while the queue moves is ignored. */
 let walking = false
+/** The wait for ComfyUI's queue to empty before a shot that needs memory released, so Stop can end it. */
+let waiting: AbortController | null = null
 
 function emit(): void {
   for (const fn of [...listeners]) {
@@ -283,6 +285,24 @@ export function shotsToRender(
 
 const RUN_KEY = 'switchgen.reelrun.v1'
 
+/**
+ * Every open tab loads this engine, and they share one saved run. So the shot
+ * on the press is saved with the tab that is following it, and that tab says
+ * it is still there every few seconds. Another tab leaves a shot alone while
+ * its follower is alive: two tabs following one prompt could file its clip
+ * twice, and whichever finished second wrote back a strip that was out of
+ * date, without the next shot on the press.
+ *
+ * The allowance is long because browsers slow the timers of a tab nobody is
+ * looking at (Chrome to once a minute, after five minutes hidden), and that
+ * is usually the tab the reel is rendering in.
+ */
+const TAB = newRunId()
+const BEAT_MS = 5_000
+const STALE_MS = 150_000
+/** How often a tab that is not following the shot checks whether its follower has gone. */
+const WATCH_MS = 15_000
+
 /** The shot on the press, with everything needed to file it if the page goes away. */
 type Pending = {
   shotId: string
@@ -298,20 +318,60 @@ type Pending = {
   modelLabel: string
 }
 
+/** Who is following a saved shot on the press. Stamped when it is written. */
+type Stamp = {
+  /** The tab following it. */
+  owner: string
+  /** When that tab last wrote, in epoch ms. */
+  beat: number
+  /** True when that page went away (a reload, a close) and left it for the next one. */
+  released: boolean
+}
+
+type StoredPending = Pending & Stamp
+
 type SavedShot = Pick<
   ShotState,
   'shotId' | 'clip' | 'frame' | 'files' | 'entryId' | 'durationMs' | 'finishedAt' | 'made'
 >
 
+/** The shot this tab is following, if any. */
 let pending: Pending | null = null
+let beatTimer: ReturnType<typeof setInterval> | null = null
+let watchTimer: ReturnType<typeof setTimeout> | null = null
+/** The saved shots this tab last wrote or took in, as written. */
+let mirrored = ''
+
+/** Set or clear the shot this tab follows, keep its heartbeat going while there is one, and save. */
+function setPending(p: Pending | null): void {
+  pending = p
+  if (p && !beatTimer) beatTimer = setInterval(() => persist(), BEAT_MS)
+  if (!p && beatTimer) {
+    clearInterval(beatTimer)
+    beatTimer = null
+  }
+  persist()
+}
 
 /**
  * Write every clip on disk, whatever its status says: a shot waiting to be
  * rendered again, or one whose new render failed, still has its earlier clip.
- * Written immediately, not debounced, because it only runs at shot boundaries
- * and the moment it matters is the moment before the page goes.
+ * Written immediately, not debounced, because it runs at shot boundaries and
+ * on the heartbeat, and the moment it matters is the moment before the page
+ * goes.
+ *
+ * A shot another tab is following is written back as it was found. This tab's
+ * view of the run can be behind that tab's, and leaving the entry out would
+ * forget the shot if that tab then closed.
  */
-function persist(): void {
+function persist(opts: { released?: boolean } = {}): void {
+  let entry: StoredPending | null = null
+  if (pending) entry = { ...pending, owner: TAB, beat: Date.now(), released: opts.released ?? false }
+  else {
+    const theirs = readStored(kv.get(RUN_KEY))?.pending ?? null
+    if (theirs && theirs.owner !== TAB) entry = theirs
+  }
+
   const shots: SavedShot[] = []
   for (const s of Object.values(state.states)) {
     if (!s.clip || !s.made) continue
@@ -326,9 +386,10 @@ function persist(): void {
       made: s.made,
     })
   }
+  mirrored = JSON.stringify(shots)
   try {
-    if (!shots.length && !pending) kv.remove(RUN_KEY)
-    else kv.set(RUN_KEY, JSON.stringify({ shots, pending }))
+    if (!shots.length && !entry) kv.remove(RUN_KEY)
+    else kv.set(RUN_KEY, JSON.stringify({ shots, pending: entry }))
   } catch {
     // A full quota costs the saved copy, never the run on screen.
   }
@@ -371,7 +432,7 @@ function readSaved(v: unknown): ShotState | null {
   }
 }
 
-function readPending(v: unknown): Pending | null {
+function readPending(v: unknown): StoredPending | null {
   if (
     !isObject(v) ||
     !isString(v.shotId) ||
@@ -388,7 +449,39 @@ function readPending(v: unknown): Pending | null {
   ) {
     return null
   }
-  return v as unknown as Pending
+  // An entry saved before entries were stamped reads as unowned and long
+  // quiet, so the next page picks it up as it always did.
+  return {
+    ...(v as unknown as Pending),
+    owner: isString(v.owner) ? v.owner : '',
+    beat: isNumber(v.beat) ? v.beat : 0,
+    released: v.released === true,
+  }
+}
+
+type Saved = {
+  states: Record<string, ShotState>
+  pending: StoredPending | null
+  /** The saved shots as written, to tell a write that changed them from a heartbeat. */
+  shotsKey: string
+}
+
+/** The saved run, or null when there is none or it cannot be read. */
+function readStored(raw: string | null): Saved | null {
+  let v: unknown
+  try {
+    v = JSON.parse(raw ?? 'null')
+  } catch {
+    return null
+  }
+  if (!isObject(v)) return null
+  const list: unknown[] = Array.isArray(v.shots) ? v.shots : []
+  const states: Record<string, ShotState> = {}
+  for (const s of list) {
+    const shot = readSaved(s)
+    if (shot) states[shot.shotId] = shot
+  }
+  return { states, pending: readPending(v.pending), shotsKey: JSON.stringify(list) }
 }
 
 /** File a finished clip, unless the archive already holds that exact file. */
@@ -466,17 +559,17 @@ async function resume(p: Pending, kept: ShotState | null): Promise<void> {
     }
   }
 
-  pending = null
   walking = false
   holdUnload(false)
   setRun({ status: verdict, finishedAt: Date.now(), currentShotId: null, stopRequested: false, note })
-  persist()
+  setPending(null)
 }
 
 /** Poll one job to its end, and file its clip if it lands. */
 async function follow(p: Pending): Promise<[RunStatus, string]> {
   const left = `${p.label} was left on the press by the page before this one`
   let misses = 0
+  let historyMisses = 0
   for (;;) {
     let job: ServerJob | null | undefined
     try {
@@ -494,19 +587,36 @@ async function follow(p: Pending): Promise<[RunStatus, string]> {
     misses = 0
     if (job && (job.status === 'pending' || job.status === 'in_progress')) {
       const waiting = job.status === 'pending'
-      setShot(p.shotId, { status: waiting ? 'queued' : 'running', stage: waiting ? 'Queued' : 'Drawing' })
+      setShot(p.shotId, {
+        status: waiting ? 'queued' : 'running',
+        stage: state.stopRequested ? 'Stopping' : waiting ? 'Queued' : 'Drawing',
+      })
       await delay(POLL_MS)
       continue
     }
-    if (!job) return ['error', `${left}, and ComfyUI no longer knows the job, so it did not finish.`]
+    // Stop takes a waiting job out of ComfyUI's queue, and a job taken out
+    // that way leaves no record at all. So gone after a stop is the stop
+    // landing, not a job that was lost.
+    if (!job) {
+      return state.stopRequested
+        ? ['stopped', `${p.label} was stopped.`]
+        : ['error', `${left}, and ComfyUI no longer knows the job, so it did not finish.`]
+    }
     if (job.status === 'cancelled') return ['stopped', `${p.label} was stopped.`]
     if (job.status === 'failed') return ['error', `${left}, and it failed in ComfyUI.`]
 
-    let past: PastRun | undefined
+    // This one prompt's record, asked for by id. A page of recent history
+    // could already have scrolled past a shot that finished a while ago.
+    let past: PastRun | null
     try {
-      past = (await pastRuns(64)).find((r) => r.promptId === p.promptId)
+      past = await fetchPastRun(p.promptId)
     } catch {
-      past = undefined
+      // Could not ask, which is not the same as no record.
+      if (++historyMisses < POLL_GIVE_UP) {
+        await delay(POLL_MS)
+        continue
+      }
+      return ['error', `${left}. It finished, but ComfyUI did not answer when asked for its clip, so the desk stopped waiting. The Archive's recover action can still file it.`]
     }
     const files = past?.files ?? []
     const clip = files.find((f) => f.kind === 'video') ?? null
@@ -543,39 +653,29 @@ async function follow(p: Pending): Promise<[RunStatus, string]> {
 
 /** Read what the last page left behind, once, when the module loads. */
 function restore(): void {
-  let raw: unknown
-  try {
-    raw = JSON.parse(kv.get(RUN_KEY) ?? 'null')
-  } catch {
+  const saved = readStored(kv.get(RUN_KEY))
+  if (!saved) return
+  mirrored = saved.shotsKey
+  if (Object.keys(saved.states).length) state = { ...IDLE, states: saved.states }
+  pickUp(saved.pending, true)
+}
+
+/**
+ * Follow a shot a page left on the press, unless a tab that is still open is
+ * following it. A page that went away released it, and the next page to load
+ * takes it at once: that is usually the same tab, reloaded. A tab that was
+ * already open waits for the entry to go quiet instead, so a reload gets its
+ * own shot back, and a tab that closed or crashed is still covered.
+ */
+function pickUp(p: StoredPending | null, atLoad: boolean): void {
+  if (!p || p.owner === TAB) return
+  const free = Date.now() - p.beat >= STALE_MS || (atLoad && p.released)
+  if (walking || !free) {
+    watchPress()
     return
   }
-  if (!isObject(raw)) return
 
-  const states: Record<string, ShotState> = {}
-  for (const v of Array.isArray(raw.shots) ? raw.shots : []) {
-    const shot = readSaved(v)
-    if (shot) states[shot.shotId] = shot
-  }
-
-  const p = readPending(raw.pending)
-  if (!p) {
-    if (Object.keys(states).length) state = { ...IDLE, states }
-    return
-  }
-
-  const kept = states[p.shotId] ?? null
-  states[p.shotId] = {
-    ...(kept ?? blankShot(p.shotId, p.frames)),
-    status: 'running',
-    stage: 'Still on the press from before the reload',
-    promptId: p.promptId,
-    startedAt: p.startedAt,
-    finishedAt: null,
-    error: null,
-    detail: null,
-    frames: p.frames,
-  }
-  pending = p
+  const kept = state.states[p.shotId] ?? null
   state = {
     ...IDLE,
     id: newRunId(),
@@ -583,12 +683,53 @@ function restore(): void {
     startedAt: p.startedAt,
     order: p.order,
     queue: [p.shotId],
-    states,
+    states: {
+      ...state.states,
+      [p.shotId]: {
+        ...(kept ?? blankShot(p.shotId, p.frames)),
+        status: 'running',
+        stage: 'Still on the press from before the reload',
+        promptId: p.promptId,
+        startedAt: p.startedAt,
+        finishedAt: null,
+        error: null,
+        detail: null,
+        frames: p.frames,
+      },
+    },
     currentShotId: p.shotId,
   }
   walking = true
   holdUnload(true)
+  // Claimed before anything else runs, so another tab reading now sees it taken.
+  setPending(p)
+  emit()
   void resume(p, kept)
+}
+
+/** Look again shortly at a shot another tab is following, and pick it up if that tab has gone. */
+function watchPress(): void {
+  if (watchTimer) return
+  watchTimer = setTimeout(() => {
+    watchTimer = null
+    const saved = readStored(kv.get(RUN_KEY))
+    if (!walking) mirror(saved)
+    pickUp(saved?.pending ?? null, false)
+  }, WATCH_MS)
+}
+
+/**
+ * Take in the run as another tab saved it, while this tab is rendering
+ * nothing, so its strip is not left behind and a later save from here does
+ * not write an old strip over a newer one. A heartbeat that changed no shot
+ * changes nothing here.
+ */
+function mirror(saved: Saved | null): void {
+  const key = saved?.shotsKey ?? ''
+  if (key === mirrored) return
+  mirrored = key
+  state = saved && Object.keys(saved.states).length ? { ...state, states: saved.states } : IDLE
+  emit()
 }
 
 /**
@@ -673,22 +814,36 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
 
   if (r.release) {
     // The two-model families are killed for memory at the final decode when
-    // models from earlier runs are still resident. Released just before the
-    // queue, because ComfyUI applies it when the next prompt starts.
+    // models from earlier runs are still resident. ComfyUI spends a release
+    // on whichever prompt it takes next, so one sent while other work waits
+    // in its queue frees memory for that work, and this shot then starts with
+    // whatever that work loaded. So the shot waits until ComfyUI has nothing
+    // queued or running, releases, and is queued straight after.
+    const stopped = () => {
+      setShot(shotId, { status: 'stopped', stage: 'Stopped', finishedAt: Date.now() })
+      return 'stopped' as const
+    }
+    const wait = new AbortController()
+    waiting = wait
+    const idle = await waitForIdleComfy(wait.signal, (ahead) =>
+      setShot(shotId, {
+        stage: `Waiting for ComfyUI to finish ${ahead === 1 ? 'one other job' : `${ahead} other jobs`}`,
+      }),
+    )
+    waiting = null
+    if (!idle || state.stopRequested) return stopped()
     setShot(shotId, { stage: 'Freeing memory first' })
     await releaseComfyMemory()
+    if (state.stopRequested) return stopped()
     setShot(shotId, { stage: 'Sending it to the press' })
-    if (state.stopRequested) {
-      setShot(shotId, { status: 'stopped', stage: 'Stopped', finishedAt: Date.now() })
-      return 'stopped'
-    }
   }
 
   const onEvent = (e: ProgressEvent) => {
     if (e.phase === 'queued') {
       setShot(shotId, { promptId: e.promptId, stage: 'Queued' })
+      let entry: Pending | null = null
       try {
-        pending = {
+        entry = {
           shotId,
           promptId: e.promptId,
           label: r.label,
@@ -700,10 +855,10 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
           familyLabel: ctx.familyLabel,
           modelLabel: ctx.modelLabel,
         }
-        persist()
       } catch {
-        pending = null
+        entry = null
       }
+      setPending(entry)
       if (state.stopRequested) void cancelJob(e.promptId).catch(() => undefined)
     } else if (e.phase === 'running') {
       setShot(shotId, { status: 'running', value: e.value, max: e.max, stage: 'Drawing' })
@@ -743,8 +898,7 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
       previewUrl: null,
       made: r.made,
     })
-    pending = null
-    persist()
+    setPending(null)
     return filed.unchanged ? 'unchanged' : 'done'
   } catch (err) {
     const f = faultOf(err)
@@ -758,8 +912,7 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
       durationMs: finishedAt - startedAt,
       previewUrl: null,
     })
-    pending = null
-    persist()
+    setPending(null)
     return f.cancelled ? 'stopped' : 'error'
   }
 }
@@ -795,10 +948,23 @@ async function walk(pass: Pass): Promise<void> {
   const stopped = new Set<string>()
   const unchanged: number[] = []
 
-  for (const index of indices) {
+  // The notes speak for this pass only. It can be one shot rendered alone, or
+  // the few shots a whole-reel pass found missing, so nothing is said about
+  // shots it never touched, and later shots are said to depend on a failed one
+  // only when the next one really opens on its last frame.
+  /** Shot numbers this pass finished, cached answers included. */
+  const finished: number[] = []
+  const finishedLine = () =>
+    finished.length
+      ? ` ${shotsWord(finished)} finished in this pass and ${finished.length === 1 ? 'is' : 'are'} on disk and in the archive.`
+      : ''
+  /** How a note ends when a shot at `position` in the queue stopped the pass. */
+  const restLine = (position: number) => (position + 1 < indices.length ? ', so the rest of this pass was not sent.' : '.')
+
+  for (const [position, index] of indices.entries()) {
     if (state.stopRequested) {
       verdict = 'stopped'
-      note = `Stopped before shot ${index + 1}. What was already rendered is on disk and in the archive.`
+      note = `Stopped before shot ${index + 1}.${finishedLine()}`
       break
     }
     const shotId = order[index]
@@ -815,7 +981,7 @@ async function walk(pass: Pass): Promise<void> {
     if (refusal) {
       setShot(shotId, { status: 'error', stage: 'Not sent', error: refusal, detail: null, finishedAt: Date.now() })
       verdict = 'error'
-      note = `Shot ${index + 1} was not sent to ComfyUI, so the queue stopped there.`
+      note = `Shot ${index + 1} was not sent to ComfyUI${restLine(position)}`
       break
     }
 
@@ -831,7 +997,7 @@ async function walk(pass: Pass): Promise<void> {
           finishedAt: Date.now(),
         })
         verdict = 'error'
-        note = `Shot ${index + 1} had nothing to continue from, so the queue stopped there.`
+        note = `Shot ${index + 1} had nothing to continue from${restLine(position)}`
         break
       }
     }
@@ -855,22 +1021,24 @@ async function walk(pass: Pass): Promise<void> {
       order,
     })
 
-    if (result === 'done') continue
-    if (result === 'unchanged') {
-      unchanged.push(index + 1)
+    if (result === 'done' || result === 'unchanged') {
+      finished.push(index + 1)
+      if (result === 'unchanged') unchanged.push(index + 1)
       continue
     }
     if (result === 'stopped') {
       stopped.add(shotId)
       verdict = 'stopped'
-      note = `Stopped during shot ${index + 1}. Everything before it is finished and filed.`
+      const kept = before[shotId]?.status === 'done' ? ' Its earlier clip is kept.' : ''
+      note = `Stopped during shot ${index + 1}.${kept}${finishedLine()}`
       break
     }
     verdict = 'error'
+    const next = indices[position + 1]
     note =
-      index + 1 < order.length
-        ? `Shot ${index + 1} failed, and every shot after it was going to open on its last frame. The queue stopped rather than carry on from a frame that does not exist.`
-        : `Shot ${index + 1} failed.`
+      next === index + 1 && jobs[next]?.start.from === 'previous'
+        ? `Shot ${index + 1} failed, and shot ${index + 2} was going to open on its last frame, so the rest of this pass was not sent.`
+        : `Shot ${index + 1} failed${restLine(position)}`
     break
   }
 
@@ -986,6 +1154,8 @@ export const reelRun = {
   stop(): void {
     if (state.status !== 'running') return
     setRun({ stopRequested: true })
+    // A shot still waiting for ComfyUI's queue to empty has nothing to cancel yet.
+    waiting?.abort()
     const shot = shotOf(state.currentShotId ?? undefined)
     if (shot?.promptId) {
       setShot(shot.shotId, { stage: 'Stopping' })
@@ -1002,8 +1172,7 @@ export const reelRun = {
   clear(): void {
     if (walking) return
     state = IDLE
-    pending = null
-    persist()
+    setPending(null)
     emit()
   },
 }
@@ -1011,6 +1180,26 @@ export const reelRun = {
 export function useReelRun(): RunState {
   return useSyncExternalStore(reelRun.subscribe, reelRun.snapshot, reelRun.snapshot)
 }
+
+if (typeof window !== 'undefined') {
+  // A reload or a close hands the shot on the press to the next page at once,
+  // rather than after the quiet time another tab waits.
+  window.addEventListener('pagehide', () => {
+    if (pending) persist({ released: true })
+  })
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted && pending) persist()
+  })
+}
+
+// Another tab saved the run. While this one renders nothing it takes in that
+// tab's strip, and keeps an eye on that tab's shot on the press.
+onStorage(RUN_KEY, (value) => {
+  if (walking) return
+  const saved = readStored(value)
+  mirror(saved)
+  if (saved?.pending && saved.pending.owner !== TAB) watchPress()
+})
 
 // Last, so everything it calls is defined.
 restore()

@@ -71,9 +71,12 @@ import {
   Strip,
   currencyOf,
   grouped,
+  recipeFor,
   reel,
   reelRun,
   seconds,
+  seedsToKeep,
+  shotSeed,
   shotsFromLines,
   shotsToRender,
   useReel,
@@ -282,28 +285,6 @@ function lengthChoices(fps: number, spec: NumSpec): number[] {
   return out.sort((a, b) => a - b)
 }
 
-/**
- * A family's own verified recipe, as bench settings. A reel is one continuous
- * piece, so the whole bench follows the family rather than carrying settings
- * across from a different model.
- */
-function recipeFor(f: ReelFamily): Partial<ReelDraft> {
-  const d = defaultsFor(f.def, f.model)
-  return {
-    familyId: f.def.id,
-    model: f.model,
-    width: d.width,
-    height: d.height,
-    fps: d.fps || 24,
-    length: snapLength(d.length || 81),
-    steps: d.steps,
-    cfg: d.cfg,
-    sampler: d.sampler,
-    scheduler: d.scheduler,
-    negative: null,
-  }
-}
-
 /** "Shot 3" or "Shots 2, 4 and 5". */
 function shotsWord(numbers: readonly number[]): string {
   if (numbers.length === 1) return `Shot ${numbers[0]}`
@@ -359,14 +340,31 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
   const bulk = useRef<HTMLTextAreaElement | null>(null)
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  /** A cut shot is offered back for twelve seconds, then it is simply gone. */
-  const cut = useCallback((id: string) => {
-    const removed = reel.remove(id)
-    if (!removed) return
-    setUndoCut(removed)
-    if (undoTimer.current) clearTimeout(undoTimer.current)
-    undoTimer.current = setTimeout(() => setUndoCut(null), 12_000)
+  /**
+   * On a fixed reel, every rendered take keeps the seed it was made with
+   * before the strip is rearranged. The ladder gives seeds by position, so a
+   * cut, an added shot or a move handed every later shot a new seed: the
+   * strip then called those takes changed, and rendering what was missing
+   * replaced each one with a different take. Read from the stores rather
+   * than this render, so it is right however soon after an edit it runs.
+   */
+  const keepTakes = useCallback(() => {
+    if (!reel.get().seedLocked) return
+    reel.keepSeeds(seedsToKeep(reel.get().shots, reelRun.snapshot().states))
   }, [])
+
+  /** A cut shot is offered back for twelve seconds, then it is simply gone. */
+  const cut = useCallback(
+    (id: string) => {
+      keepTakes()
+      const removed = reel.remove(id)
+      if (!removed) return
+      setUndoCut(removed)
+      if (undoTimer.current) clearTimeout(undoTimer.current)
+      undoTimer.current = setTimeout(() => setUndoCut(null), 12_000)
+    },
+    [keepTakes],
+  )
 
   const busy = run.status === 'running'
   const now = useNow(busy)
@@ -496,7 +494,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     const specs: ShotSpec[] = draft.shots.map((s) => ({
       prompt: s.prompt,
       negative: s.negative ?? undefined,
-      seed: s.seed ?? undefined,
+      seed: shotSeed(s, draft.seedLocked),
       length: s.length ?? draft.length,
       label: s.label ?? undefined,
       startImage: s.start?.name,
@@ -625,10 +623,14 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
    * pair, which the registry records being killed for memory at that length.
    *
    * Fixing a Random seed keeps the reel on screen. Each rendered shot that
-   * follows the reel's seed takes the seed it was actually made with as its
-   * own, so fixing the seed does not turn every earlier take into a change.
-   * Typing a number is different: that asks for new seeds, and the shots made
-   * with other ones then read as changed.
+   * follows the reel's seed keeps the seed it was actually made with (see
+   * keepTakes), so fixing the seed does not turn every earlier take into a
+   * change. Those kept seeds are the fixed reel's alone: going back to Random
+   * lets them go, so every shot draws a fresh seed again. They used to be
+   * written as each shot's own seed, which Random does not override and which
+   * shows only in expert mode, so those shots came back as the same take for
+   * good. Typing a number asks for new seeds, so it lets them go too, and the
+   * shots made with other ones then read as changed.
    */
   const patchBench = useCallback(
     (p: Partial<ReelDraft>) => {
@@ -639,17 +641,13 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
           return
         }
       }
-      if (p.seedLocked === true && p.seed === undefined && !draft.seedLocked) {
-        draft.shots.forEach((shot, i) => {
-          const state = run.states[shot.id]
-          const job = plan.jobs[i]
-          if (shot.seed !== null || state?.status !== 'done' || !state.made || !job) return
-          if (state.made.seed !== job.params.seed) reel.setShot(shot.id, { seed: state.made.seed })
-        })
-      }
+      const typed = p.seed !== undefined && (p.seed !== draft.seed || !draft.seedLocked)
+      if (typed || (p.seedLocked === false && draft.seedLocked)) reel.releaseSeeds()
       reel.patch(p)
+      // After the patch, because keepTakes keeps seeds only on a fixed reel.
+      if (p.seedLocked === true && !draft.seedLocked && !typed) keepTakes()
     },
-    [families, draft.familyId, draft.seedLocked, draft.shots, run.states, plan.jobs],
+    [families, draft.familyId, draft.seed, draft.seedLocked, keepTakes],
   )
 
   useEffect(() => {
@@ -890,10 +888,19 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               refused={refused}
               bookendBlocked={bookendBlocked}
               onEdit={(id, patch) => reel.setShot(id, patch)}
-              onMove={(id, delta) => reel.move(id, delta)}
+              onMove={(id, delta) => {
+                keepTakes()
+                reel.move(id, delta)
+              }}
               onRemove={cut}
-              onDuplicate={(id) => reel.duplicate(id)}
-              onAdd={(after) => reel.add(after)}
+              onDuplicate={(id) => {
+                keepTakes()
+                reel.duplicate(id)
+              }}
+              onAdd={(after) => {
+                keepTakes()
+                return reel.add(after)
+              }}
               onRender={renderOne}
               onPin={pinShot}
               onWatch={(id) => setWatching(id)}
@@ -911,6 +918,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                 type="button"
                 className="sg-link"
                 onClick={() => {
+                  keepTakes()
                   reel.restore(undoCut.shot, undoCut.index)
                   setUndoCut(null)
                 }}
@@ -997,12 +1005,8 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
             ) : null}
           </div>
 
-          <Assembly
-            key={clips.map((c) => `${c.file.subfolder}/${c.file.filename}`).join('|')}
-            clips={clips}
-            shots={draft.shots.length}
-            prefix={draft.prefix}
-          />
+          {/* Not keyed by the clips: a shot landing mid-cut remounted it and lost the cut. */}
+          <Assembly clips={clips} shots={draft.shots.length} prefix={draft.prefix} />
         </div>
 
         {/* the bench -------------------------------------------------------- */}

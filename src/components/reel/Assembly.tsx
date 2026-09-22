@@ -60,7 +60,11 @@ export type AssemblyProps = {
 export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   const [copied, setCopied] = useState(false)
   const [cutting, setCutting] = useState(false)
-  const [cut, setCut] = useState<Cut | null>(null)
+  // The cut is kept with the strip it was made from. Shots land while a cut
+  // runs, and throwing the cut away when the strip moved on (the room used to
+  // be remounted for it) lost the finished reel's link and summary and let
+  // the button send a second cut the server was still busy with.
+  const [made, setMade] = useState<{ cut: Cut; strip: string } | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
   const caps = useServerCapabilities()
   /** Null until the server answers; false when ffmpeg is not there to run. */
@@ -81,6 +85,10 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   const folder = prefix.replace(/\/+$/, '')
   const out = `${folder}/reel.webm`
   const command = buildCommand(clips, out)
+  const strip = clips.map((c) => relPath(c.file)).join('\n')
+  const cut = made?.cut ?? null
+  /** True when the strip has changed since the reel on show was cut. */
+  const earlier = made !== null && made.strip !== strip
 
   const copy = () => {
     void navigator.clipboard
@@ -98,9 +106,10 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
    * copied or re-encoded, and why, which is what the page reports.
    */
   const make = () => {
+    const from = strip
     setCutting(true)
     setFailed(null)
-    setCut(null)
+    setMade(null)
     void fetch('/api/reel/stitch?json=1', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -109,7 +118,7 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
       .then(async (r) => {
         const body = (await r.json()) as Record<string, unknown>
         if (!r.ok) throw new Error(String(body.error ?? `HTTP ${r.status}`))
-        setCut(body as unknown as Cut)
+        setMade({ cut: body as unknown as Cut, strip: from })
       })
       .catch((e: unknown) => setFailed(e instanceof Error ? e.message : String(e)))
       .finally(() => setCutting(false))
@@ -144,6 +153,11 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
         )}
         {canCut === false ? null : cut ? (
           <p className="text-caption text-grey-700">
+            {earlier ? (
+              <span className="mr-1 italic text-ink-warning">
+                Cut before the strip last changed, so this is not the reel as it stands now.
+              </span>
+            ) : null}
             <a className="sg-link" href={`/comfy/view?filename=${encodeURIComponent(cut.out.split('/').pop() ?? '')}&subfolder=${encodeURIComponent(cut.out.split('/').slice(0, -1).join('/'))}&type=output`} target="_blank" rel="noreferrer">
               {cut.out}
             </a>{' '}

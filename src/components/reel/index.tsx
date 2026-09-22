@@ -31,6 +31,7 @@ export { EmptyStrip } from './EmptyStrip'
 export { ReelProgress, measuredFor, type Measured, type ReelProgressProps } from './Progress'
 export { Assembly, type AssemblyClip, type AssemblyProps } from './Assembly'
 export { KeyframePicker, type KeyframePickerProps, type KeyframeTarget } from './Keyframe'
+export { recipeFor } from './recipe'
 
 export {
   REEL_KEY,
@@ -38,6 +39,8 @@ export {
   newId,
   newShot,
   reel,
+  seedsToKeep,
+  shotSeed,
   shotsFromLines,
   useReel,
   type PinnedFrame,

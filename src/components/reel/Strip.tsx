@@ -247,13 +247,19 @@ function ShotRow(p: RowProps) {
               <input
                 type="number"
                 className="field tabular-nums text-caption disabled:cursor-not-allowed disabled:text-grey-500"
-                placeholder="follows the reel"
+                placeholder={
+                  shot.keptSeed !== null && job?.params.seed === shot.keptSeed
+                    ? `${shot.keptSeed}, kept from its take`
+                    : 'follows the reel'
+                }
                 value={shot.seed ?? ''}
                 min={0}
                 disabled={locked}
                 onChange={(e) => {
                   const v = e.target.value
-                  p.onEdit(shot.id, { seed: v === '' ? null : Math.max(0, Math.floor(Number(v))) })
+                  // A seed typed here, or cleared to follow the reel, replaces
+                  // the one kept from its take.
+                  p.onEdit(shot.id, { seed: v === '' ? null : Math.max(0, Math.floor(Number(v))), keptSeed: null })
                 }}
               />
             </label>
