@@ -17,6 +17,7 @@
   "shortcuts": [
     { "name": "Pictures", "url": "/#/pictures" },
     { "name": "Video", "url": "/#/video" },
+    { "name": "Reel", "url": "/#/reel" },
     { "name": "Archive", "url": "/#/archive" }
   ]
 }

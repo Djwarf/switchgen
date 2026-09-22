@@ -18,7 +18,7 @@ export const RING =
 export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 /** Round to the slider's own step, so 0.7000000000000001 never reaches the UI. */
-export const toStep = (n: number, step: number) => Math.round(n / step) * step
+const toStep = (n: number, step: number) => Math.round(n / step) * step
 
 export function Kicker({
   children,
@@ -37,31 +37,6 @@ export function Kicker({
       {children}
     </span>
   )
-}
-
-/** Section head: kicker, optional figure on the right, heavy rule under both. */
-export function Head({
-  title,
-  figure,
-  note,
-}: {
-  title: string
-  figure?: ReactNode
-  note?: ReactNode
-}) {
-  return (
-    <div className="mb-2 border-b-2 border-burgundy-900 pb-1.5">
-      <div className="flex items-baseline justify-between gap-3">
-        <Kicker tone="burgundy">{title}</Kicker>
-        {figure ? <span className="text-caption tabular-nums text-grey-700">{figure}</span> : null}
-      </div>
-      {note ? <p className="mt-1 text-caption italic text-grey-500">{note}</p> : null}
-    </div>
-  )
-}
-
-export function Quiet({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <p className={`text-caption italic text-grey-700 ${className}`}>{children}</p>
 }
 
 /**

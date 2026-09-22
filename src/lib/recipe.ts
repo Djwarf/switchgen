@@ -40,6 +40,7 @@ import {
 import {
   EMPTY_LIBRARY,
   archFor,
+  defaultStrength,
   fitFor,
   resolveStack,
   targetFor,
@@ -331,35 +332,22 @@ function labelOf(lib: LoraLibrary, file: string): string {
 /**
  * The prompt prefix a weight file was trained with, read out of the registry.
  *
- * Two shapes live in perModel. The Illustrious entries carry an explicit
- * `positivePrefix`. Pony V6 carries no prefix field, only a note saying it
- * needs the score tags and renders like base SDXL without them, so the tags are
- * lifted out of that note rather than typed in here: when the registry is
- * regenerated the prefix follows it instead of rotting.
+ * Every file that needs one declares it as `positivePrefix` in perModel. This
+ * used to fall back to scraping `score_\d+` tags out of Pony's prose notes,
+ * which worked by accident and would have broken the moment the note was
+ * reworded; Pony and NoobAI now declare theirs like their siblings, so the
+ * scrape is gone. A file with no declared prefix gets no prefix.
  */
 function prefixFor(def: FamilyDef, model: string): { tokens: string[]; why: string } {
   const per = (def.perModel?.[model] ?? {}) as Record<string, unknown>
-
-  const explicit = per.positivePrefix
-  if (typeof explicit === 'string' && explicit.trim()) {
-    const tokens = explicit
+  const declared = per.positivePrefix
+  if (typeof declared === 'string' && declared.trim()) {
+    const tokens = declared
       .split(',')
       .map(t => t.trim())
       .filter(Boolean)
     return { tokens, why: 'Quality prefix this file was trained with, from the registry.' }
   }
-
-  const prose = [per.notes, per.note].filter(v => typeof v === 'string').join(' ')
-  const found = prose.match(/score_\d+(?:_up)?/g)
-  if (found?.length) {
-    const seen: string[] = []
-    for (const t of found) if (!seen.includes(t)) seen.push(t)
-    return {
-      tokens: seen,
-      why: 'Score prefix this file needs. Without it the output collapses towards base SDXL.',
-    }
-  }
-
   return { tokens: [], why: '' }
 }
 
@@ -430,18 +418,18 @@ export function decide(input: RecipeInput): Recipe {
   const notes: RecipeNote[] = []
   const warnings: string[] = []
 
-  // 1. The brief. The anatomy control is a statement about the picture, so it
-  // sets `explicit` on its own; the prompt can set it too, which is what keeps
-  // a nude described in words off a base that was trained without any.
-  // Detail and explicitness are SEPARATE questions and must not share a switch.
-  // This line used to read `anatomy !== 'off' || wantsExplicitAnatomy(prompt)`,
+  // 1. The brief. Detail and explicitness are SEPARATE questions and must not
+  // share a switch. This line once read `anatomy !== 'off' || wantsExplicit...`,
   // which made "I want better hands and faces" the identical input as "I want
   // porn": intent.ts weightsFor() swings anatomy 0.05 -> 0.40 and craft 0.35 ->
-  // 0.15 on this boolean, so asking for detail actively demoted the craft models
-  // (Chroma, Z-Image, Flux, Qwen) in favour of booru bases. Wanting good anatomy
-  // is a universal quality need; wanting explicit content is a content choice.
-  // Only the brief itself decides the latter now.
-  const explicit = wantsExplicitAnatomy(prompt)
+  // 0.15 on this boolean, so asking for detail demoted the craft models
+  // (Chroma, Z-Image, Flux, Qwen) in favour of booru bases. So 'natural', the
+  // "Sharper faces and hands" level, never sets it. 'emphasised' is labelled
+  // "Also explicit anatomy" and MUST set it, or the reader's clearest possible
+  // statement of intent is discarded because they did not also type an explicit
+  // word. The prompt sets it too, which is what keeps a nude described in words
+  // off a base that was trained without any.
+  const explicit = anatomy === 'emphasised' || wantsExplicitAnatomy(prompt)
   const brief: Brief = { intent: look as Intent, explicit, mode: 'image' }
 
   // 2. Rank. feasibility() runs inside intentReport when hardware and sizes are
@@ -517,11 +505,11 @@ export function decide(input: RecipeInput): Recipe {
         ),
       )
     } else {
-      notes.push(
-        note(
-          'model',
-          `${pick.label} renders this on its own. The face and hand helpers are SDXL booru files and nothing installed here can carry them.`,
-        ),
+      // A warning, not a note: the reader asked for anatomy help and none of
+      // it will be applied. That is the kind of thing a quiet line under the
+      // fold is for hiding, and it is exactly what must not be hidden.
+      warnings.push(
+        `${pick.label} renders this on its own. The face and hand helpers are SDXL booru files and nothing installed here can carry them.`,
       )
     }
   }
@@ -640,18 +628,14 @@ export function decide(input: RecipeInput): Recipe {
   // where the reader can see whether the region needs it.
   const refineLoras = heldForRefine(lib, target, new Set(loras.map(l => l.file)))
 
-  // 6. The graph. Image to image first, LoRA chain second, so the chain is
-  // inserted into the graph that will actually run.
+  // 6. The graph. Image to image first; the add-on chain is inserted in 6b
+  // below, once every add-on is known, so the chain goes into the graph that
+  // will actually run and carries everything the record will say it did.
   let def: FamilyDef | DerivedDef = baseDef
   if (input.sourceImage) {
     const i2i = img2imgOf(baseDef)
     if (i2i) def = i2i
     else warnings.push(`${pick.label} cannot sample from a picture, so this will render from the prompt alone.`)
-  }
-  if (loras.length) {
-    const chained = withLoras(def, loras.map(l => ({ name: l.file, strength: l.strength })))
-    if (chained) def = chained
-    else warnings.push(`${pick.label} cannot take add-ons, so none were applied.`)
   }
 
   // 7. The prompt. The prefix and the trigger tokens are the two pieces of
@@ -674,18 +658,14 @@ export function decide(input: RecipeInput): Recipe {
   // measured it.
   let promptPicks: { file: string; strength: number; why: string }[] = []
   try {
-    const sug = suggestLoras({
-      // Pass the LIBRARY, not a list of filenames. infoFor() returns null for a
-      // bare iterable, so every catalogue fact - category, label, recommended
-      // strength - was being thrown away, and the subject gate had nothing to
-      // read. InstalledLoras accepts either; only one of them works.
-      prompt, model, installed: lib, anatomy,
-      already: resolvedFiles,
-    } as never) as { stack?: { file: string; strength: number; why?: string }[] }
-    promptPicks = (sug.stack ?? [])
+    // The LIBRARY, not a list of filenames. infoFor() returns null for a bare
+    // iterable, so every catalogue fact would be thrown away. The call is typed
+    // as written: a cast used to sit here, and that cast is how that bug hid.
+    const sug = suggestLoras({ prompt, model, installed: lib, anatomy, already: resolvedFiles })
+    promptPicks = sug.stack
       .filter(s => !resolvedFiles.includes(s.file))
       .slice(0, 2)
-      .map(s => ({ file: s.file, strength: s.strength, why: s.why ?? 'Suggested by your prompt.' }))
+      .map(s => ({ file: s.file, strength: s.strength, why: s.why || 'Suggested by your prompt.' }))
   } catch {
     // suggestion is a bonus, never a dependency: a failure here must not stop a render
     promptPicks = []
@@ -721,11 +701,53 @@ export function decide(input: RecipeInput): Recipe {
       offers.push(row)
     }
   }
+  // KEPT BECAUSE YOU ADDED IT.
+  //
+  // An accepted add-on is a decision, and a decision must not evaporate the
+  // moment the wording drifts away from the vocabulary that first suggested
+  // it. A "no" already survived every recompute; a "yes" only survived while
+  // the prompt kept matching. Anything accepted that the prompt no longer
+  // names is carried on the reader's say-so, subject to the two checks that
+  // are not a matter of opinion: the file is on disk, and it fits the model.
+  for (const file of accepted) {
+    if (declined.has(file)) continue
+    if (appliedPicks.some(p => p.file === file) || resolvedFiles.includes(file)) continue
+    const info = lib.byFile.get(file)
+    if (!info || !info.installed) {
+      notes.push(note('prompt', `${labelOf(lib, file)} was added earlier but is not in the add-ons folder now, so it is left out.`))
+      continue
+    }
+    const fit = fitFor(info, target)
+    if (fit.level === 'mismatch') {
+      notes.push(note('prompt', `${info.label} was added earlier but does not fit ${pick.label}, so it is left out. ${fit.why}`))
+      continue
+    }
+    const row: RecipeLora = {
+      file,
+      label: info.label,
+      strength: defaultStrength(info),
+      measured: false,
+      why: 'Kept because you added it. Your wording no longer matches it, so this is your choice rather than a suggestion.',
+    }
+    loras.push(row)
+    appliedPicks.push({ file, strength: row.strength, why: row.why })
+  }
   if (appliedPicks.length) {
     notes.push(note('prompt', `You added ${appliedPicks.length} add-on` +
       `${appliedPicks.length === 1 ? '' : 's'} matched to your wording: ` +
       `${appliedPicks.map(p => labelOf(lib, p.file)).join(', ')}. ` +
       `Matched from training vocabulary, not measured.`))
+  }
+
+  // 6b. The chain. Only now is every add-on known: the measured stack, the
+  // offers the reader accepted, and the ones carried on their say-so. This
+  // used to run before the offers were resolved, so an accepted add-on got its
+  // trigger word in the prompt and its name in the record while the queued
+  // graph carried no loader for it. The button did nothing to the picture.
+  if (loras.length) {
+    const chained = withLoras(def, loras.map(l => ({ name: l.file, strength: l.strength })))
+    if (chained) def = chained
+    else warnings.push(`${pick.label} cannot take add-ons, so none were applied.`)
   }
 
   // Suggested LoRAs need their triggers as much as measured ones do. An

@@ -433,6 +433,23 @@ function isAnatomyLora(entry: LoraIndexEntry, info: LoraInfo | null): boolean {
 }
 
 /**
+ * True when the add-on's own vocabulary is explicit: its name, its trigger,
+ * its top training tags, or the catalogue's description of it. Judged with the
+ * same word list a prompt is judged with, so the two verdicts cannot drift
+ * apart: what counts as explicit in a brief counts as explicit in a file.
+ */
+function isExplicitLora(entry: LoraIndexEntry, info: LoraInfo | null): boolean {
+  const text = [
+    entry.stem,
+    entry.triggerPhrase,
+    ...entry.promptTags,
+    ...entry.concepts.slice(0, 8).map(c => c.tag),
+    info?.does ?? '',
+  ].join(' ')
+  return wantsExplicitAnatomy(text)
+}
+
+/**
  * Load order. Each LoraLoader patches the model the previous one produced, so a
  * detail LoRA placed before an anatomy LoRA gets painted over. The measured
  * natural stack ran anatomy-helper then add-micro-details, and this reproduces
@@ -693,16 +710,35 @@ export function suggest(input: SuggestInput): SuggestResult {
     // This used to read `anatomy === 'off' && anatomical`, which hid every
     // body-related add-on behind a global setting while happily recommending a
     // human skin-hands-eyes add-on for a snow leopard, on the strength of both
-    // prompts containing the word 'photography'. The setting was never the
-    // right question. The right question is whether the picture has a person in
-    // it, and it is asked the same way for every subject: a hands add-on is
-    // wrong for a landscape for exactly the reason a landscape add-on would be
-    // wrong for a portrait.
+    // prompts containing the word 'photography'. Whether the picture has a
+    // person in it is a question about the subject, and it is asked the same
+    // way for every subject: a hands add-on is wrong for a landscape for
+    // exactly the reason a landscape add-on would be wrong for a portrait.
     if (isPersonSpecific(entry, info) && !describesPerson(input.prompt)) {
       rejected.push({
         file: entry.file,
         label,
         why: `${label} is trained on people, and nothing in this prompt names a person. It would spend its capacity on skin, hands and faces the picture does not contain.`,
+      })
+      return
+    }
+
+    // THE CONTENT GATE.
+    //
+    // Whether there is a person in the picture and whether the reader wants
+    // explicit content are two different questions, and the gate above answers
+    // only the first. Replacing the old setting check with it alone let an
+    // explicit add-on reach the offers for any portrait. An explicit add-on is
+    // offered when the brief asks for it, by the anatomy setting at its top
+    // level or by explicit words in the prompt itself. At Standard and at
+    // "Sharper faces and hands" a portrait is a portrait. This is judged on
+    // the file's own vocabulary and not on its catalogue shelf: an explicit
+    // style add-on is as explicit as an explicit anatomy one.
+    if (isExplicitLora(entry, info) && anatomy !== 'emphasised' && !wantsExplicitAnatomy(prompt)) {
+      rejected.push({
+        file: entry.file,
+        label,
+        why: `${label} is an explicit add-on. Nothing in this prompt asks for that and the anatomy setting is not "Also explicit anatomy", so it is not offered.`,
       })
       return
     }

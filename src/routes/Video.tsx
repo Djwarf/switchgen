@@ -209,7 +209,7 @@ const STAGES: Record<string, string> = {
   CheckpointLoaderSimple: 'Loading the model',
   CLIPLoader: 'Reading the prompt',
   CLIPTextEncode: 'Reading the prompt',
-  LoraLoaderModelOnly: 'Loading the LoRA',
+  LoraLoaderModelOnly: 'Loading add-ons',
   LoadImage: 'Preparing your picture',
   VAEEncode: 'Preparing your picture',
   ImageScaleToTotalPixels: 'Preparing your picture',

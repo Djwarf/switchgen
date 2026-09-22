@@ -1276,36 +1276,38 @@ export function Pictures() {
     if (reuseTaken.current) return
     reuseTaken.current = true
 
+    // Read off the store, not the render-scoped `c`: this runs once when
+    // `touched` arrives, and the dependency list says exactly that.
+    const snap = store.get()
     const next: Overrides = {}
-    for (const f of c.touched) {
-      if (f === 'steps') next.steps = c.steps
-      else if (f === 'cfg') next.cfg = c.cfg
-      else if (f === 'sampler') next.sampler = c.sampler
-      else if (f === 'scheduler') next.scheduler = c.scheduler
-      else if (f === 'negative' && c.negative != null) next.negative = c.negative
-      else if (f === 'width') next.width = c.width
-      else if (f === 'height') next.height = c.height
+    for (const f of snap.touched) {
+      if (f === 'steps') next.steps = snap.steps
+      else if (f === 'cfg') next.cfg = snap.cfg
+      else if (f === 'sampler') next.sampler = snap.sampler
+      else if (f === 'scheduler') next.scheduler = snap.scheduler
+      else if (f === 'negative' && snap.negative != null) next.negative = snap.negative
+      else if (f === 'width') next.width = snap.width
+      else if (f === 'height') next.height = snap.height
       else if (f === 'seed') {
-        next.seed = c.seed
-        next.seedLocked = c.seedLocked
-      } else if (f === 'denoise' && c.denoise != null) next.denoise = c.denoise
-      else if (f === 'megapixels' && c.megapixels != null) next.megapixels = c.megapixels
-      else if (f === 'shift' && c.shift != null) next.shift = c.shift
-      else if (f === 'clipSkip' && c.clipSkip != null) next.clipSkip = c.clipSkip
+        next.seed = snap.seed
+        next.seedLocked = snap.seedLocked
+      } else if (f === 'denoise' && snap.denoise != null) next.denoise = snap.denoise
+      else if (f === 'megapixels' && snap.megapixels != null) next.megapixels = snap.megapixels
+      else if (f === 'shift' && snap.shift != null) next.shift = snap.shift
+      else if (f === 'clipSkip' && snap.clipSkip != null) next.clipSkip = snap.clipSkip
     }
 
     ov.set(next)
-    if (c.model) setPinned(c.model)
+    if (snap.model) setPinned(snap.model)
     store.patch({ touched: [] })
     setCorrection(
       `Settings loaded from a finished picture. ${
-        c.model ? `${PLAIN_NAMES[c.model] ?? titleFromFilename(c.model)} is pinned and ` : ''
+        snap.model ? `${PLAIN_NAMES[snap.model] ?? titleFromFilename(snap.model)} is pinned and ` : ''
       }${Object.keys(next).length} values are set by hand. Open More to see them, or put them back there.`,
     )
     // Read once, on the composition that arrived. Re-running this on every
     // keystroke would fight the reader.
-
-  }, [c.touched])
+  }, [c.touched, ov])
 
   // The prompt proposes an anatomy level until the reader states one. It never
   // proposes `emphasised`: that stack measured below base, so it is a choice
@@ -1732,6 +1734,12 @@ export function Pictures() {
   /** The reader's own pick, as `familyId::model`. Null means "follow the recipe". */
   const [refinePick, setRefinePick] = useState<string | null>(null)
 
+  /** What the bench draws with when nothing is picked: the recipe's model, else the first that can. */
+  const refineDefault = useMemo(
+    () => (style && deriveRefine(style.def) ? style : (refineOptions[0] ?? null)),
+    [style, refineOptions],
+  )
+
   const refineStyle = useMemo(() => {
     // A pick the reader made outranks both the recipe and the fallback, and it
     // is checked against the current list so a stale pick cannot strand the
@@ -1897,6 +1905,9 @@ export function Pictures() {
     setRefineResult(null)
     setRefineFault(null)
     setOpeningRefine(false)
+    // The "Drawn by" choice belongs to the picture it was made for. Left set,
+    // it silently outranked the recipe for every region pass that followed.
+    setRefinePick(null)
   }, [])
 
   /**
@@ -1958,13 +1969,13 @@ export function Pictures() {
           prompt: req.prompt,
           seed,
         })
-        // `press` is the live module singleton, read the same way busy(press) reads it
-      // above. `state` is the render-scoped snapshot and runRefine's dependency list
-      // does not include it, so closing over it would freeze the baseline at the
-      // render where refineSource last changed - reintroducing the very bug this
-      // line exists to fix.
-      refineBaseline.current = press.current?.id ?? null
-      awaitingRefine.current = true
+        // `press` is the live module singleton, read the same way busy(press)
+        // reads it above. `state` is the render-scoped snapshot and runRefine's
+        // dependency list does not include it, so closing over it would freeze
+        // the baseline at the render where refineSource last changed,
+        // reintroducing the very bug this line exists to fix.
+        refineBaseline.current = press.current?.id ?? null
+        awaitingRefine.current = true
         startRuns([
           {
             graph,
@@ -1996,7 +2007,7 @@ export function Pictures() {
     if (!cur || cur.id === refineBaseline.current) return
     awaitingRefine.current = false
     setRefineResult(cur)
-  }, [state, refineSource])
+  }, [state])
 
   const refineBlocked =
     refineFault ??
@@ -2250,13 +2261,24 @@ export function Pictures() {
             )}
             <RegionRefine
               model={{
-                options: refineOptions.map((o) => ({
-                  id: `${o.def.id}::${o.model}`,
-                  label: o.label,
-                  group: o.group,
-                })),
-                value: refineStyle ? `${refineStyle.def.id}::${refineStyle.model}` : '',
-                onChange: (id: string) => setRefinePick(id),
+                // The first row hands the choice back to the desk, so the
+                // reader can undo a pick without reloading. Only drawn when
+                // there is a real choice; a one-model machine sees no picker.
+                options: [
+                  ...(refineOptions.length > 1 && refineDefault
+                    ? [{ id: '', label: `Follow the desk: ${refineDefault.label}`, group: '' }]
+                    : []),
+                  ...refineOptions.map((o) => ({
+                    id: `${o.def.id}::${o.model}`,
+                    label: o.label,
+                    group: o.group,
+                  })),
+                ],
+                value:
+                  refinePick && refineOptions.some((o) => `${o.def.id}::${o.model}` === refinePick)
+                    ? refinePick
+                    : '',
+                onChange: (id: string) => setRefinePick(id || null),
                 note: refineBorrows
                   ? refineSource?.madeBy
                     ? `This picture was made with ${refineSource.madeBy}, which cannot redraw a region. This one will.`
