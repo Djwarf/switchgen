@@ -49,22 +49,29 @@ export type BenchProps = {
   busy: boolean
   onPatch: (p: Partial<ReelDraft>) => void
   onPinAnchor: () => void
-  onRerollSeed: () => void
 }
 
 export function Bench(p: BenchProps) {
   const { draft, family, plan, expert } = p
   const deepest = plan.jobs.reduce((m, j) => Math.max(m, j.hops), 0)
+  // Every shot in a running pass was handed its job when the button was
+  // pressed, so a setting changed now would reach none of them and would leave
+  // the finished clips beside settings they were never made with. So the whole
+  // bench holds still until the queue stops, not only the style.
+  const held = p.busy
 
   return (
     <aside className="lg:sticky lg:top-4 lg:self-start">
-      <Head title="The bench" note="One set of settings. Every shot follows them." />
+      <Head
+        title="The bench"
+        note={held ? 'Held while the queue runs. Every shot follows these settings.' : 'One set of settings. Every shot follows them.'}
+      />
 
       <Field label="Style" hint={family?.chainable ? 'chains' : family ? 'no chaining' : undefined}>
         <select
-          className="field text-small"
+          className="field text-small disabled:cursor-not-allowed disabled:text-grey-500"
           value={draft.familyId}
-          disabled={p.busy}
+          disabled={held}
           onChange={(e) => p.onPatch({ familyId: e.target.value })}
         >
           {p.families.map((f) => (
@@ -80,6 +87,7 @@ export function Bench(p: BenchProps) {
         <Chips
           ariaLabel="The shape of every shot"
           value={`${draft.width}x${draft.height}`}
+          disabled={held}
           options={p.shapes.map((s) => ({
             value: `${s.width}x${s.height}`,
             label: s.label,
@@ -100,6 +108,7 @@ export function Bench(p: BenchProps) {
         <Chips
           ariaLabel="How long each shot runs"
           value={draft.length}
+          disabled={held}
           options={p.lengthOptions.map((n) => ({ value: n, label: seconds(n, draft.fps), title: `${n} frames` }))}
           onChange={(v) => p.onPatch({ length: v })}
         />
@@ -124,6 +133,7 @@ export function Bench(p: BenchProps) {
               <button
                 type="button"
                 className={`sg-link ${RING} text-caption`}
+                disabled={held}
                 onClick={() => p.onPatch({ anchor: null })}
               >
                 Remove it
@@ -131,7 +141,9 @@ export function Bench(p: BenchProps) {
             </div>
           </div>
         ) : (
-          <Quiet onClick={p.onPinAnchor}>Choose a frame</Quiet>
+          <Quiet onClick={p.onPinAnchor} disabled={held}>
+            Choose a frame
+          </Quiet>
         )}
         <p className="mt-1 text-caption italic text-grey-500">
           A clean frame the reel can go back to. The opening shot starts from it, and the schedule below returns to it
@@ -144,6 +156,7 @@ export function Bench(p: BenchProps) {
           <Chips
             ariaLabel="How often the reel returns to the anchor frame"
             value={draft.reanchorEvery}
+            disabled={held}
             options={[
               { value: 0, label: 'Never' },
               { value: 3, label: 'Every 3' },
@@ -159,7 +172,7 @@ export function Bench(p: BenchProps) {
         </Field>
       ) : null}
 
-      <Field label="Seed" hint={draft.seedLocked ? 'fixed' : 'fresh each reel'}>
+      <Field label="Seed" hint={draft.seedLocked ? 'fixed' : 'fresh each render'}>
         <div className="flex gap-2">
           <NumberField
             label="Seed"
@@ -168,6 +181,7 @@ export function Bench(p: BenchProps) {
             min={0}
             max={Number.MAX_SAFE_INTEGER}
             step={1}
+            disabled={held}
             commit={(n) => {
               if (n < 0) return
               p.onPatch({ seed: Math.floor(n), seedLocked: true })
@@ -176,8 +190,9 @@ export function Bench(p: BenchProps) {
           <button
             type="button"
             aria-pressed={draft.seedLocked}
+            disabled={held}
             onClick={() => p.onPatch({ seedLocked: !draft.seedLocked })}
-            className={`${RING} shrink-0 border px-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] ${
+            className={`${RING} shrink-0 border px-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] disabled:cursor-not-allowed disabled:opacity-40 ${
               draft.seedLocked
                 ? 'border-ink bg-ink text-newsprint'
                 : 'border-grey-300 text-grey-700 hover:bg-newsprint-aged'
@@ -187,14 +202,9 @@ export function Bench(p: BenchProps) {
           </button>
         </div>
         <p className="mt-1 text-caption italic text-grey-500">
-          Shot 1 takes this seed, shot 2 takes the next, and so on up the reel. Fix it and the same reel comes back the
-          same way.
+          Shot 1 takes this seed, shot 2 takes the next, and so on up the reel. On Random, every render draws a new
+          one, so rendering a shot again gives a different take. Fix it and the same reel comes back the same way.
         </p>
-        {!draft.seedLocked ? (
-          <button type="button" className={`sg-link ${RING} mt-1 text-caption`} onClick={p.onRerollSeed}>
-            Draw a new one now
-          </button>
-        ) : null}
       </Field>
 
       {expert && family ? (
@@ -211,6 +221,7 @@ export function Bench(p: BenchProps) {
                 min={family.width.min}
                 max={family.width.max}
                 step={family.width.step}
+                disabled={held}
                 commit={(n) => p.onPatch({ width: snap(n, family.width) })}
               />
             </Field>
@@ -221,6 +232,7 @@ export function Bench(p: BenchProps) {
                 min={family.height.min}
                 max={family.height.max}
                 step={family.height.step}
+                disabled={held}
                 commit={(n) => p.onPatch({ height: snap(n, family.height) })}
               />
             </Field>
@@ -233,6 +245,7 @@ export function Bench(p: BenchProps) {
               min={1}
               max={120}
               step={1}
+              disabled={held}
               commit={(n) => p.onPatch({ fps: Math.min(120, Math.max(1, Math.round(n))) })}
             />
           </Field>
@@ -249,6 +262,7 @@ export function Bench(p: BenchProps) {
                 min={1}
                 max={200}
                 step={1}
+                disabled={held}
                 commit={(n) => p.onPatch({ steps: Math.min(200, Math.max(1, Math.round(n))) })}
               />
             </Field>
@@ -261,13 +275,15 @@ export function Bench(p: BenchProps) {
               min={0}
               max={30}
               step={0.1}
+              disabled={held}
               commit={(n) => p.onPatch({ cfg: Math.min(30, Math.max(0, n)) })}
             />
           </Field>
 
           <Field label="Sampler">
             <select
-              className="field text-small"
+              className="field text-small disabled:cursor-not-allowed disabled:text-grey-500"
+              disabled={held}
               value={draft.sampler}
               onChange={(e) => p.onPatch({ sampler: e.target.value })}
             >
@@ -281,7 +297,8 @@ export function Bench(p: BenchProps) {
 
           <Field label="Scheduler">
             <select
-              className="field text-small"
+              className="field text-small disabled:cursor-not-allowed disabled:text-grey-500"
+              disabled={held}
               value={draft.scheduler}
               onChange={(e) => p.onPatch({ scheduler: e.target.value })}
             >
@@ -295,7 +312,8 @@ export function Bench(p: BenchProps) {
 
           <Field label="Negative">
             <textarea
-              className="field h-20 text-caption"
+              className="field h-20 text-caption disabled:cursor-not-allowed disabled:text-grey-500"
+              disabled={held}
               value={draft.negative ?? p.houseNegative}
               onChange={(e) => p.onPatch({ negative: e.target.value })}
             />
@@ -303,6 +321,7 @@ export function Bench(p: BenchProps) {
               <button
                 type="button"
                 className={`sg-link ${RING} mt-1 text-caption`}
+                disabled={held}
                 onClick={() => p.onPatch({ negative: null })}
               >
                 Reset to the house wording
@@ -314,7 +333,8 @@ export function Bench(p: BenchProps) {
 
           <Field label="Output folder">
             <input
-              className="field text-caption"
+              className="field text-caption disabled:cursor-not-allowed disabled:text-grey-500"
+              disabled={held}
               value={draft.prefix}
               onChange={(e) => p.onPatch({ prefix: e.target.value })}
             />

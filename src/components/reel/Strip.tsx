@@ -17,9 +17,9 @@
 import { useRef, useState } from 'react'
 
 import { fileUrl } from '../../lib/comfy'
-import type { ShotJob } from '../../lib/continuation'
+import { clipFrames, type ShotJob } from '../../lib/continuation'
 import { Chips, Mark, Quiet, RING, duration, seconds } from './bits'
-import type { RunState, ShotState } from './engine'
+import type { Currency, RunState, ShotState } from './engine'
 import type { ReelShot } from './store'
 
 export type StripProps = {
@@ -33,6 +33,10 @@ export type StripProps = {
   lengthOptions: readonly number[]
   expert: boolean
   busy: boolean
+  /** Per shot, in strip order: whether its clip still matches its line (engine currencyOf). */
+  currency: readonly (Currency | null)[]
+  /** Per shot, in strip order: true when the desk will not queue it as it stands. */
+  refused: readonly boolean[]
   /** Null when this family can pin a closing frame, otherwise the reason it cannot. */
   bookendBlocked: string | null
   onEdit: (id: string, patch: Partial<ReelShot>) => void
@@ -69,6 +73,13 @@ export function Strip(props: StripProps) {
             shot={shot}
             job={jobs[i] ?? null}
             state={run.states[shot.id] ?? null}
+            currencyNow={props.currency[i] ?? null}
+            refusedNow={props.refused[i] ?? false}
+            locked={
+              props.busy &&
+              run.queue.includes(shot.id) &&
+              !['done', 'error', 'stopped'].includes(run.states[shot.id]?.status ?? '')
+            }
             live={run.currentShotId === shot.id}
             registerField={(el) => {
               if (el) fields.current.set(shot.id, el)
@@ -101,6 +112,14 @@ type RowProps = StripProps & {
   shot: ReelShot
   job: ShotJob | null
   state: ShotState | null
+  currencyNow: Currency | null
+  refusedNow: boolean
+  /**
+   * True while this shot is in the running pass and has not finished. The walk
+   * renders the job it was handed when the button was pressed, so an edit here
+   * would be ignored and the clip would land beside words it never saw.
+   */
+  locked: boolean
   live: boolean
   first: boolean
   last: boolean
@@ -109,10 +128,11 @@ type RowProps = StripProps & {
 }
 
 function ShotRow(p: RowProps) {
-  const { shot, job, state, index, fps, reelLength, expert, busy } = p
+  const { shot, job, state, index, fps, reelLength, expert, busy, locked, currencyNow, refusedNow, bookendBlocked } = p
   const [confirming, setConfirming] = useState(false)
-  const frames = job?.params.length ?? shot.length ?? reelLength
+  const frames = job ? clipFrames(job) : (shot.length ?? reelLength)
   const status = state?.status ?? 'waiting'
+  const lockedTitle = locked ? 'This shot is in the queue. It can be changed once it has rendered.' : undefined
 
   return (
     <li className="grid grid-cols-1 gap-x-5 gap-y-3 border-b border-grey-300 py-4 sm:grid-cols-[2.75rem_minmax(0,1fr)] lg:grid-cols-[2.75rem_11rem_minmax(0,1fr)_11rem]">
@@ -123,7 +143,9 @@ function ShotRow(p: RowProps) {
         </span>
         <span className="mt-2 flex items-center gap-1.5 lg:mt-3">
           <Mark state={markFor(status, p.live)} />
-          <span className="text-[0.625rem] uppercase tracking-[0.14em] text-grey-500">{stateWord(state, p.live)}</span>
+          <span className="text-[0.625rem] uppercase tracking-[0.14em] text-grey-500">
+            {stateWord(state, p.live, currencyNow)}
+          </span>
         </span>
         {job && job.hops > 0 ? (
           <span
@@ -142,8 +164,10 @@ function ShotRow(p: RowProps) {
       <div className="min-w-0">
         <textarea
           ref={p.registerField}
-          className="field min-h-[3.75rem] resize-y text-small"
+          className="field min-h-[3.75rem] resize-y text-small disabled:cursor-not-allowed disabled:text-grey-500"
           rows={2}
+          disabled={locked}
+          title={lockedTitle}
           placeholder={index === 0 ? 'What happens in the opening shot' : 'What happens next'}
           value={shot.prompt}
           onChange={(e) => p.onEdit(shot.id, { prompt: e.target.value })}
@@ -163,7 +187,12 @@ function ShotRow(p: RowProps) {
         {shot.start ? (
           <p className="mt-1 text-caption italic text-grey-500">
             Pinned: {shot.start.label}.{' '}
-            <button type="button" className={`sg-link ${RING}`} onClick={() => p.onEdit(shot.id, { start: null })}>
+            <button
+              type="button"
+              className={`sg-link ${RING}`}
+              disabled={locked}
+              onClick={() => p.onEdit(shot.id, { start: null })}
+            >
               Unpin it
             </button>
           </p>
@@ -171,7 +200,12 @@ function ShotRow(p: RowProps) {
         {shot.end ? (
           <p className="mt-1 text-caption italic text-grey-500">
             Has to land on: {shot.end.label}.{' '}
-            <button type="button" className={`sg-link ${RING}`} onClick={() => p.onEdit(shot.id, { end: null })}>
+            <button
+              type="button"
+              className={`sg-link ${RING}`}
+              disabled={locked}
+              onClick={() => p.onEdit(shot.id, { end: null })}
+            >
               Unpin it
             </button>
           </p>
@@ -183,9 +217,17 @@ function ShotRow(p: RowProps) {
           </p>
         ))}
 
-        {state?.stale ? (
+        {job?.blocked ? (
+          <p className="mt-1 border-l-2 border-error pl-2 text-caption text-ink-error">{job.blocked}</p>
+        ) : null}
+
+        {currencyNow === 'stale' ? (
           <p className="mt-1 border-l-2 border-warning pl-2 text-caption text-ink-warning">
             Rendered, then the shot before it changed. This clip still opens on the old frame.
+          </p>
+        ) : currencyNow === 'changed' ? (
+          <p className="mt-1 border-l-2 border-warning pl-2 text-caption text-ink-warning">
+            Changed since it was rendered. The clip on disk still shows it as it was.
           </p>
         ) : null}
 
@@ -204,10 +246,11 @@ function ShotRow(p: RowProps) {
               </span>
               <input
                 type="number"
-                className="field tabular-nums text-caption"
+                className="field tabular-nums text-caption disabled:cursor-not-allowed disabled:text-grey-500"
                 placeholder="follows the reel"
                 value={shot.seed ?? ''}
                 min={0}
+                disabled={locked}
                 onChange={(e) => {
                   const v = e.target.value
                   p.onEdit(shot.id, { seed: v === '' ? null : Math.max(0, Math.floor(Number(v))) })
@@ -220,9 +263,10 @@ function ShotRow(p: RowProps) {
               </span>
               <input
                 type="text"
-                className="field text-caption"
+                className="field text-caption disabled:cursor-not-allowed disabled:text-grey-500"
                 placeholder="follows the reel"
                 value={shot.negative ?? ''}
+                disabled={locked}
                 onChange={(e) => p.onEdit(shot.id, { negative: e.target.value || null })}
               />
             </label>
@@ -241,6 +285,7 @@ function ShotRow(p: RowProps) {
           <Chips
             ariaLabel={`Length of shot ${index + 1}`}
             value={shot.length ?? 0}
+            disabled={locked}
             onChange={(v) => p.onEdit(shot.id, { length: v === 0 ? null : v })}
             options={[
               { value: 0, label: 'Reel', title: `Follow the reel: ${reelLength} frames` },
@@ -254,16 +299,24 @@ function ShotRow(p: RowProps) {
         ) : null}
 
         <div className="flex flex-wrap gap-1 lg:justify-end">
-          <Quiet onClick={() => p.onRender(index)} disabled={busy || !shot.prompt.trim()}>
+          <Quiet
+            onClick={() => p.onRender(index)}
+            disabled={busy || !shot.prompt.trim() || refusedNow}
+            title={refusedNow ? 'This shot cannot be rendered as it stands. The note under the strip says why.' : undefined}
+          >
             {state?.status === 'done' ? 'Render again' : 'Render'}
           </Quiet>
-          <Quiet onClick={() => p.onPin(shot.id, 'start')} title="Pin the frame this shot opens on">
+          <Quiet
+            onClick={() => p.onPin(shot.id, 'start')}
+            disabled={locked}
+            title={lockedTitle ?? 'Pin the frame this shot opens on'}
+          >
             Pin start
           </Quiet>
           <Quiet
             onClick={() => p.onPin(shot.id, 'end')}
-            disabled={p.bookendBlocked !== null}
-            title={p.bookendBlocked ?? 'Pin the frame this shot has to reach'}
+            disabled={bookendBlocked !== null || locked}
+            title={bookendBlocked ?? lockedTitle ?? 'Pin the frame this shot has to reach'}
           >
             Pin end
           </Quiet>
@@ -353,7 +406,7 @@ function markFor(status: ShotState['status'], live: boolean): 'idle' | 'live' | 
   return 'idle'
 }
 
-function stateWord(state: ShotState | null, live: boolean): string {
+function stateWord(state: ShotState | null, live: boolean, currency: Currency | null): string {
   if (!state) return 'unwritten'
   if (live && state.status === 'queued') return 'queued'
   switch (state.status) {
@@ -362,7 +415,7 @@ function stateWord(state: ShotState | null, live: boolean): string {
     case 'queued':
       return 'queued'
     case 'done':
-      return state.stale ? 'out of date' : 'rendered'
+      return currency === 'stale' ? 'out of date' : currency === 'changed' ? 'changed' : 'rendered'
     case 'error':
       return 'failed'
     case 'stopped':

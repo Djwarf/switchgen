@@ -112,7 +112,7 @@ export function Leader({ label, value }: { label: ReactNode; value: ReactNode })
 // Controls
 // ---------------------------------------------------------------------------
 
-export function NumberField({ label, value, min, max, step, commit, id, italic }: {
+export function NumberField({ label, value, min, max, step, commit, id, italic, disabled }: {
   label: string
   value: number
   min: number
@@ -121,17 +121,19 @@ export function NumberField({ label, value, min, max, step, commit, id, italic }
   commit: (n: number) => void
   id?: string
   italic?: boolean
+  disabled?: boolean
 }) {
   return (
     <input
       id={id}
       type="number"
       aria-label={label}
-      className={`field tabular-nums ${italic ? 'italic text-grey-500' : ''}`}
+      className={`field tabular-nums disabled:cursor-not-allowed disabled:text-grey-500 ${italic ? 'italic text-grey-500' : ''}`}
       value={Number.isFinite(value) ? value : ''}
       min={min}
       max={max}
       step={step}
+      disabled={disabled}
       onChange={(e) => {
         const n = Number(e.target.value)
         if (Number.isFinite(n)) commit(n)
@@ -142,29 +144,32 @@ export function NumberField({ label, value, min, max, step, commit, id, italic }
 
 export type ChipOption<T> = { value: T; label: string; title?: string; disabled?: boolean }
 
-export function Chips<T extends string | number>({ ariaLabel, value, options, onChange }: {
+export function Chips<T extends string | number>({ ariaLabel, value, options, onChange, disabled }: {
   ariaLabel: string
   value: T
   options: readonly ChipOption<T>[]
   onChange: (v: T) => void
+  /** Every chip at once, for a setting that must not move while the queue runs. */
+  disabled?: boolean
 }) {
   return (
     <div role="group" aria-label={ariaLabel} className="flex flex-wrap gap-1">
       {options.map((o) => {
         const on = o.value === value
+        const off = disabled || o.disabled
         return (
           <button
             key={String(o.value)}
             type="button"
             title={o.title}
-            disabled={o.disabled}
+            disabled={off}
             aria-pressed={on}
             onClick={() => onChange(o.value)}
             className={`${RING} border px-2 py-1 text-caption tabular-nums transition-colors ${
               on
                 ? 'border-ink bg-ink text-newsprint'
                 : 'border-grey-300 text-grey-700 hover:border-ink hover:bg-newsprint-aged'
-            } ${o.disabled ? 'cursor-not-allowed opacity-40' : ''}`}
+            } ${off ? 'cursor-not-allowed opacity-40' : ''}`}
           >
             {o.label}
           </button>

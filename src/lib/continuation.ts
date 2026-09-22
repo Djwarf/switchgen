@@ -71,6 +71,7 @@ export const NODE_IDS = {
   lastFrame: '__cont_last',
   frameSave: '__cont_frame',
   trim: '__cont_trim',
+  dropFirst: '__cont_drop',
 } as const
 
 /** Output path the handoff frames are written under. */
@@ -577,6 +578,18 @@ export type ShotJob = {
   /** Output path for this shot's clip. Numbered, so the reel sorts into order. */
   outputPrefix: string
   /**
+   * True when this shot's seed is one somebody chose: its own, or the reel's
+   * when the reel's seed is fixed. False when the reel draws a fresh seed at
+   * every render, and then the seed in `params` is only a placeholder.
+   */
+  seedFixed: boolean
+  /**
+   * One plain sentence saying why this shot cannot be queued as it stands, or
+   * null when it can. The plan refuses rather than letting a graph reach the
+   * server with a stand-in where a real picture has to be.
+   */
+  blocked: string | null
+  /**
    * Generations since a clean keyframe. 0 means this shot opens on a real file.
    * 4 means four rounds of encode and decode sit between this shot and anything
    * the user actually chose.
@@ -587,7 +600,10 @@ export type ShotJob = {
 
 export type ShotPlan = {
   jobs: ShotJob[]
-  /** Frames across the whole reel. */
+  /**
+   * Frames across the whole reel as the clips hold them. A continued shot's
+   * first frame is dropped from its clip, so it is not counted twice.
+   */
   frames: number
   /** Running time at the plan's fps. */
   seconds: number
@@ -612,6 +628,11 @@ export type ShotPlanInput = {
   reanchorEvery?: number
   /** Output folder for the reel. */
   prefix?: string
+  /**
+   * True when the reel draws a fresh seed at every render. A shot without a
+   * seed of its own then has no fixed seed, and its job says so.
+   */
+  freshSeeds?: boolean
 }
 
 /**
@@ -671,12 +692,18 @@ export function shotPlan(input: ShotPlanInput): ShotPlan {
       start = { from: 'none' }
     }
 
-    if (index === 0 && start.from === 'none' && needsOpeningFrame(base)) {
-      warnings.push(
-        `${base.label} renders from a starting picture, so the first shot needs one. ` +
-        'Add a frame to shot 1, or open the reel with a text to video family.',
-      )
-      notes.push('Needs an opening frame.')
+    // A family whose graph carries its own LoadImage has no words-only path:
+    // queued without a frame, the loader keeps its stand-in and ComfyUI
+    // rejects the job with "Invalid image file". So the plan refuses the shot
+    // and says what would fix it, rather than letting the server say it.
+    let blocked: string | null = null
+    if (start.from === 'none' && needsOpeningFrame(base)) {
+      const n = index + 1
+      blocked =
+        `Shot ${n} needs an opening frame. ${base.label} makes every clip from a starting picture and cannot start from words alone. ` +
+        (index === 0
+          ? 'Pin a start frame on shot 1, choose an anchor frame on the bench, or choose a style that can start from words.'
+          : `Pin a start frame on shot ${n}.`)
     }
 
     if (index > 0 && start.from === 'none') {
@@ -710,7 +737,7 @@ export function shotPlan(input: ShotPlanInput): ShotPlan {
 
     const wanted = spec.length ?? params.length ?? def.defaults.length
     const length = snapLength(wanted > 0 ? wanted : 81)
-    frames += length
+    frames += start.from === 'previous' ? length - 1 : length
 
     if (hops === 3) notes.push('Third generation off the last clean frame. Colour has started to move.')
     if (hops >= 5) notes.push('Five hops deep. Expect a visibly different look from where the reel started.')
@@ -735,6 +762,8 @@ export function shotPlan(input: ShotPlanInput): ShotPlan {
       endImage,
       referenceImage,
       outputPrefix: `${prefix}/${String(index + 1).padStart(3, '0')}`,
+      seedFixed: spec.seed !== undefined || !input.freshSeeds,
+      blocked,
       hops,
       notes,
     })
@@ -783,8 +812,78 @@ export function instantiateShot(job: ShotJob, previous?: FileRef | string | null
   const wf = instantiate(job.def, params)
   if (job.endImage) setEndImage(wf, job.endImage)
   if (job.referenceImage) setReferenceImage(wf, job.referenceImage)
+  if (job.start.from === 'previous') dropOpeningFrame(wf as GraphLike)
   setOutputPrefix(wf, job.outputPrefix)
   return wf
+}
+
+/**
+ * Keep a continued shot's first frame out of its clip.
+ *
+ * The handoff frame is baked into the first latent frame with no noise on it
+ * (Wan22ImageToVideoLatent sets noise_mask 0 there, and WanImageToVideo
+ * conditions the same frame on it), so decoded frame 0 is the handoff frame
+ * again: the last frame of the clip before. Laid end to end, every join would
+ * hold that frame twice and the motion would stop for one frame at each seam.
+ *
+ * So every writer that reads the decode is pointed at an ImageFromBatch that
+ * starts at frame 1. 4096 is the node's ceiling for `length`, and execute
+ * clamps it to the batch, so it means "to the end". The tap keeps reading the
+ * full decode, so the next handoff is still the real final frame. Mutates
+ * `graph`. Shots that open on a pinned or anchor frame are real cuts, and
+ * this is only called for a continued shot.
+ */
+function dropOpeningFrame(graph: GraphLike): void {
+  const decode = findDecodeNode(graph)
+  if (!decode) return
+  let rewired = false
+  for (const [id, node] of Object.entries(graph)) {
+    if (id === NODE_IDS.frameSave || !node.class_type.startsWith('Save')) continue
+    for (const [key, value] of Object.entries(node.inputs)) {
+      if (isLink(value) && value[0] === decode && value[1] === 0) {
+        node.inputs[key] = [NODE_IDS.dropFirst, 0]
+        rewired = true
+      }
+    }
+  }
+  if (rewired) {
+    graph[NODE_IDS.dropFirst] = {
+      class_type: 'ImageFromBatch',
+      inputs: { image: [decode, 0], batch_index: 1, length: 4096 },
+    }
+  }
+}
+
+/**
+ * Frames in the clip a job writes. A continued shot writes one fewer than it
+ * generates, because its first frame is the previous clip's last one and is
+ * dropped (see dropOpeningFrame).
+ */
+export function clipFrames(job: ShotJob): number {
+  const length = job.params.length ?? 0
+  return job.start.from === 'previous' ? Math.max(0, length - 1) : length
+}
+
+/**
+ * Everything about a job that decides what its clip looks like, as one
+ * comparable string. The desk records it when a clip lands and compares it with
+ * the strip's current job, so an edit to a rendered shot or to the bench is
+ * noticed rather than left under a "rendered" label.
+ *
+ * Left out: the seed, which the engine compares separately and only when it is
+ * fixed (a Random reel draws a new one at every render, so a different seed is
+ * not an edit); the image, which for a pinned or anchor start is already in
+ * `start`, and for a continued shot is only known at instantiateShot; and the
+ * output prefix, which names the file and changes nothing in it.
+ */
+export function jobSignature(job: ShotJob): string {
+  const params: Record<string, unknown> = {}
+  const raw = job.params as Record<string, unknown>
+  for (const key of Object.keys(raw).sort()) {
+    if (key === 'seed' || key === 'image') continue
+    params[key] = raw[key]
+  }
+  return JSON.stringify([job.def.id, params, job.start, job.endImage ?? null, job.referenceImage ?? null])
 }
 
 /**

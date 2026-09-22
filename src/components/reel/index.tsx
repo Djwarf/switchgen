@@ -46,8 +46,12 @@ export {
 } from './store'
 
 export {
+  currencyOf,
   reelRun,
+  shotsToRender,
   useReelRun,
+  type Currency,
+  type Made,
   type RunContext,
   type RunState,
   type RunStatus,

@@ -30,7 +30,8 @@
  */
 import { ServerDown } from '../components/ServerDown'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
-import { modelFiles, probeHardware, type ModelFile } from '../lib/hardware'
+import { clipMemory, type ClipMemory } from '../lib/clipMemory'
+import { modelFiles, probeHardware, type Hardware, type ModelFile } from '../lib/hardware'
 import {
   useCallback,
   useEffect,
@@ -41,10 +42,11 @@ import {
   type ReactNode,
 } from 'react'
 
-import { connect, fileUrl, objectInfo, type FileRef, type OutputFile } from '../lib/comfy'
+import { connect, fileUrl, objectInfo, type FileRef } from '../lib/comfy'
 import {
   annotatedRef,
   checkReel,
+  clipFrames,
   deriveContinuation,
   explainUnavailable,
   shotPlan,
@@ -66,16 +68,20 @@ import {
   Quiet,
   ReelProgress,
   Strip,
+  currencyOf,
   grouped,
   reel,
   reelRun,
   seconds,
   shotsFromLines,
+  shotsToRender,
   useReel,
   type AssemblyClip,
+  type Currency,
   type KeyframeTarget,
   type NumSpec,
   type PinnedFrame,
+  type ReelDraft,
   type ReelFamily,
   type ReelShot,
   type RunContext,
@@ -110,6 +116,8 @@ type Catalogue = {
   blocked: { label: string; why: string }[]
   samplers: string[]
   schedulers: string[]
+  /** What the machine has, for the memory verdict on each clip. Null when the probe failed. */
+  hardware: Hardware | null
 }
 
 function latentClassOf(def: FamilyDef): string | null {
@@ -188,6 +196,7 @@ async function loadCatalogue(): Promise<Catalogue> {
     blocked,
     samplers: inv.samplers,
     schedulers: inv.schedulers,
+    hardware,
   }
 }
 
@@ -241,6 +250,50 @@ function lengthChoices(fps: number, spec: NumSpec): number[] {
     if (n >= spec.min && n <= spec.max && !out.includes(n)) out.push(n)
   }
   return out.sort((a, b) => a - b)
+}
+
+/**
+ * A family's own verified recipe, as bench settings. A reel is one continuous
+ * piece, so the whole bench follows the family rather than carrying settings
+ * across from a different model.
+ */
+function recipeFor(f: ReelFamily): Partial<ReelDraft> {
+  const d = defaultsFor(f.def, f.model)
+  return {
+    familyId: f.def.id,
+    model: f.model,
+    width: d.width,
+    height: d.height,
+    fps: d.fps || 24,
+    length: snapLength(d.length || 81),
+    steps: d.steps,
+    cfg: d.cfg,
+    sampler: d.sampler,
+    scheduler: d.scheduler,
+    negative: null,
+  }
+}
+
+/** "Shot 3" or "Shots 2, 4 and 5". */
+function shotsWord(numbers: readonly number[]): string {
+  if (numbers.length === 1) return `Shot ${numbers[0]}`
+  return `Shots ${numbers.slice(0, -1).join(', ')} and ${numbers[numbers.length - 1]}`
+}
+
+/**
+ * One sentence per distinct memory verdict at `level`, naming the shots it
+ * covers unless it covers them all. A reel of ten shots at one size would
+ * otherwise print the same paragraph ten times.
+ */
+function byReason(verdicts: readonly (ClipMemory | null)[], level: ClipMemory['level']): string[] {
+  const shots = new Map<string, number[]>()
+  verdicts.forEach((v, i) => {
+    if (v?.level !== level || !v.reason) return
+    shots.set(v.reason, [...(shots.get(v.reason) ?? []), i + 1])
+  })
+  return [...shots].map(([reason, numbers]) =>
+    numbers.length === verdicts.length ? reason : `${shotsWord(numbers)}: ${reason}`,
+  )
 }
 
 /** A clock that ticks only while something is running. */
@@ -329,26 +382,15 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     return cat.families.find((f) => f.def.id === draft.familyId) ?? cat.families[0] ?? null
   }, [cat, draft.familyId])
 
-  // The family's own verified recipe, applied when the style changes. A reel is
-  // one continuous piece, so the whole bench follows the family rather than
-  // carrying settings across from a different model.
+  // The family's recipe, applied when the draft does not match the family it
+  // resolves to: a first load, or a saved family that is no longer installed.
+  // A deliberate change of style is handled where the bench patches (see
+  // patchBench), because this check alone cannot see it between the two Wan
+  // 2.2 14B pairs: both are two-model families with model '' here.
   useEffect(() => {
     if (!family) return
     if (draft.familyId === family.def.id && draft.model === family.model) return
-    const d = defaultsFor(family.def, family.model)
-    reel.patch({
-      familyId: family.def.id,
-      model: family.model,
-      width: d.width,
-      height: d.height,
-      fps: d.fps || 24,
-      length: snapLength(d.length || 81),
-      steps: d.steps,
-      cfg: d.cfg,
-      sampler: d.sampler,
-      scheduler: d.scheduler,
-      negative: null,
-    })
+    reel.patch(recipeFor(family))
   }, [family, draft.familyId, draft.model])
 
   const houseNegative = family ? defaultsFor(family.def, family.model).negative : ''
@@ -402,11 +444,48 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
       anchorImage: draft.anchor?.name,
       reanchorEvery: draft.reanchorEvery,
       prefix: draft.prefix,
+      freshSeeds: !draft.seedLocked,
     })
-  }, [family, params, draft.shots, draft.length, draft.anchor, draft.reanchorEvery, draft.prefix])
+  }, [family, params, draft.shots, draft.length, draft.anchor, draft.reanchorEvery, draft.prefix, draft.seedLocked])
 
   const issues = useMemo(() => checkReel(plan.jobs), [plan.jobs])
   const order = useMemo(() => draft.shots.map((s) => s.id), [draft.shots])
+
+  // --- what may be sent ----------------------------------------------------
+
+  const hardware = cat?.hardware ?? null
+  const memoryFor = useCallback(
+    (job: ShotJob): ClipMemory | null =>
+      family
+        ? clipMemory(
+            family.def,
+            { width: job.params.width, height: job.params.height, frames: job.params.length ?? 0 },
+            hardware,
+          )
+        : null,
+    [family, hardware],
+  )
+  const memory = useMemo(() => plan.jobs.map(memoryFor), [plan.jobs, memoryFor])
+  /** Per shot: true when the desk will not queue it as it stands. */
+  const refused = useMemo(
+    () => plan.jobs.map((j, i) => j.blocked !== null || memory[i]?.level === 'refuse'),
+    [plan.jobs, memory],
+  )
+  const refusals = useMemo(
+    () => [...plan.jobs.flatMap((j) => (j.blocked ? [j.blocked] : [])), ...byReason(memory, 'refuse')],
+    [plan.jobs, memory],
+  )
+  const cautions = useMemo(() => byReason(memory, 'caution'), [memory])
+
+  // --- what is already on disk ---------------------------------------------
+
+  /** Per shot, in strip order: whether its clip still matches its line. */
+  const currency = useMemo<(Currency | null)[]>(
+    () => order.map((_, i) => currencyOf(i, order, plan.jobs, run.states)),
+    [order, plan.jobs, run.states],
+  )
+  /** What "Render what is missing" would queue, worked out the way the engine does. */
+  const missing = useMemo(() => shotsToRender(order, plan.jobs, run.states), [order, plan.jobs, run.states])
   const blanks = useMemo(
     () => draft.shots.map((s, i) => (s.prompt.trim() ? null : i + 1)).filter((n): n is number => n !== null),
     [draft.shots],
@@ -435,25 +514,78 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
         length: job.params.length ?? draft.length,
         fps: draft.fps,
       })
-    return { familyLabel: label, modelLabel: model, compositionFor }
-  }, [family, draft])
+    const memoryOf = (job: ShotJob): ClipMemory =>
+      memoryFor(job) ?? { level: 'ok', reason: null, release: false }
+    return { familyLabel: label, modelLabel: model, compositionFor, memory: memoryOf }
+  }, [family, draft, memoryFor])
 
   // --- running -------------------------------------------------------------
 
+  /**
+   * The jobs one press hands the engine. On a Random reel every press draws a
+   * new seed: with the old one, rendering a shot again queued the identical
+   * graph, and ComfyUI answered it from its cache with the clip it had already
+   * made. The drawn seed is written back to the bench, so the number shown is
+   * the one this press started from. A shot with its own seed keeps it.
+   */
+  const pressJobs = useCallback((): readonly ShotJob[] => {
+    if (draft.seedLocked) return plan.jobs
+    const seed = randomSeed()
+    reel.patch({ seed })
+    return plan.jobs.map((j) => (j.seedFixed ? j : { ...j, params: { ...j.params, seed: seed + j.index } }))
+  }, [draft.seedLocked, plan.jobs])
+
   const renderAll = useCallback(
     (opts: { force?: boolean } = {}) => {
-      if (!context || busy || blanks.length || !plan.jobs.length) return
-      reelRun.renderAll(order, plan.jobs, context, opts)
+      if (!context || busy || blanks.length || !plan.jobs.length || refusals.length) return
+      if (!opts.force && !missing.length) return
+      reelRun.renderAll(order, pressJobs(), context, opts)
     },
-    [context, busy, blanks.length, plan.jobs, order],
+    [context, busy, blanks.length, plan.jobs.length, refusals.length, missing.length, order, pressJobs],
   )
 
   const renderOne = useCallback(
     (index: number) => {
-      if (!context || busy) return
-      reelRun.renderOne(index, order, plan.jobs, context)
+      if (!context || busy || refused[index]) return
+      reelRun.renderOne(index, order, pressJobs(), context)
     },
-    [context, busy, order, plan.jobs],
+    [context, busy, refused, order, pressJobs],
+  )
+
+  /**
+   * The bench's changes, with two that need more than a patch.
+   *
+   * A deliberate change of style takes the new family's recipe outright. The
+   * effect above cannot see a move between the two Wan 2.2 14B pairs, so that
+   * move used to keep the old pair's length: 81 frames on the image-to-video
+   * pair, which the registry records being killed for memory at that length.
+   *
+   * Fixing a Random seed keeps the reel on screen. Each rendered shot that
+   * follows the reel's seed takes the seed it was actually made with as its
+   * own, so fixing the seed does not turn every earlier take into a change.
+   * Typing a number is different: that asks for new seeds, and the shots made
+   * with other ones then read as changed.
+   */
+  const patchBench = useCallback(
+    (p: Partial<ReelDraft>) => {
+      if (p.familyId !== undefined && p.familyId !== draft.familyId) {
+        const next = cat?.families.find((f) => f.def.id === p.familyId)
+        if (next) {
+          reel.patch({ ...p, ...recipeFor(next) })
+          return
+        }
+      }
+      if (p.seedLocked === true && p.seed === undefined && !draft.seedLocked) {
+        draft.shots.forEach((shot, i) => {
+          const state = run.states[shot.id]
+          const job = plan.jobs[i]
+          if (shot.seed !== null || state?.status !== 'done' || !state.made || !job) return
+          if (state.made.seed !== job.params.seed) reel.setShot(shot.id, { seed: state.made.seed })
+        })
+      }
+      reel.patch(p)
+    },
+    [cat, draft.familyId, draft.seedLocked, draft.shots, run.states, plan.jobs],
   )
 
   useEffect(() => {
@@ -482,7 +614,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
   const pictures = useMemo(() => records.filter((e) => e.kind === 'image').slice(0, 40), [records])
   const reelFrames = useMemo(
     () =>
-      run.order
+      order
         .map((id, i) => {
           const frame = run.states[id]?.frame
           if (!frame) return null
@@ -493,7 +625,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
           }
         })
         .filter((f): f is { label: string; name: string; previewUrl: string } => f !== null),
-    [run],
+    [order, run.states],
   )
 
   const pinShot = useCallback((id: string, which: 'start' | 'end') => {
@@ -523,37 +655,45 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     const state = run.states[watching]
     const clip = state?.clip
     if (!clip) return null
-    const index = run.order.indexOf(watching)
+    const index = order.indexOf(watching)
     const job = index >= 0 ? plan.jobs[index] : null
     const entry = state.entryId ? (records.find((r) => r.id === state.entryId) ?? null) : null
     return {
       file: clip as FileRef,
       entry,
-      frames: job?.params.length ?? 0,
-      fps: draft.fps,
+      frames: state.made?.frames ?? (job ? clipFrames(job) : 0),
+      fps: state.made?.fps || draft.fps,
       index,
     }
-  }, [watching, run, plan.jobs, records, draft.fps])
+  }, [watching, run.states, order, plan.jobs, records, draft.fps])
 
+  // The cutting room follows the strip, not the last run. Built from the run's
+  // own order, a cut shot stayed in the join, a moved one kept its old place,
+  // and a pasted reel left the previous reel's clips waiting to be cut.
   const clips = useMemo<AssemblyClip[]>(
     () =>
-      run.order
+      order
         .map((id, i) => {
           const state = run.states[id]
           if (!state?.clip || state.status !== 'done') return null
           return {
             index: i,
             label: `Shot ${i + 1}`,
-            file: state.clip as OutputFile,
-            frames: state.frames,
+            file: state.clip,
+            frames: state.made?.frames ?? state.frames,
+            fps: state.made?.fps || draft.fps,
+            width: state.made?.width ?? draft.width,
+            height: state.made?.height ?? draft.height,
             durationMs: state.durationMs,
+            outOfDate: currency[i] !== 'current',
           }
         })
         .filter((c): c is AssemblyClip => c !== null),
-    [run],
+    [order, run.states, currency, draft.fps, draft.width, draft.height],
   )
 
-  const stale = clips.length && run.order.some((id) => run.states[id]?.stale)
+  const changedCount = currency.filter((c) => c === 'changed').length
+  const staleCount = currency.filter((c) => c === 'stale').length
 
   // --- the page ------------------------------------------------------------
 
@@ -647,7 +787,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               />
               <div className="mt-2 flex flex-wrap gap-2">
                 <Quiet
-                  disabled={!pasted.trim()}
+                  disabled={!pasted.trim() || busy}
                   onClick={() => {
                     const shots = shotsFromLines(pasted)
                     if (!shots.length) return
@@ -682,6 +822,8 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               lengthOptions={lengthOptions}
               expert={expert}
               busy={busy}
+              currency={currency}
+              refused={refused}
               bookendBlocked={bookendBlocked}
               onEdit={(id, patch) => reel.setShot(id, patch)}
               onMove={(id, delta) => reel.move(id, delta)}
@@ -714,11 +856,21 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
             </p>
           ) : null}
 
-          {issues.length ? (
+          {issues.length || cautions.length ? (
             <div className="mb-4 space-y-1">
-              {issues.map((issue) => (
+              {[...issues, ...cautions].map((issue) => (
                 <p key={issue} className="border-l-2 border-warning pl-2 text-caption text-ink-warning">
                   {issue}
+                </p>
+              ))}
+            </div>
+          ) : null}
+
+          {refusals.length ? (
+            <div className="mb-4 space-y-1">
+              {refusals.map((why) => (
+                <p key={why} className="border-l-2 border-error pl-2 text-caption text-ink-error">
+                  {why}
                 </p>
               ))}
             </div>
@@ -730,16 +882,22 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               <button
                 type="button"
                 className="press"
-                disabled={busy || blanks.length > 0 || !plan.jobs.length || !family}
+                disabled={
+                  busy || blanks.length > 0 || !plan.jobs.length || !family || refusals.length > 0 || !missing.length
+                }
                 onClick={() => renderAll()}
               >
                 {busy ? 'On the press' : clips.length ? 'Render what is missing' : 'Render the reel'}
               </button>
 
               {clips.length && !busy ? (
-                <Quiet onClick={() => renderAll({ force: true })}>Render every shot again</Quiet>
+                <Quiet onClick={() => renderAll({ force: true })} disabled={refusals.length > 0 || blanks.length > 0}>
+                  Render every shot again
+                </Quiet>
               ) : null}
-              {run.status !== 'idle' && !busy ? <Quiet onClick={() => reelRun.clear()}>Clear the run</Quiet> : null}
+              {(run.status !== 'idle' || Object.keys(run.states).length > 0) && !busy ? (
+                <Quiet onClick={() => reelRun.clear()}>Clear the run</Quiet>
+              ) : null}
 
               <span className="text-caption italic text-grey-500">
                 {blanks.length
@@ -748,19 +906,39 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                     : `Shots ${blanks.join(', ')} have no lines yet.`
                   : busy
                     ? 'One shot at a time, in order.'
-                    : `${plan.jobs.length} generations of several minutes each. Control and Enter starts them.`}
+                    : refusals.length
+                      ? 'Nothing is sent while the note above stands.'
+                      : !missing.length
+                        ? 'Every shot is rendered and matches its line.'
+                        : missing.length === 1
+                          ? 'One generation of several minutes. Control and Enter starts it.'
+                          : `${missing.length} generations of several minutes each. Control and Enter starts them.`}
               </span>
             </div>
 
-            {stale ? (
+            {changedCount || staleCount ? (
               <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-ink-warning">
-                Some shots were rendered before the shot above them changed. Rendering what is missing brings them back
-                into line.
+                {changedCount
+                  ? changedCount === 1
+                    ? 'One shot has changed since it was rendered. '
+                    : `${changedCount} shots have changed since they were rendered. `
+                  : ''}
+                {staleCount
+                  ? staleCount === 1
+                    ? 'One shot was rendered before the shot above it changed. '
+                    : `${staleCount} shots were rendered before the shot above them changed. `
+                  : ''}
+                Rendering what is missing brings them back into line.
               </p>
             ) : null}
           </div>
 
-          <Assembly clips={clips} fps={draft.fps} shots={draft.shots.length} prefix={draft.prefix} />
+          <Assembly
+            key={clips.map((c) => `${c.file.subfolder}/${c.file.filename}`).join('|')}
+            clips={clips}
+            shots={draft.shots.length}
+            prefix={draft.prefix}
+          />
         </div>
 
         {/* the bench -------------------------------------------------------- */}
@@ -778,9 +956,8 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
             plan={plan}
             expert={expert}
             busy={busy}
-            onPatch={(p) => reel.patch(p)}
+            onPatch={patchBench}
             onPinAnchor={pinAnchor}
-            onRerollSeed={() => reel.patch({ seed: randomSeed(), seedLocked: false })}
           />
         </div>
       </div>

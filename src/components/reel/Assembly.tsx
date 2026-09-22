@@ -2,10 +2,14 @@
  * The cutting room.
  *
  * Ten clips laid end to end are a film only once something actually lays them
- * end to end. Every clip in a reel is written by the same encoder at the same
- * size, codec and frame rate, which is the condition ffmpeg's concat demuxer
- * needs to join them without re encoding. So the join is a stream copy: it
- * takes about a second and costs nothing in quality.
+ * end to end. Clips written by the same encoder at the same size, codec and
+ * frame rate meet the condition ffmpeg's concat demuxer needs to join them
+ * without re-encoding, and the server then joins them by stream copy, which
+ * costs nothing in quality. Clips that differ (a reel rendered partly on one
+ * style and partly on another, or before and after a change of shape) cannot
+ * be copied, and the server re-encodes them to match the first. The page says
+ * which of the two happened, from the server's own answer, and never promises
+ * a copy in advance.
  *
  * The button posts the ordered list to /api/reel/stitch, which resolves every
  * path inside ComfyUI's output root, runs ffmpeg there and hands back the
@@ -26,6 +30,8 @@ type Cut = {
   mode: 'copy' | 'encode' | 'crossfade'
   elapsed: number
   warnings: string[]
+  /** Why the clips could not be copied, one line per disagreement. Empty for a copy. */
+  reasons?: string[]
   actual: { seconds: number; frames: number; size: number; width: number; height: number }
 }
 
@@ -33,20 +39,25 @@ export type AssemblyClip = {
   index: number
   label: string
   file: OutputFile
+  /** Frames in the clip, and the rate and size it was written at. */
   frames: number
+  fps: number
+  width: number
+  height: number
   durationMs: number
+  /** True when the strip has moved on since this clip was made. */
+  outOfDate: boolean
 }
 
 export type AssemblyProps = {
   clips: readonly AssemblyClip[]
-  fps: number
   /** How many shots the reel has in total, so a partial cut says so. */
   shots: number
   /** Where the clips were written, for the command's working directory. */
   prefix: string
 }
 
-export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
+export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   const [copied, setCopied] = useState(false)
   const [cutting, setCutting] = useState(false)
   const [cut, setCut] = useState<Cut | null>(null)
@@ -58,7 +69,14 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
   if (!clips.length) return null
 
   const frames = clips.reduce((n, c) => n + c.frames, 0)
+  // Each clip at its own rate: a reel that changed style part way holds clips
+  // at 24 and at 16 frames a second, and one rate for all of them misstates both.
+  const runSeconds = clips.reduce((n, c) => n + (c.fps > 0 ? c.frames / c.fps : 0), 0)
   const spent = clips.reduce((n, c) => n + c.durationMs, 0)
+  const head = clips[0]
+  const mixed = head
+    ? clips.some((c) => c.fps !== head.fps || c.width !== head.width || c.height !== head.height)
+    : false
   const partial = clips.length < shots
   const folder = prefix.replace(/\/+$/, '')
   const out = `${folder}/reel.webm`
@@ -76,8 +94,8 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
 
   /**
    * Cut it. One request, one answer: `json=1` asks the server for the summary
-   * rather than a progress stream, which is the right trade when the join is a
-   * stream copy that lands in well under a second.
+   * rather than a progress stream. The summary says whether the clips were
+   * copied or re-encoded, and why, which is what the page reports.
    */
   const make = () => {
     setCutting(true)
@@ -101,9 +119,17 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
     <section className="mt-8">
       <Head
         title="The cutting room"
-        figure={`${clips.length} clips · ${seconds(frames, fps)}`}
-        note="The clips are numbered in cutting order. Joining them is a stream copy, so nothing is re encoded."
+        figure={`${clips.length} clips · ${runSeconds.toFixed(1)} s`}
+        note="The clips are numbered in cutting order. Clips that share one size, frame rate and codec are joined by stream copy, with nothing re-encoded. Clips that differ are re-encoded to match the first."
       />
+
+      {mixed ? (
+        <p className="mb-4 border-l-2 border-warning pl-2 text-caption text-ink-warning">
+          These clips do not all share one size and frame rate, so cutting them re-encodes the reel to match shot{' '}
+          {(head?.index ?? 0) + 1}. That costs some quality and takes longer than a copy. Rendering what is missing
+          brings the older clips into line first.
+        </p>
+      ) : null}
 
       <div className="mb-5 flex flex-wrap items-baseline gap-x-4 gap-y-2 border-b border-grey-300 pb-4">
         {canCut === false ? (
@@ -122,7 +148,12 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
               {cut.out}
             </a>{' '}
             <span className="tabular-nums text-grey-500">
-              {cut.actual.seconds.toFixed(2)} s · {grouped(cut.actual.frames)} frames · {mb(cut.actual.size)}
+              {cut.actual.seconds.toFixed(2)} s · {grouped(cut.actual.frames)} frames · {mb(cut.actual.size)} ·{' '}
+              {cut.mode === 'copy'
+                ? 'joined by stream copy, nothing re-encoded'
+                : cut.mode === 'crossfade'
+                  ? 'crossfaded, so re-encoded'
+                  : 're-encoded to match the first clip'}
             </span>
           </p>
         ) : failed ? (
@@ -133,6 +164,17 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
           </p>
         )}
       </div>
+
+      {cut && cut.mode !== 'copy' && cut.reasons?.length ? (
+        <div className="mb-4 border-l-2 border-warning pl-2 text-caption text-ink-warning">
+          <p>Re-encoded, because the clips differ:</p>
+          <ul>
+            {cut.reasons.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {cut?.warnings.length ? (
         <ul className="mb-4 border-l-2 border-warning pl-2 text-caption text-ink-warning">
@@ -156,6 +198,12 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
               For doing it yourself. Set COMFY_OUTPUT to ComfyUI's output folder first.
             </span>
           </div>
+          {mixed ? (
+            <p className="mt-2 text-caption italic text-grey-500">
+              The command copies the clips as they are, so it only works once they all share one size, frame rate and
+              codec.
+            </p>
+          ) : null}
 
           {partial ? (
             <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-ink-warning">
@@ -177,8 +225,9 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
                   <a className="sg-link" href={fileUrl(c.file)} target="_blank" rel="noreferrer">
                     {c.file.filename}
                   </a>
+                  {c.outOfDate ? <span className="ml-1 italic text-ink-warning">out of date</span> : null}
                 </span>
-                <span className="shrink-0 text-caption tabular-nums text-grey-500">{seconds(c.frames, fps)}</span>
+                <span className="shrink-0 text-caption tabular-nums text-grey-500">{seconds(c.frames, c.fps)}</span>
               </li>
             ))}
           </ol>
