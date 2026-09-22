@@ -100,7 +100,9 @@ export const FAMILY_DEFS: FamilyDef[] = [
         "sampler": "dpmpp_2m",
         "scheduler": "karras",
         "negative": "score_6, score_5, score_4, worst quality, low quality, bad anatomy, bad hands, extra digits, watermark, signature",
-        "notes": "Pony V6 requires the score tag prefix in the positive prompt to reach its trained quality: score_9, score_8_up, score_7_up. Without it output looks like base SDXL. Largest NSFW LoRA ecosystem of anything installed."
+        "notes": "Pony V6 requires the score tag prefix in the positive prompt to reach its trained quality: score_9, score_8_up, score_7_up. Without it output looks like base SDXL. Largest NSFW LoRA ecosystem of anything installed.",
+        "clipSkip": -2,
+        "positivePrefix": "score_9, score_8_up, score_7_up, "
       },
       "NoobAI-XL-v1.1.safetensors": {
         "steps": 28,
@@ -110,7 +112,9 @@ export const FAMILY_DEFS: FamilyDef[] = [
         "sampler": "euler_ancestral",
         "scheduler": "normal",
         "negative": "worst quality, low quality, bad anatomy, bad hands, extra digits, watermark, signature, jpeg artifacts",
-        "notes": "Booru tag prompting, comma separated. Trained on explicit content, so anatomy is markedly stronger than the photoreal bases. Euler ancestral suits it."
+        "notes": "Booru tag prompting, comma separated. Trained on explicit content, so anatomy is markedly stronger than the photoreal bases. Euler ancestral suits it.",
+        "clipSkip": -2,
+        "positivePrefix": "masterpiece, best quality, amazing quality, "
       }
     },
     "notes": "ARCHITECTURE (verified, not assumed): both files are plain SDXL eps-prediction checkpoints. I read the safetensors headers directly: 1680 model.diffusion_model.* keys, adm/label_emb present, conditioner.embedders.0 (CLIP-L) + .1 (CLIP-G) bundled, 248 first_stage_model.* VAE keys bundled, all tensors F16, 6.9 GB each. Neither contains 'v_pred', 'ztsnr', 'edm_mean' or 'edm_vpred.sigma_max', so comfy",
