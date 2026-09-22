@@ -113,7 +113,16 @@ export type LoraArch =
   | 'qwen-image-edit'
   | 'anima'
   | 'krea2'
+  /**
+   * Wan comes in three sizes whose weights have different shapes, and an
+   * add-on made for one size does nothing on another: ComfyUI skips every key
+   * whose shape does not match, and says so only in its own log. Plain `wan`
+   * is a Wan add-on whose size nobody has read.
+   */
   | 'wan'
+  | 'wan-14b'
+  | 'wan-5b'
+  | 'wan-1.3b'
   | 'hunyuan'
   | 'ltxv'
   | 'unknown'
@@ -130,7 +139,10 @@ export const ARCH_LABEL: Record<LoraArch, string> = {
   'qwen-image-edit': 'Qwen Image Edit',
   anima: 'Anima',
   krea2: 'Krea 2',
-  wan: 'Wan 2.2',
+  wan: 'Wan, size not known',
+  'wan-14b': 'Wan 14B',
+  'wan-5b': 'Wan 2.2 5B',
+  'wan-1.3b': 'Wan 2.1 1.3B',
   hunyuan: 'HunyuanVideo',
   ltxv: 'LTX-Video',
   unknown: 'no verified base',
@@ -143,6 +155,19 @@ export const ARCH_LABEL: Record<LoraArch, string> = {
  * `untested`, not `mismatch`.
  */
 const SDXL_LINEAGE: ReadonlySet<LoraArch> = new Set<LoraArch>(['pony', 'illustrious', 'sdxl'])
+
+const isWan = (arch: LoraArch) => arch === 'wan' || arch.startsWith('wan-')
+
+/**
+ * Wan add-ons whose size was read off the file's own safetensors header,
+ * because the filename does not say it. Both halves of this pair carry
+ * `lora_A` tensors of [64, 5120] across blocks 0 to 39, which is the 14B
+ * layout; the 5B is 3072 wide with 30 blocks and the 1.3B is 1536 wide.
+ */
+const WAN_SIZE_READ: Readonly<Record<string, LoraArch>> = {
+  Wan22_I2V_NSFW_General_HIGH: 'wan-14b',
+  Wan22_I2V_NSFW_General_LOW: 'wan-14b',
+}
 
 /** Names the catalogue's `claims` field uses, mapped to our architectures. */
 const ARCH_ALIAS: Record<string, LoraArch> = {
@@ -1461,7 +1486,8 @@ function infoFromCatalogue(e: CatalogueEntry, onDisk: ModelFile | null, file: st
  * as a caution rather than as a fit.
  */
 function infoFromDisk(f: ModelFile): LoraInfo {
-  const guess = archFor(null, f.name)
+  const read = WAN_SIZE_READ[stem(f.name)]
+  const guess = read ?? archFor(null, f.name)
   return {
     file: loraNameOf(f),
     label: titleOf(f.name),
@@ -1477,8 +1503,9 @@ function infoFromDisk(f: ModelFile): LoraInfo {
     recommended: 0.7,
     slider: false,
     usage: 'both',
-    does:
-      guess === 'unknown'
+    does: read
+      ? `Not in the verified catalogue. The shapes in the file's own header are ${ARCH_LABEL[read]}, so that is the only size of Wan it works on.`
+      : guess === 'unknown'
         ? 'Not in the verified catalogue, and the filename says nothing about its base. It is offered without a compatibility claim.'
         : `Not in the verified catalogue. The filename suggests ${ARCH_LABEL[guess]}, which is a guess rather than a read of the file.`,
   }
@@ -1595,7 +1622,15 @@ export function archFor(def: FamilyDef | null, model: string): LoraArch {
   if (/krea/.test(name)) return 'krea2'
   if (/hunyuan/.test(name)) return 'hunyuan'
   if (/ltxv?[-_]/.test(name)) return 'ltxv'
-  if (/wan/.test(name)) return 'wan'
+  if (/wan/.test(name)) {
+    // The size, where the name gives it. `1.3b` first, so it is never read as
+    // a 3B, and the 5B only when no other digit runs into it. A name without
+    // a size defers to a Wan family's id, which always carries one.
+    if (/1[._]3b/.test(name)) return 'wan-1.3b'
+    if (/(^|[^0-9.])5b/.test(name)) return 'wan-5b'
+    if (/14b/.test(name)) return 'wan-14b'
+    if (!(def?.id ?? '').toLowerCase().startsWith('wan')) return 'wan'
+  }
 
   const id = (def?.id ?? '').toLowerCase()
   if (id.includes('pony')) return 'pony'
@@ -1609,7 +1644,13 @@ export function archFor(def: FamilyDef | null, model: string): LoraArch {
   if (id.includes('krea')) return 'krea2'
   if (id.includes('hunyuan')) return 'hunyuan'
   if (id.includes('ltxv')) return 'ltxv'
-  if (id.startsWith('wan')) return 'wan'
+  // Every Wan family in the registry names its size in its id, and the 14B is
+  // the one without a size of its own: `wan22-14b-*` and `wan21-vace-14b-*`.
+  if (id.startsWith('wan')) {
+    if (id.includes('1_3b')) return 'wan-1.3b'
+    if (id.includes('5b') && !id.includes('14b')) return 'wan-5b'
+    return 'wan-14b'
+  }
   if (id.includes('sdxl')) return 'sdxl'
   return 'unknown'
 }
@@ -1630,8 +1671,22 @@ export function fitFor(info: LoraInfo, target: LoraTarget): Fit {
   if (model && info.bases.some(b => stem(b) === model)) {
     return { level: 'match', why: `Verified against ${titleOf(target.model)}.` }
   }
+  // A Wan add-on is only as good as its size. One whose size nobody has read,
+  // or a model whose size the name does not give, is a guess either way.
+  if (isWan(info.arch) && isWan(target.arch) && (info.arch === 'wan' || target.arch === 'wan')) {
+    return {
+      level: 'untested',
+      why: `Made for Wan, but ${info.arch === 'wan' ? 'the size it was made for is not known' : 'the size of the loaded model is not known'}. Wan comes in three sizes, and ComfyUI skips every weight whose shape does not match the loaded model, so on the wrong size it has no effect.`,
+    }
+  }
   if (info.arch !== 'unknown' && info.arch === target.arch) {
     return { level: 'match', why: `Trained on ${ARCH_LABEL[info.arch]}, which is what is loaded.` }
+  }
+  if (isWan(info.arch) && isWan(target.arch)) {
+    return {
+      level: 'mismatch',
+      why: `Made for ${ARCH_LABEL[info.arch]}. ${ARCH_LABEL[target.arch]} is a different size, so none of its weights match the model's shapes and ComfyUI would skip them all: it would have no effect. It is never sent.`,
+    }
   }
   if (info.claims.some(c => ARCH_ALIAS[c.toLowerCase()] === target.arch)) {
     return {

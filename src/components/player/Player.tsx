@@ -35,9 +35,9 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react'
-import { fileUrl, type FileRef } from '../../lib/comfy'
+import { fileUrl, uploadImage, type FileRef } from '../../lib/comfy'
 import type { HistoryEntry } from '../../lib/history'
-import { adoptSource, settings, type DeskId } from '../../lib/session'
+import { adoptFrame, settings, type DeskId } from '../../lib/session'
 import {
   Readout,
   britishDateTime,
@@ -112,7 +112,10 @@ export type PlayerProps = {
   /** Take focus on mount — for the detail overlay, not for the desk. */
   autoFocus?: boolean
   className?: string
-  /** Receives a frame lifted out of the clip. Falls back to `adoptSource`. */
+  /**
+   * Receives a frame lifted out of the clip. Without it the player uploads the
+   * frame itself and stands it in the chosen desk's well.
+   */
   onUseFrame?: (request: UseFrameRequest) => void
   /** Mirrors anything the player says, for a shell that keeps one notice area. */
   onNotice?: (text: string) => void
@@ -130,6 +133,16 @@ function saveBlob(blob: Blob, name: string): void {
   a.click()
   a.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/** Where the well can show a picture that has just been uploaded to ComfyUI's input folder. */
+function inputUrl(name: string): string {
+  const cut = name.lastIndexOf('/')
+  return fileUrl({
+    filename: cut < 0 ? name : name.slice(cut + 1),
+    subfolder: cut < 0 ? '' : name.slice(0, cut),
+    type: 'input',
+  })
 }
 
 function isTypingTarget(target: EventTarget | null): boolean {
@@ -621,7 +634,7 @@ function PlayerBody({
   const sendFrameTo = useCallback(
     async (desk: DeskId) => {
       setMenuOpen(false)
-      if (!canUseFrame) return
+      if (!canUseFrame || busy) return
       videoRef.current?.pause()
       const f = currentFrame
       const where = desk === 'images' ? 'the pictures desk' : 'the video desk as a start frame'
@@ -648,12 +661,37 @@ function PlayerBody({
         return
       }
 
-      if (entry) {
-        adoptSource(entry, desk, { frame: f })
+      // No handler, so the player does the whole job: the frame on screen,
+      // as a picture, uploaded under its own name. Handing the desk the clip's
+      // file instead would upload every frame of it, and LoadImage would feed
+      // them all to the next clip as its start.
+      const v = videoRef.current
+      setBusy('frame')
+      try {
+        const blob = await grabFrame()
+        if (!blob || !v) {
+          say('error', 'We could not copy that frame out of the clip.')
+          return
+        }
+        const name = await uploadImage(blob, frameNameFor(f))
+        adoptFrame(desk, {
+          name,
+          previewUrl: inputUrl(name),
+          label: clip ? `frame ${f} of ${clip.filename}` : `frame ${f}`,
+          width: v.videoWidth,
+          height: v.videoHeight,
+          bytes: blob.size,
+          fromEntryId: entry?.id,
+          fromFrame: f,
+        })
         say('info', `Frame ${padFrame(f, Math.max(frames, 1))} sent to ${where}.`)
+      } catch {
+        say('error', 'ComfyUI would not take the frame, so nothing was sent. Try again.')
+      } finally {
+        setBusy(null)
       }
     },
-    [canUseFrame, clip, currentFrame, effFps, entry, frameNameFor, frames, grabFrame, onUseFrame, say],
+    [busy, canUseFrame, clip, currentFrame, effFps, entry, frameNameFor, frames, grabFrame, onUseFrame, say],
   )
 
   // --- keyboard -----------------------------------------------------------
@@ -878,6 +916,9 @@ function PlayerBody({
   return (
     <section
       ref={rootRef}
+      // The desks' own single-key shortcuts look for this and stand down while
+      // focus is inside the player, which claims several of the same keys.
+      data-player=""
       tabIndex={-1}
       aria-label={entry ? `Clip viewer, No. ${entry.no}` : 'Clip viewer'}
       className={`flex w-full flex-col bg-newsprint ${RING} ${

@@ -30,7 +30,8 @@ import { OfferList } from '../components/result/ResultActions'
 import { videoOffersFor } from '../components/result/videoOffers'
 import { LoraRack } from '../components/video/LoraRack'
 import { EMPTY_LIBRARY, loadLoraLibrary, loadStack, missingTriggers, resolveStack, saveStack, targetFor, type LoraLibrary, type LoraStack } from '../lib/loras'
-import { chainVideoStack, collapsePairs } from '../lib/videoLoras'
+import { chainVideoStack, rackFromRecord, videoLorasToRun } from '../lib/videoLoras'
+import { clipMemory, releaseComfyMemory } from '../lib/clipMemory'
 import { CataloguePanel } from '../components/advanced/CataloguePanel'
 import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
@@ -90,12 +91,12 @@ import {
   applyDefaults,
   clearTouched,
   deskStore,
+  needsSource,
   randomSeed,
   recordOf,
   reuseIntoDesk,
   settings,
   toParams,
-  type AppliedReuse,
   type Composition,
   type FamilyDefaults,
   type SourceRef,
@@ -244,6 +245,9 @@ function stageOf(graph: ApiWorkflow, nodeId: string | null): string {
 
 const I2V_LOAD = '__i2v_load'
 
+/** Containers that only ever hold a clip. Animated WEBP and GIF can be stills too, so they are left out. */
+const CLIP_FILE = /\.(webm|mp4|mkv|avi|mov)$/i
+
 /** Latent nodes that accept a first frame. Both take an IMAGE link. */
 const START_FRAME_NODES = ['Wan22ImageToVideoLatent', 'WanImageToVideo']
 
@@ -301,6 +305,23 @@ function graphShift(def: FamilyDef): number | null {
   return null
 }
 
+/**
+ * The node that writes the clip, and whether the family's fps binding reaches
+ * it. A binding that points at a node the graph does not have, or only at the
+ * sampler's conditioning, leaves the encoder at its own rate whatever the
+ * reader types, and every length the desk prints would then be computed at a
+ * rate the file does not play at. With no encoder that carries a rate there
+ * is nothing to check, and the field is taken at its word.
+ */
+function encoderOf(def: FamilyDef): { bound: boolean; fps: number | null } {
+  const save = Object.entries(def.graph).find(
+    ([, n]) => n.class_type.startsWith('Save') && typeof n.inputs.fps === 'number',
+  )
+  if (!save) return { bound: true, fps: null }
+  const bound = (def.bindings.fps ?? []).some(([id, input]) => id === save[0] && input === 'fps')
+  return { bound, fps: save[1].inputs.fps as number }
+}
+
 function latentClassOf(def: FamilyDef): string | null {
   for (const node of Object.values(def.graph)) {
     if (START_FRAME_NODES.includes(node.class_type)) return node.class_type
@@ -329,6 +350,16 @@ export type VideoFamily = {
   verdict: Verdict | null
   /** True when a start frame can be wired into this family's latent node. */
   canStartFromPicture: boolean
+  /**
+   * True when the family's own graph binds a start frame (the 14B I2V pair).
+   * It has no text-to-video graph: sent from words, its LoadImage would keep
+   * the placeholder `example.png` and ComfyUI would refuse the prompt.
+   */
+  needsStartFrame: boolean
+  /** True when the fps binding reaches the node that writes the clip. */
+  fpsReachesEncoder: boolean
+  /** The frame rate the family's encoder node is set to in its own graph. */
+  encoderFps: number | null
   width: NumSpec
   height: NumSpec
   frames: NumSpec
@@ -384,12 +415,16 @@ async function loadCatalogue(): Promise<Catalogue> {
     const model = def.dualModel ? '' : (def.models.find((m) => weights.has(m)) ?? def.models[0] ?? '')
 
     const latent = latentClassOf(def)
+    const encoder = encoderOf(def)
     families.push({
       def,
       model,
       label: def.label,
       verdict,
       canStartFromPicture: deriveImageToVideo(def) !== null,
+      needsStartFrame: !!def.bindings.image,
+      fpsReachesEncoder: encoder.bound,
+      encoderFps: encoder.fps,
       width: readSpec(info, latent, 'width', SPEC_FALLBACK.size),
       height: readSpec(info, latent, 'height', SPEC_FALLBACK.size),
       frames: readSpec(info, latent, 'length', SPEC_FALLBACK.frames),
@@ -452,6 +487,21 @@ function defaultsOf(family: VideoFamily): FamilyDefaults {
     length: d.length || undefined,
     fps: d.fps || undefined,
     negative: d.negative,
+  }
+}
+
+/** The frame rate the clip will actually be written at. */
+function fpsOf(family: VideoFamily, c: Composition): number {
+  if (!family.fpsReachesEncoder && family.encoderFps) return family.encoderFps
+  return c.fps ?? defaultsFor(family.def, family.model).fps ?? 24
+}
+
+/** The size of the clip as the memory check reads it. */
+function clipOf(family: VideoFamily, c: Composition): { width: number; height: number; frames: number } {
+  return {
+    width: c.width,
+    height: c.height,
+    frames: c.length ?? defaultsFor(family.def, family.model).length ?? 0,
   }
 }
 
@@ -620,6 +670,10 @@ export type VideoJob = {
   cancelRequested: boolean
   sighted: boolean
   misses: number
+  /** Polls on which the server said the job had ended while no event came. */
+  terminalWaits: number
+  /** True when ComfyUI releases its cached models before this clip runs. */
+  release: boolean
 }
 
 let jobs: VideoJob[] = []
@@ -695,6 +749,8 @@ type StartOptions = {
   modelLabel: string
   /** The add-ons chained into the graph, for the record. */
   loras?: HistoryEntry['loras']
+  /** Release ComfyUI's cached models immediately before queueing. See lib/clipMemory.ts. */
+  release?: boolean
 }
 
 function startJob(opts: StartOptions): string {
@@ -726,6 +782,8 @@ function startJob(opts: StartOptions): string {
     cancelRequested: false,
     sighted: false,
     misses: 0,
+    terminalWaits: 0,
+    release: !!opts.release,
   }
   jobs = [job, ...jobs]
   announce()
@@ -737,6 +795,12 @@ function startJob(opts: StartOptions): string {
       patchJob(id, { promptId: e.promptId, status: 'queued', stage: 'Queued' })
       if (current.cancelRequested) void cancelJob(e.promptId).catch(() => undefined)
     } else if (e.phase === 'running') {
+      // ComfyUI applies a release after the job it is running, not before, so
+      // a heavy clip of ours waiting behind this one gets its release now. Its
+      // own, sent as it was queued, went to whatever was running then.
+      if (current.status !== 'running' && jobs.some((j) => j.id !== id && j.release && j.status === 'queued')) {
+        void releaseComfyMemory()
+      }
       const sampling = e.max > 1
       patchJob(id, {
         status: 'running',
@@ -751,7 +815,15 @@ function startJob(opts: StartOptions): string {
     }
   }
 
-  void run(opts.graph, onEvent)
+  const queue = async (): Promise<OutputFile[]> => {
+    // Sent immediately before the prompt: ComfyUI's worker drops its cached
+    // models before it takes the next job, so this clip starts from a clear
+    // machine rather than from whatever the last run left resident.
+    if (opts.release) await releaseComfyMemory()
+    return run(opts.graph, onEvent)
+  }
+
+  void queue()
     .then((files) => {
       const current = jobById(id)
       if (!current) return
@@ -807,6 +879,9 @@ function startJob(opts: StartOptions): string {
   return id
 }
 
+/** Polls to wait for a socket event the server says has already happened. */
+const LOST_TERMINAL_WAITS = 3
+
 /**
  * Reconcile against ComfyUI's own queue every five seconds, so a job that the
  * server has forgotten is reported rather than spinning forever, and so the
@@ -849,8 +924,24 @@ async function reconcile(): Promise<void> {
     }
     const server = await getJob(job.promptId).catch(() => null)
     if (server && (server.status === 'completed' || server.status === 'failed' || server.status === 'cancelled')) {
-      // The terminal socket event is the authority; give it one more cycle.
-      patchJob(job.id, { misses: 0, sighted: true })
+      // The terminal socket event is the authority, so it gets a few more
+      // cycles to arrive. Not forever: comfy.ts looks for a missed event once,
+      // when the socket reopens, and if that one look fails nothing looks
+      // again, so the card would run its stopwatch for as long as the page
+      // stays open.
+      const waits = job.terminalWaits + 1
+      if (waits < LOST_TERMINAL_WAITS) {
+        patchJob(job.id, { misses: 0, sighted: true, terminalWaits: waits })
+        continue
+      }
+      if (jobById(job.id)?.status === 'done') continue
+      patchJob(job.id, {
+        status: 'error',
+        error: 'ComfyUI says this job has ended but never sent the result. Look in the archive: the clip may be on disk anyway.',
+        finishedAt: Date.now(),
+        stage: 'Lost',
+        queuePos: null,
+      })
       continue
     }
     if (jobById(job.id)?.status === 'done') continue
@@ -1114,12 +1205,31 @@ function Chips<T extends string | number>({
 const store = deskStore('video')
 
 /** Why the press cannot run yet, in the reader's words. Null means it can. */
-function reasonFor(family: VideoFamily | null, c: Composition): string | null {
+function reasonFor(family: VideoFamily | null, c: Composition, hardware: Hardware | null): string | null {
   if (!family) return 'No video model is installed.'
+  // First, because it is the one the reader cannot guess: a clip this size
+  // samples for minutes and is then killed in its final decode.
+  const memory = clipMemory(family.def, clipOf(family, c), hardware)
+  if (memory.level === 'refuse') return memory.reason
   if (!c.prompt.trim()) return 'Describe the shot first.'
+  if (family.needsStartFrame && (c.mode !== 'i2v' || !c.source?.name)) {
+    return `${family.label} starts from a picture. Add a start frame.`
+  }
   if (c.mode === 'i2v' && !family.canStartFromPicture) return `${family.label} works from words only.`
   if (c.mode === 'i2v' && !c.source?.name) return 'Add a start frame, or work from words.'
+  // Uploaded by an older player, which sent the whole clip rather than a frame.
+  if (c.mode === 'i2v' && c.source && CLIP_FILE.test(c.source.name)) {
+    return 'The start frame is a whole clip, not one frame of it. Clear it and use one frame.'
+  }
   return null
+}
+
+/** Two racks that would chain the same files at the same strengths. */
+function sameRack(a: LoraStack, b: LoraStack): boolean {
+  return (
+    a.length === b.length &&
+    a.every((e, i) => e.file === b[i].file && e.strength === b[i].strength && e.enabled === b[i].enabled)
+  )
 }
 
 const EXAMPLES: { prompt: string; note: string }[] = [
@@ -1152,7 +1262,15 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const [showWorkflow, setShowWorkflow] = useState(false)
   const [viewing, setViewing] = useState<HistoryEntry | null>(null)
   const [justFinished, setJustFinished] = useState<{ id: string; ms: number } | null>(null)
-  const [reuseNotice, setReuseNotice] = useState<{ applied: AppliedReuse; no: number } | null>(null)
+  const [reuseNotice, setReuseNotice] = useState<{
+    no: number
+    /** Everything the reader should know about what was and was not carried over. */
+    notes: string[]
+    /** True when `Make another` queued a clip straight after loading. */
+    ran: boolean
+    /** The desk and its add-on rack, exactly as they were before. */
+    undo: () => void
+  } | null>(null)
 
   const fileInput = useRef<HTMLInputElement | null>(null)
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
@@ -1200,8 +1318,16 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     store.set(applyDefaults(current, defaultsOf(family)))
   }, [family])
 
+  // A family that only starts from a picture has no words-only graph, so a
+  // draft that arrives on it in `From words`, saved or restored, is moved over.
+  useEffect(() => {
+    if (family?.needsStartFrame && composition.mode !== 'i2v') store.patch({ mode: 'i2v' })
+  }, [family, composition.mode])
+
   const mode = composition.mode === 'i2v' ? 'i2v' : 't2v'
-  const fps = composition.fps ?? (family ? defaultsFor(family.def, family.model).fps : 24) ?? 24
+  // The rate the file will be written at, which is not always the one typed:
+  // see encoderOf. Every length on the desk is computed from this one.
+  const fps = family ? fpsOf(family, composition) : (composition.fps ?? 24)
   const frames = composition.length ?? (family ? defaultsFor(family.def, family.model).length : 81) ?? 81
   const houseNegative = family ? defaultsFor(family.def, family.model).negative : ''
   const shapes = useMemo(() => {
@@ -1225,6 +1351,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     return list.includes(frames) ? list : [...list, frames].sort((a, b) => a - b)
   }, [family, fps, frames])
   const notes = useMemo(() => (family ? marginaliaOf(family) : []), [family])
+  const memory = useMemo(
+    () => (family ? clipMemory(family.def, clipOf(family, composition), cat?.hardware ?? null) : null),
+    [family, composition, cat],
+  )
 
   const myJobs = allJobs
   const live = useMemo(() => myJobs.filter(unfinished), [myJobs])
@@ -1400,6 +1530,19 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     setUploading(true)
     ;(async () => {
       try {
+        // A clip is not a start frame. LoadImage decodes every frame of one,
+        // and the next clip would take all of them as its opening. An older
+        // player sent the whole clip this way, and a draft saved then may
+        // still hold it.
+        if (CLIP_FILE.test(ref.filename)) {
+          setSource(null)
+          setNotice({
+            kind: 'correction',
+            title: 'Correction',
+            body: 'The start frame waiting here was a whole clip, not one frame of it, so it was taken off. Open the clip and use one frame.',
+          })
+          return
+        }
         const res = await fetch(fileUrl(ref))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const blob = await res.blob()
@@ -1468,24 +1611,43 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     [family],
   )
 
+  /**
+   * The rack the press would chain for a family. The ref holds what the reader
+   * last set; for a family it has not been set for yet, the saved rack is the
+   * rack.
+   */
+  const rackOf = useCallback(
+    (familyId: string): LoraStack =>
+      stackRef.current.familyId === familyId ? stackRef.current.stack : loadStack(familyId),
+    [],
+  )
+
   /** The add-ons that will actually be chained: installed, fitting, on, pairs expanded. */
   const resolvedLoras = useCallback((fam: VideoFamily) => {
     const l = libRef.current
     const target = targetFor(fam.def, fam.model)
-    // The ref holds what the reader last set; for a family it has not been
-    // set for yet, the saved rack is the rack.
-    const stack = stackRef.current.familyId === fam.def.id ? stackRef.current.stack : loadStack(fam.def.id)
+    const stack = rackOf(fam.def.id)
     const resolved = resolveStack(stack, l, target)
     const installed = new Set(l.all.filter((i) => i.installed).map((i) => i.file))
-    return { target, stack, specs: resolved.specs, installed }
-  }, [])
+    // Rows on the rack that will not run: switched off, dropped, or at nought.
+    // The other half of a pair is never pulled back in from among these.
+    const running = new Set(resolved.specs.map((sp) => sp.name))
+    const excluded = new Set(stack.map((e) => e.file).filter((f) => !running.has(f)))
+    // What goes into the graph, each file at the strength it runs at, which
+    // is also what the record says ran.
+    const ran = videoLorasToRun(fam.def, resolved.specs, installed, excluded)
+    return { target, stack, specs: resolved.specs, installed, excluded, ran }
+  }, [rackOf])
 
   const buildGraph = useCallback(
     (fam: VideoFamily, c: Composition, seed: number): ApiWorkflow | null => {
+      // Sent from words, the start-frame-only family would go out with its
+      // LoadImage still holding the placeholder, which ComfyUI refuses.
+      if (fam.needsStartFrame && c.mode !== 'i2v') return null
       const shaped = c.mode === 'i2v' ? deriveImageToVideo(fam.def) : fam.def
       if (!shaped) return null
-      const { target, stack: rack, specs, installed } = resolvedLoras(fam)
-      const chained = specs.length ? chainVideoStack(shaped, specs, installed) : null
+      const { target, stack: rack, specs, installed, excluded } = resolvedLoras(fam)
+      const chained = specs.length ? chainVideoStack(shaped, specs, installed, excluded) : null
       const params = toParams({ ...c, seed }, { negative: defaultsFor(fam.def, fam.model).negative })
       if (c.mode !== 'i2v') delete params.image
       // An add-on without its trigger words runs at a fraction of itself.
@@ -1498,7 +1660,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     [resolvedLoras],
   )
 
-  const blockedReason = useMemo(() => reasonFor(family, composition), [family, composition])
+  const blockedReason = useMemo(
+    () => reasonFor(family, composition, cat?.hardware ?? null),
+    [family, composition, cat],
+  )
 
   /**
    * Queue the clip — or several, with successive seeds.
@@ -1506,41 +1671,72 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
    * Everything is read from the store rather than from this render's props,
    * because `Make another` loads a record into the store and runs in the same
    * tick, before React has re-rendered with it.
+   *
+   * @returns true when at least one clip was queued.
    */
-  const make = useCallback(() => {
-    if (uploading) return
+  const make = useCallback((): boolean => {
+    if (uploading) return false
     const c = store.get()
-    const fam = cat?.families.find((f) => f.def.id === c.familyId) ?? cat?.families[0] ?? null
-    if (!fam || reasonFor(fam, c)) return
+    // The family the desk names and no other. Falling back to the first one
+    // would queue a record's size, length and steps on a model it was never
+    // made with, and file the result under the wrong name. A blank desk has
+    // no family yet, and takes the first.
+    const fam = cat?.families.find((f) => f.def.id === c.familyId) ?? (c.familyId ? null : cat?.families[0]) ?? null
+    if (!fam) {
+      if (cat && c.familyId) {
+        setNotice({
+          kind: 'error',
+          title: 'That style is not installed',
+          body: 'These settings name a style that is no longer on this machine. Choose another style before you run this.',
+        })
+      }
+      return false
+    }
+    const hardware = cat?.hardware ?? null
+    if (reasonFor(fam, c, hardware)) return false
 
     const runs = c.runs ?? 1
     const first = c.seedLocked ? c.seed : randomSeed()
+    const release = clipMemory(fam.def, clipOf(fam, c), hardware).release
 
     for (let i = 0; i < runs; i++) {
       const seed = first + i
-      const snapshot: Composition = { ...c, seed }
+      // A start frame left on the desk after switching to words never reaches
+      // the graph, so it is not carried into the record either; and the rate
+      // is the one the encoder will actually write.
+      const snapshot: Composition = {
+        ...c,
+        seed,
+        fps: fpsOf(fam, c),
+        source: needsSource(c.mode) ? c.source : null,
+      }
       const graph = buildGraph(fam, snapshot, seed)
       if (!graph) {
         setNotice({
           kind: 'error',
           title: 'That shape is not available',
-          body: `${fam.label} cannot take a start frame. Work from words, or choose another style.`,
+          body:
+            fam.needsStartFrame && c.mode !== 'i2v'
+              ? `${fam.label} starts from a picture. Add a start frame.`
+              : `${fam.label} cannot take a start frame. Work from words, or choose another style.`,
         })
-        return
+        return i > 0
       }
-      const chainedSpecs = resolvedLoras(fam).specs
+      const { ran } = resolvedLoras(fam)
       startJob({
         composition: snapshot,
         graph,
         familyLabel: fam.def.label,
         modelLabel: modelLabelOf(fam),
-        loras: chainedSpecs.length ? chainedSpecs.map((s) => ({ name: s.name, strength: s.strength })) : undefined,
+        loras: ran.length ? ran.map((s) => ({ name: s.name, strength: s.strength })) : undefined,
+        release,
       })
     }
 
     store.patch({ seed: first })
     setViewing(null)
     setNotice(null)
+    return true
   }, [cat, uploading, buildGraph, resolvedLoras])
 
   /**
@@ -1549,38 +1745,75 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
    * `Make another` does the same with a fresh seed and then runs.
    *
    * A draft that would be overwritten is never simply lost: the notice offers
-   * both ways out, and the undo is the store's own previous state.
+   * both ways out, and the undo puts back the store's own previous state and
+   * the add-on rack the record replaced.
    */
   const reuse = useCallback(
     (entry: HistoryEntry, run: boolean) => {
+      const fam = cat?.families.find((f) => f.def.id === entry.familyId) ?? null
       const installedModels = cat?.families.map((f) => f.model).filter(Boolean)
+      const priorRack = rackOf(entry.familyId)
       const applied = reuseIntoDesk(entry, {
         freshSeed: run,
         installedModels,
         availableSamplers: cat?.samplers,
         availableSchedulers: cat?.schedulers,
       })
-      // The record carries the add-ons it was made with; put them back on the
-      // rack, a pair folded to one row. Saved under the record's family, which
-      // is the one the store now points at.
-      updateStack(
-        entry.loras?.length
-          ? collapsePairs(entry.loras).map((l) => ({ file: l.name, strength: l.strength, enabled: true }))
-          : [],
-        entry.familyId,
-      )
+      // The record carries the add-ons it ran with; put them back on the rack
+      // so the next clip runs them the same way. Saved under the record's
+      // family, which is the one the store now points at.
+      const def = fam?.def ?? FAMILIES.find((f) => f.id === entry.familyId) ?? null
+      const installed = new Set(libRef.current.all.filter((i) => i.installed).map((i) => i.file))
+      const nextRack: LoraStack = entry.loras?.length
+        ? def
+          ? rackFromRecord(entry.loras, def, installed)
+          : entry.loras.map((l) => ({ file: l.name, strength: l.strength, enabled: true }))
+        : []
+      updateStack(nextRack, entry.familyId)
+
+      // The shared notes say the rack was not carried over, which on this desk
+      // it just was.
+      const notes = applied.notes.filter((n) => n.field !== 'loras').map((n) => n.reason)
+      // A two-model family records no single model file, so its absence has
+      // to be read off the catalogue rather than off the record.
+      const gone = !!cat && !fam
+      if (gone && !applied.notes.some((n) => n.field === 'model')) {
+        notes.unshift(`${entry.familyLabel} is no longer installed. Choose another style before you run this.`)
+      }
+      if (priorRack.length && !sameRack(priorRack, nextRack)) {
+        notes.push(
+          nextRack.length
+            ? 'The add-on rack now holds what this clip used.'
+            : 'The add-ons on the rack were taken off, because this clip used none.',
+        )
+      }
+
       setViewing(null)
-      setReuseNotice(applied.clobbered || applied.notes.length ? { applied, no: entry.no } : null)
-      if (run) make()
-      else promptRef.current?.focus()
+      const ran = run && !gone && !applied.notes.some((n) => n.field === 'model') ? make() : false
+      setReuseNotice(
+        applied.clobbered || notes.length
+          ? {
+              no: entry.no,
+              notes,
+              ran,
+              undo: () => {
+                applied.undo()
+                updateStack(priorRack, entry.familyId)
+              },
+            }
+          : null,
+      )
+      if (!run) promptRef.current?.focus()
     },
-    [cat, make, updateStack],
+    [cat, make, rackOf, updateStack],
   )
 
   // Ctrl/⌘+Enter runs, from inside the prompt too — the one deliberate
   // exception to "every single-key shortcut is dead while a field has focus".
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // A key somebody nearer the event already claimed is not ours.
+      if (e.defaultPrevented) return
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault()
         make()
@@ -1588,6 +1821,12 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       }
       if (isTyping(e) || e.ctrlKey || e.metaKey || e.altKey) return
       if (e.key === 'u') {
+        // The player claims `u` for its frame menu while it has focus or fills
+        // the screen. Both listeners sit on window, and this one is added again
+        // whenever `make` changes, so it can run before the player's and the
+        // claim above cannot be relied on to have been made yet.
+        const active = document.activeElement as HTMLElement | null
+        if (document.fullscreenElement || active?.closest('[data-player]')) return
         e.preventDefault()
         fileInput.current?.click()
       }
@@ -1735,19 +1974,26 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 </p>
               </ExpertField>
 
-              <ExpertField label="Frames per second" id="field-fps">
-                <NumberField
-                  label="Frames per second"
-                  value={fps}
-                  min={1}
-                  max={120}
-                  step={1}
-                  commit={(n) => store.edit({ fps: clamp(n, 1, 120) }, 'fps')}
-                />
-                <p className="mt-1 text-caption italic text-grey-500">
-                  The encoder's frame rate. It changes the pace of the clip, not how long it takes to make.
+              {family.fpsReachesEncoder ? (
+                <ExpertField label="Frames per second" id="field-fps">
+                  <NumberField
+                    label="Frames per second"
+                    value={fps}
+                    min={1}
+                    max={120}
+                    step={1}
+                    commit={(n) => store.edit({ fps: clamp(n, 1, 120) }, 'fps')}
+                  />
+                  <p className="mt-1 text-caption italic text-grey-500">
+                    The encoder's frame rate. It changes the pace of the clip, not how long it takes to make.
+                  </p>
+                </ExpertField>
+              ) : (
+                <p className="mb-3 text-caption italic text-grey-700 tabular-nums" id="field-fps">
+                  Written at {fps} frames per second. This family's recipe does not pass a frame rate to its
+                  encoder, so the rate cannot be changed here.
                 </p>
-              </ExpertField>
+              )}
 
               <div className="grid grid-cols-2 gap-2">
                 <ExpertField label="Width" id="field-width">
@@ -1981,12 +2227,20 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               <div className="mb-5 flex border border-grey-300" role="group" aria-label="Where the clip comes from">
                 {(['t2v', 'i2v'] as const).map((m, i) => {
                   const active = mode === m
-                  const disabled = m === 'i2v' && !family.canStartFromPicture
+                  const disabled =
+                    (m === 'i2v' && !family.canStartFromPicture) || (m === 't2v' && family.needsStartFrame)
                   return (
                     <button
                       key={m}
                       type="button"
                       disabled={disabled}
+                      title={
+                        disabled
+                          ? m === 't2v'
+                            ? `${family.label} starts from a picture.`
+                            : `${family.label} works from words only.`
+                          : undefined
+                      }
                       aria-pressed={active}
                       onClick={() => store.patch({ mode: m })}
                       className={[
@@ -2142,7 +2396,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                     value={family.def.id}
                     onChange={(e) => {
                       const next = cat.families.find((f) => f.def.id === e.target.value)
-                      if (next) store.set(applyDefaults(store.get(), defaultsOf(next)))
+                      if (!next) return
+                      const loaded = applyDefaults(store.get(), defaultsOf(next))
+                      store.set(next.needsStartFrame ? { ...loaded, mode: 'i2v' } : loaded)
                     }}
                   >
                     {cat.families.map((f) => (
@@ -2216,6 +2472,11 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                     </p>
                   )
                 })()}
+                {/* The length and the shape are what decide whether a 14B pair
+                    survives its final decode. A refusal is said under the button. */}
+                {memory?.level === 'caution' && memory.reason ? (
+                  <p className="mt-1 text-caption italic text-grey-700 tabular-nums">{memory.reason}</p>
+                ) : null}
               </div>
 
               {/* The button. It stays live while a clip runs: there is one GPU
@@ -2300,16 +2561,17 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               {reuseNotice ? (
                 <div className="mt-4">
                   <Notice tone="correction" title="Settings loaded">
-                    from No. {reuseNotice.no.toLocaleString('en-GB')}. Nothing has run yet.{' '}
-                    {reuseNotice.applied.notes.map((n) => n.reason).join(' ')}{' '}
+                    from No. {reuseNotice.no.toLocaleString('en-GB')}.{' '}
+                    {reuseNotice.ran ? 'A clip is queued with them, on a new seed.' : 'Nothing has run yet.'}{' '}
+                    {reuseNotice.notes.join(' ')}{' '}
                     <button
                       className="underline"
                       onClick={() => {
-                        reuseNotice.applied.undo()
+                        reuseNotice.undo()
                         setReuseNotice(null)
                       }}
                     >
-                      Undo this
+                      {reuseNotice.ran ? 'Put back what was on the desk' : 'Undo this'}
                     </button>{' '}
                     ·{' '}
                     <button className="underline" onClick={() => setReuseNotice(null)}>

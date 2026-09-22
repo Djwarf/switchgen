@@ -566,7 +566,10 @@ export function recordOf(
     positivePrefix: c.positivePrefix ?? undefined,
     passes: ranAPass ? { ...passes } : undefined,
     loras: result.loras?.length ? result.loras.map((l) => ({ ...l })) : undefined,
-    source: c.source
+    // A picture left on the desk after switching to a mode that does not take
+    // one never reached the graph, so it is not this record's source. Filing
+    // it would print a lineage the result does not have.
+    source: c.source && needsSource(c.mode)
       ? {
           name: c.source.name,
           ref: c.source.ref,
@@ -1072,7 +1075,7 @@ export function compositionFromEntry(entry: HistoryEntry, opts: ReuseOptions = {
     const named = entry.loras.map((l) => `${l.name} at ${l.strength}`)
     notes.push({
       field: 'loras',
-      reason: `Not carried over: ${entry.loras.length === 1 ? 'the LoRA' : `the ${entry.loras.length} LoRAs`} this used. Set the rack to ${sentenceList(named)} before you run this.`,
+      reason: `Not carried over: ${entry.loras.length === 1 ? 'the add-on' : `the ${entry.loras.length} add-ons`} this used. Set the rack to ${sentenceList(named)} before you run this.`,
     })
   }
 
@@ -1168,9 +1171,7 @@ export function adoptSource(
   desk: DeskId,
   opts: { name?: string; frame?: number } = {},
 ): () => void {
-  const target = deskStore(desk)
-  const previous = target.get()
-  const source: SourceRef = {
+  return standBy(desk, {
     // An output of ours is already inside ComfyUI, but LoadImage reads the
     // *input* folder, so the desk uploads it and fills `name` in. Until then
     // the ref is enough to show the well.
@@ -1180,7 +1181,26 @@ export function adoptSource(
     label: entry.file.filename,
     fromEntryId: entry.id,
     fromFrame: opts.frame,
-  }
+  })
+}
+
+/**
+ * Send a frame lifted out of a clip to a desk, leaving the prompt and settings
+ * alone. The player's "Use this frame" verb.
+ *
+ * The frame arrives already uploaded, with its input name filled in, so the
+ * desk has nothing to fetch. It must not go through `adoptSource`: that hands
+ * the desk the clip's own file as the ref, and the desk would upload the whole
+ * clip into LoadImage, which decodes every frame of it.
+ */
+export function adoptFrame(desk: DeskId, source: SourceRef): () => void {
+  return standBy(desk, source)
+}
+
+/** Put a picture in a desk's well and switch the desk to the mode that uses it. */
+function standBy(desk: DeskId, source: SourceRef): () => void {
+  const target = deskStore(desk)
+  const previous = target.get()
   const mode: Mode = desk === 'video' ? 'i2v' : previous.mode === 'edit' ? 'edit' : 'i2i'
   target.set({ ...previous, mode, source })
   return () => target.set(previous)
