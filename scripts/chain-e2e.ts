@@ -13,7 +13,7 @@ import {
 } from '../src/lib/continuation.ts'
 import type { OutputFile } from '../src/lib/comfy.ts'
 
-const COMFY = 'http://127.0.0.1:8188'
+const COMFY = process.env.COMFY_URL ?? 'http://127.0.0.1:8188'
 
 const base = FAMILIES.find(f => f.id === 'wan22-5b')
 if (!base) throw new Error('wan22-5b not in the registry')

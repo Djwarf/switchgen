@@ -98,7 +98,7 @@ import { fileURLToPath } from 'node:url'
 // ---------------------------------------------------------------------------
 
 /** Where the LoRAs live. Matches server/api.mjs and the ComfyUI install. */
-const LORA_DIR = '/mnt/storage/ai/models/Lora'
+const LORA_DIR = process.env.SWITCHGEN_LORA_DIR ?? '/mnt/storage/ai/models/Lora'
 
 /**
  * A tag must appear in this share of training images to be a trigger candidate.

@@ -19,13 +19,14 @@ import crypto from 'node:crypto'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { TOOLS, confine, guardMutation, readBody, send, sse, sseOpen } from './guard.mjs'
 
 const run = promisify(execFile)
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
 const MODELS = process.env.SWITCHGEN_MODELS ?? '/mnt/storage/ai/models'
 const CATALOG = process.env.SWITCHGEN_CATALOG ?? path.join(HERE, 'catalog.json')
-const ARIA2C = process.env.SWITCHGEN_ARIA2C ?? '/usr/bin/aria2c'
+const ARIA2C = TOOLS.aria2c
 const HF_TOKEN_FILE = process.env.HF_TOKEN_FILE ?? path.join(os.homedir(), '.cache/huggingface/token')
 const WEIGHTS = /\.(safetensors|gguf|ckpt|pt|pth|sft|bin)$/i
 
@@ -40,28 +41,6 @@ const RAM_CEILING = 0.85
 const DISK_RESERVE = 8 * GIB
 
 // ---------------------------------------------------------------- helpers ---
-
-function send(res, code, body) {
-  res.statusCode = code
-  res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
-}
-
-/** Resolve `rel` inside `root`, refusing anything that escapes it. */
-function confine(root, rel) {
-  const full = path.resolve(root, String(rel).replace(/^[/\\]+/, ''))
-  const base = path.resolve(root)
-  if (full !== base && !full.startsWith(base + path.sep)) return null
-  return full
-}
-
-async function body(req) {
-  const chunks = []
-  for await (const c of req) chunks.push(c)
-  const raw = Buffer.concat(chunks).toString()
-  if (!raw) return {}
-  try { return JSON.parse(raw) } catch { return null }
-}
 
 /** Sizes for humans: GB once it is really gigabytes, MB below that. */
 const human = n => (n >= GIB ? (n / GIB).toFixed(1) + ' GB' : n >= 1048576 ? Math.round(n / 1048576) + ' MB' : n + ' B')
@@ -334,6 +313,13 @@ function fitVerdict(fam, ann, hw) {
 
 /** id -> live download record. Nothing here ever holds the token. */
 const jobs = new Map()
+/**
+ * Plans in flight. A plan is one POST /api/download, sequential inside itself;
+ * nothing capped how many could run at once, and each spawns aria2c at eight
+ * connections. Two is enough to fetch a family while a LoRA lands.
+ */
+const MAX_ACTIVE_PLANS = 2
+let activePlans = 0
 
 function publicJob(j) {
   return {
@@ -480,18 +466,6 @@ function fetchFile(job, onProgress) {
   })().catch(reject) })
 }
 
-function sseOpen(res) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  })
-}
-function sse(res, event, data) {
-  try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) } catch { /* client gone */ }
-}
-
 /** Run a queue of files through aria2c, streaming SSE for each. */
 async function runPlan(res, queue, familyId, mine = new Set()) {
   const ids = []
@@ -621,7 +595,7 @@ export const downloadsMiddleware = async (req, res, next) => {
         totalBytes: ann.missingBytes,
         alreadyInstalled: ann.files.filter(f => f.installed).map(f => f.filename),
         incomplete: fam.incomplete ?? [],
-        gated: { files: ann.gatedMissing, tokenPresent: !!token, tokenPath: HF_TOKEN_FILE },
+        gated: { files: ann.gatedMissing, tokenPresent: !!token },
         hardware: {
           ramTotal: hw.ramTotal, ramFree: hw.ramFree,
           diskFree: disk?.free ?? null, diskTotal: disk?.total ?? null,
@@ -642,7 +616,8 @@ export const downloadsMiddleware = async (req, res, next) => {
 
     // ---- POST /api/download/cancel ----------------------------------------
     if (p === '/api/download/cancel' && req.method === 'POST') {
-      const b = await body(req)
+      if (!guardMutation(req, res)) return
+      const b = await readBody(req)
       if (!b || typeof b.id !== 'string') return send(res, 400, { error: 'id must be a string' })
       const job = jobs.get(b.id)
       if (!job) return send(res, 404, { error: 'no such download' })
@@ -664,8 +639,12 @@ export const downloadsMiddleware = async (req, res, next) => {
 
     // ---- POST /api/download -----------------------------------------------
     if (p === '/api/download' && req.method === 'POST') {
-      const b = await body(req)
-      if (!b) return send(res, 400, { error: 'body must be JSON' })
+      if (!guardMutation(req, res)) return
+      const b = await readBody(req)
+      if (!b) return send(res, 400, { error: 'body must be JSON under 1 MB' })
+      if (activePlans >= MAX_ACTIVE_PLANS) {
+        return send(res, 429, { error: `${MAX_ACTIVE_PLANS} downloads are already running; wait for one to finish` })
+      }
 
       let queue = []
       let familyId = null
@@ -697,6 +676,22 @@ export const downloadsMiddleware = async (req, res, next) => {
         const cat = await catalog()
         const known = cat.depsByName.get(path.basename(dest))
         queue = [{ filename, dest, url: b.url, sizeBytes: known?.sizeBytes ?? null, gated: !!known?.gated /* never trust the caller: this decides whether a token is attached */ }]
+        // The family path is checked by fitVerdict. A bare URL gets the same
+        // disk check, using the wire size when the catalogue has none, so a
+        // LoRA fetch cannot fill the disk that the next generation needs.
+        const disk = await diskFree(MODELS)
+        let bytes = known?.sizeBytes ?? null
+        if (bytes == null) {
+          const token = queue[0].gated && tokenAllowedFor(b.url) ? await hfToken() : null
+          bytes = (await remoteSize(b.url, token)).size
+        }
+        if (disk && bytes != null && bytes + DISK_RESERVE > disk.free) {
+          return send(res, 409, {
+            error: `The download is ${human(bytes)} but only ${human(disk.free)} of disk is free ` +
+                   `(${human(DISK_RESERVE)} is held back as headroom).`,
+            fits: false,
+          })
+        }
       } else {
         return send(res, 400, { error: 'send {family} or {url, dest, filename}' })
       }
@@ -733,7 +728,12 @@ export const downloadsMiddleware = async (req, res, next) => {
           }
         }
       })
-      await runPlan(res, queue, familyId, mine)
+      activePlans += 1
+      try {
+        await runPlan(res, queue, familyId, mine)
+      } finally {
+        activePlans -= 1
+      }
       return
     }
 

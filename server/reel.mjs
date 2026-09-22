@@ -24,12 +24,13 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { TOOLS, confineReal, guardMutation, readBody, send, sse, sseOpen } from './guard.mjs'
 
 const run = promisify(execFile)
 
 const OUTPUTS = process.env.SWITCHGEN_OUTPUTS ?? '/mnt/storage/ai/outputs'
-const FFMPEG = process.env.SWITCHGEN_FFMPEG ?? '/usr/bin/ffmpeg'
-const FFPROBE = process.env.SWITCHGEN_FFPROBE ?? '/usr/bin/ffprobe'
+const FFMPEG = TOOLS.ffmpeg
+const FFPROBE = TOOLS.ffprobe
 
 /** Containers we will read. Anything else is refused before ffmpeg is spawned. */
 const VIDEO = /\.(webm|mp4|mkv|mov|m4v)$/i
@@ -53,79 +54,6 @@ const PROBE_MS = 20000
 const CONTROL = /[\u0000-\u001f\u007f]/
 
 // ------------------------------------------------------------------ plumbing
-
-function send(res, code, body) {
-  res.statusCode = code
-  res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
-}
-
-/** Resolve `rel` inside `root`, refusing anything that escapes it lexically. */
-function confine(root, rel) {
-  const full = path.resolve(root, String(rel).replace(/^[/\\]+/, ''))
-  const base = path.resolve(root)
-  if (full !== base && !full.startsWith(base + path.sep)) return null
-  return full
-}
-
-/**
- * Confinement that survives symlinks. `confine` alone is lexical: a link inside
- * the outputs tree pointing at /etc passes it.
- *
- * Resolving only the leaf is not enough either. A path whose leaf does not
- * exist yet, which is every `prefix` the first time a folder is used, cannot be
- * realpath'd at all, and returning the lexical path there would let
- * `outputs/link-to-etc/new/reel` through to mkdir. So this walks up to the
- * nearest component that does exist, resolves that for real, re-checks it
- * against the root, and re-attaches the components below it.
- */
-async function confineReal(root, rel) {
-  const base = path.resolve(root)
-  const full = confine(base, rel)
-  if (!full) return null
-  let head = full
-  const tail = []
-  for (;;) {
-    let real
-    try {
-      real = await fs.realpath(head)
-    } catch {
-      const parent = path.dirname(head)
-      if (parent === head) return null
-      tail.unshift(path.basename(head))
-      head = parent
-      continue
-    }
-    const back = confine(base, path.relative(base, real))
-    if (!back) return null
-    return tail.length ? path.join(back, ...tail) : back
-  }
-}
-
-async function readBody(req) {
-  const chunks = []
-  let size = 0
-  for await (const c of req) {
-    size += c.length
-    if (size > 1048576) return null
-    chunks.push(c)
-  }
-  const raw = Buffer.concat(chunks).toString()
-  if (!raw) return {}
-  try { return JSON.parse(raw) } catch { return null }
-}
-
-function sseOpen(res) {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  })
-}
-function sse(res, event, data) {
-  try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) } catch { /* client gone */ }
-}
 
 /** "24/1" into a usable pair. Rationals stay exact; ffmpeg wants them that way. */
 function rational(s) {
@@ -676,6 +604,7 @@ export function switchgenReel() {
       }
 
       if (url.pathname === '/api/reel/stitch' && req.method === 'POST') {
+        if (!guardMutation(req, res)) return
         return await stitch(req, res, url)
       }
 

@@ -13,6 +13,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { confineReal, guardMutation, readBody, send, tools } from './guard.mjs'
 
 const run = promisify(execFile)
 
@@ -22,44 +23,6 @@ const WEIGHTS = /\.(safetensors|gguf|ckpt|pt|pth|sft|bin)$/i
 
 /** Longest a probe of the machine may hang before we give up on it. */
 const PROBE_MS = 5000
-
-/** Resolve `rel` inside `root`, refusing anything that escapes it lexically. */
-function confine(root, rel) {
-  const full = path.resolve(root, String(rel).replace(/^[/\\]+/, ''))
-  const base = path.resolve(root)
-  if (full !== base && !full.startsWith(base + path.sep)) return null
-  return full
-}
-
-/**
- * Confinement that survives symlinks. `confine` alone is lexical: a link inside
- * a root pointing at /etc passes it, and `fs.unlink` follows links. This walks
- * up to the nearest component that actually exists, resolves that for real, and
- * re-checks, so a missing leaf cannot skip the check on the directories above
- * it either.
- */
-async function confineReal(root, rel) {
-  const base = path.resolve(root)
-  const full = confine(base, rel)
-  if (!full) return null
-  let head = full
-  const tail = []
-  for (;;) {
-    let real
-    try {
-      real = await fs.realpath(head)
-    } catch {
-      const parent = path.dirname(head)
-      if (parent === head) return null
-      tail.unshift(path.basename(head))
-      head = parent
-      continue
-    }
-    const back = confine(base, path.relative(base, real))
-    if (!back) return null
-    return tail.length ? path.join(back, ...tail) : back
-  }
-}
 
 async function walk(dir, root = dir, out = []) {
   let entries
@@ -103,7 +66,6 @@ async function diskFree(dir) {
     return { free: avail, total: size }
   } catch { return null }
 }
-
 
 /** Per-core CPU busy fraction, from the delta between two samples. */
 let lastCpu = null
@@ -164,26 +126,6 @@ async function snapshot() {
   }
 }
 
-function send(res, code, body) {
-  res.statusCode = code
-  res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
-}
-
-/** Read a JSON body with a cap, so a request cannot buffer the box to death. */
-async function readBody(req, limit = 1048576) {
-  const chunks = []
-  let size = 0
-  for await (const c of req) {
-    size += c.length
-    if (size > limit) return null
-    chunks.push(c)
-  }
-  const raw = Buffer.concat(chunks).toString()
-  if (!raw.trim()) return {}
-  try { return JSON.parse(raw) } catch { return null }
-}
-
 /**
  * What this server can do, for a client deciding whether to offer a feature.
  *
@@ -193,19 +135,25 @@ async function readBody(req, limit = 1048576) {
  * on every page load while POST /api/delete sat there working. This is the real
  * answer to that question.
  *
- * `downloads` and `stitch` are served by switchgenDownloads() and
- * switchgenReel(), which are registered alongside this plugin in
- * vite.config.ts. They ship and mount as one set, so if this endpoint answers
- * at all, those two are mounted.
+ * `downloads` and `stitch` used to be declared true on the grounds that
+ * switchgenDownloads() and switchgenReel() are mounted alongside this plugin.
+ * Mounted is not the same as working: those two spawn aria2c and ffmpeg, and a
+ * machine without them answered "yes" to a question it had never asked. Each
+ * is now the result of running the binary, cached for a minute in guard.mjs.
  */
-const CAPABILITIES = {
-  server: 'switchgen',
-  deleteFiles: true,
-  stitch: true,
-  downloads: true,
-  models: true,
-  hardware: true,
-  hardwareStream: true,
+async function capabilities() {
+  const t = await tools()
+  return {
+    server: 'switchgen',
+    deleteFiles: true,
+    stitch: !!(t.ffmpeg && t.ffprobe),
+    downloads: !!t.aria2c,
+    models: true,
+    hardware: true,
+    hardwareStream: true,
+    gpu: t.gpu,
+    tools: { aria2c: t.aria2c, ffmpeg: t.ffmpeg, ffprobe: t.ffprobe },
+  }
 }
 
 /** Paths this middleware owns. Anything else under /api/ belongs elsewhere. */
@@ -226,7 +174,7 @@ export function switchgenApi() {
 
     try {
       if (url.pathname === '/api/capabilities' && req.method === 'GET') {
-        return send(res, 200, { ...CAPABILITIES, roots: { models: MODELS, outputs: OUTPUTS } })
+        return send(res, 200, { ...(await capabilities()), roots: { models: MODELS, outputs: OUTPUTS } })
       }
 
       if (url.pathname === '/api/hardware' && req.method === 'GET') {
@@ -290,6 +238,7 @@ export function switchgenApi() {
       // Deleting a model or an output is destructive, so it is POST-with-intent
       // rather than a bare DELETE that a stray prefetch could trigger.
       if (url.pathname === '/api/delete' && req.method === 'POST') {
+        if (!guardMutation(req, res)) return
         const b = await readBody(req)
         if (!b) return send(res, 400, { error: 'body must be JSON under 1 MB' })
         const { kind, rel } = b

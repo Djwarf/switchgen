@@ -16,6 +16,7 @@
  */
 import { useState } from 'react'
 
+import { useServerCapabilities } from '../../lib/capabilities'
 import { fileUrl, relPath, type OutputFile } from '../../lib/comfy'
 import { Head, Kicker, Quiet, duration, grouped, seconds } from './bits'
 
@@ -50,6 +51,9 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
   const [cutting, setCutting] = useState(false)
   const [cut, setCut] = useState<Cut | null>(null)
   const [failed, setFailed] = useState<string | null>(null)
+  const caps = useServerCapabilities()
+  /** Null until the server answers; false when ffmpeg is not there to run. */
+  const canCut = caps === null ? null : caps.stitch
 
   if (!clips.length) return null
 
@@ -102,10 +106,17 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
       />
 
       <div className="mb-5 flex flex-wrap items-baseline gap-x-4 gap-y-2 border-b border-grey-300 pb-4">
-        <button type="button" className="press" disabled={cutting} onClick={make}>
-          {cutting ? 'Cutting' : 'Cut the reel'}
-        </button>
-        {cut ? (
+        {canCut === false ? (
+          <p className="text-caption italic text-grey-500">
+            ffmpeg is not on the server, so the reel cannot be joined here. The command below still
+            works anywhere it is.
+          </p>
+        ) : (
+          <button type="button" className="press" disabled={cutting || canCut === null} onClick={make}>
+            {cutting ? 'Cutting' : 'Cut the reel'}
+          </button>
+        )}
+        {canCut === false ? null : cut ? (
           <p className="text-caption text-grey-700">
             <a className="sg-link" href={`/comfy/view?filename=${encodeURIComponent(cut.out.split('/').pop() ?? '')}&subfolder=${encodeURIComponent(cut.out.split('/').slice(0, -1).join('/'))}&type=output`} target="_blank" rel="noreferrer">
               {cut.out}

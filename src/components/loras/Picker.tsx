@@ -28,6 +28,7 @@ import {
   type LoraLibrary,
   type LoraTarget,
 } from '../../lib/loras'
+import { useServerCapabilities } from '../../lib/capabilities'
 import { Badge, Kicker, Meter, RING, Tap } from './bits'
 
 type Job = { progress: FetchProgress; abort: AbortController }
@@ -54,6 +55,9 @@ export function Picker({
   const [installedOnly, setInstalledOnly] = useState(false)
   const [jobs, setJobs] = useState<Record<string, Job>>({})
   const search = useRef<HTMLInputElement | null>(null)
+  const caps = useServerCapabilities()
+  /** False once the server has said aria2c is not there to run. */
+  const canFetch = caps === null ? true : caps.downloads
 
   // The picker opens because the user asked for it, so the caret belongs in
   // the search field: seventy four rows is a list you type at, not scroll.
@@ -178,6 +182,13 @@ export function Picker({
         </p>
       ) : null}
 
+      {!canFetch ? (
+        <p className="mt-2 text-caption italic text-warning">
+          aria2c is not on the server, so nothing can be fetched from here. Files already on disk
+          can still be added.
+        </p>
+      ) : null}
+
       {!rows.length ? (
         <p className="mt-3 text-caption italic text-grey-700">
           Nothing matches. Clear the search, or turn off the filters above to see what was hidden.
@@ -244,7 +255,7 @@ export function Picker({
                         ) : job && (job.progress.state === 'starting' || job.progress.state === 'downloading') ? (
                           <Tap onClick={() => job.abort.abort()}>stop</Tap>
                         ) : (
-                          <Tap onClick={() => fetchOne(info)} disabled={!info.url}>
+                          <Tap onClick={() => fetchOne(info)} disabled={!info.url || !canFetch}>
                             fetch
                           </Tap>
                         )}

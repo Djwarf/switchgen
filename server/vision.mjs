@@ -68,6 +68,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { confineReal, guardMutation, readBody, send } from './guard.mjs'
 
 const MODELS = process.env.SWITCHGEN_MODELS ?? '/mnt/storage/ai/models'
 const OUTPUTS = process.env.SWITCHGEN_OUTPUTS ?? '/mnt/storage/ai/outputs'
@@ -133,61 +134,6 @@ const RUN_MS = 120000
 // ---------------------------------------------------------------------------
 // Helpers, matching server/api.mjs
 // ---------------------------------------------------------------------------
-
-function send(res, code, body) {
-  res.statusCode = code
-  res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
-}
-
-/** Resolve `rel` inside `root`, refusing anything that escapes it lexically. */
-function confine(root, rel) {
-  const full = path.resolve(root, String(rel).replace(/^[/\\]+/, ''))
-  const base = path.resolve(root)
-  if (full !== base && !full.startsWith(base + path.sep)) return null
-  return full
-}
-
-/**
- * Confinement that survives symlinks, as in api.mjs. `confine` alone is
- * lexical: a link inside a root pointing at /etc passes it, and everything
- * downstream of here opens the file for real.
- */
-async function confineReal(root, rel) {
-  const base = path.resolve(root)
-  const full = confine(base, rel)
-  if (!full) return null
-  let head = full
-  const tail = []
-  for (;;) {
-    let real
-    try {
-      real = await fs.realpath(head)
-    } catch {
-      const parent = path.dirname(head)
-      if (parent === head) return null
-      tail.unshift(path.basename(head))
-      head = parent
-      continue
-    }
-    const back = confine(base, path.relative(base, real))
-    if (!back) return null
-    return tail.length ? path.join(back, ...tail) : back
-  }
-}
-
-async function readBody(req, limit = 1048576) {
-  const chunks = []
-  let size = 0
-  for await (const c of req) {
-    size += c.length
-    if (size > limit) return null
-    chunks.push(c)
-  }
-  const raw = Buffer.concat(chunks).toString()
-  if (!raw.trim()) return {}
-  try { return JSON.parse(raw) } catch { return null }
-}
 
 async function readBytes(req, limit) {
   const chunks = []
@@ -549,6 +495,7 @@ export const visionMiddleware = async (req, res, next) => {
     const wantsDetect = p === '/api/vision/detect' || p === '/api/vision/inspect'
 
     if ((wantsTag || wantsDetect) && req.method === 'POST') {
+      if (!guardMutation(req, res, ['application/json', 'image/', 'application/octet-stream'])) return
       const caps = await capabilities()
       if (wantsTag && !caps.tagger) {
         return send(res, 503, { error: caps.reason, install: caps.install, tagger: false })

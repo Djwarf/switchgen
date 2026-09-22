@@ -23,6 +23,7 @@ import {
   type MouseEvent,
 } from 'react'
 import { fileUrl, relPath } from '../lib/comfy'
+import { serverCapabilities } from '../lib/capabilities'
 import {
   all,
   checkMissing,
@@ -85,33 +86,14 @@ const PAGE = 120
 // ---------------------------------------------------------------------------
 
 /**
- * Is the local API mounted?
+ * Whether the local server will delete a file on request.
  *
- * It has to be probed with a route that exists. A path the SwitchGen
- * middleware does not recognise is handed straight back to Vite, which serves
- * index.html for it, so an invented /api/* path answers `200 text/html` on the
- * dev server and on a bare static host alike and tells us nothing.
- *
- * `GET /api/hardware` is answered by the same middleware that answers
- * `POST /api/delete`, so a JSON body from it is proof the delete route is
- * there. It is a read, so probing it cannot change anything.
+ * Asked of /api/capabilities, which probes rather than assumes. Without the
+ * SwitchGen middleware (a static host, say) the answer is false and the
+ * archive offers to remove the record only, which is the honest offer.
  */
-let deleteCapability: boolean | null = null
 async function probeDeleteCapability(): Promise<boolean> {
-  if (deleteCapability !== null) return deleteCapability
-  try {
-    const res = await fetch('/api/hardware', { headers: { Accept: 'application/json' } })
-    const type = res.headers.get('content-type') ?? ''
-    if (!res.ok || !type.includes('json')) {
-      deleteCapability = false
-    } else {
-      const body = (await res.json().catch(() => null)) as unknown
-      deleteCapability = typeof body === 'object' && body !== null
-    }
-  } catch {
-    deleteCapability = false
-  }
-  return deleteCapability
+  return (await serverCapabilities()).deleteFiles
 }
 
 /** ComfyUI's /view sets no Content-Disposition, so a plain link would open it. */
@@ -216,7 +198,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const [pendingDelete, setPendingDelete] = useState<HistoryEntry[] | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
-  const [canDeleteFiles, setCanDeleteFiles] = useState(deleteCapability ?? false)
+  const [canDeleteFiles, setCanDeleteFiles] = useState(false)
   const [checking, setChecking] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>('at')
   const [ascending, setAscending] = useState(false)
@@ -479,10 +461,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     const failed = outcome.filter((o) => !o.result.ok)
     const gone = outcome.length - failed.length
     const unsupported = failed.some((o) => !o.result.ok && o.result.unsupported)
-    if (unsupported) {
-      deleteCapability = false
-      setCanDeleteFiles(false)
-    }
+    if (unsupported) setCanDeleteFiles(false)
 
     if (failed.length) {
       const first = failed[0].result
