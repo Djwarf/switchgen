@@ -47,21 +47,22 @@ import {
   useState,
   useSyncExternalStore,
   type DragEvent as ReactDragEvent,
-  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react'
+import { useHoldToConfirm } from '../components/shell/hotkeys'
+import { onPlanLanded } from '../lib/downloads'
 
 import {
   cancelJob,
   connect,
   fileUrl,
-  getJob,
   listJobs,
   objectInfo,
   run,
   systemStats,
   uploadImage,
   watchConnection,
+  VIDEO_EXT,
   type ApiWorkflow,
   type ConnectionState,
   type FileRef,
@@ -77,6 +78,7 @@ import {
 } from '../lib/workflows'
 
 import {
+  feasibility,
   gb,
   modelFiles,
   probeHardware,
@@ -245,9 +247,6 @@ function stageOf(graph: ApiWorkflow, nodeId: string | null): string {
 
 const I2V_LOAD = '__i2v_load'
 
-/** Containers that only ever hold a clip. Animated WEBP and GIF can be stills too, so they are left out. */
-const CLIP_FILE = /\.(webm|mp4|mkv|avi|mov)$/i
-
 /** Latent nodes that accept a first frame. Both take an IMAGE link. */
 const START_FRAME_NODES = ['Wan22ImageToVideoLatent', 'WanImageToVideo']
 
@@ -366,14 +365,62 @@ export type VideoFamily = {
 }
 
 type Catalogue = {
+  /**
+   * Families whose every file is installed. Whether the machine can hold one
+   * is a question of memory, which moves, so it is asked of a fresh reading
+   * by {@link priced} rather than settled here.
+   */
   families: VideoFamily[]
   /** Families with a recipe but a missing file, so the absence is explicable. */
   blocked: { label: string; why: string }[]
   samplers: string[]
   schedulers: string[]
-  hardware: Hardware | null
-  vramFree: number | null
+  /** Weight files on disk and their sizes, for pricing a family against a reading. */
+  sizes: Map<string, ModelFile>
+  /** The reading taken with the catalogue. The desk takes fresher ones. */
+  machine: Machine
 }
+
+/** One reading of the machine's memory, and when it was taken. */
+type Machine = {
+  hardware: Hardware | null
+  /** Free VRAM as ComfyUI reports it, or nvidia-smi's figure when ComfyUI gave none. */
+  vramFree: number | null
+  at: number
+}
+
+async function readMachine(): Promise<Machine> {
+  const [hardware, stats] = await Promise.all([
+    probeHardware().catch(() => null),
+    systemStats().catch(() => null),
+  ])
+  const devices = (stats as { devices?: { vram_free?: number }[] } | null)?.devices
+  const vramFree = Array.isArray(devices) && typeof devices[0]?.vram_free === 'number'
+    ? devices[0].vram_free
+    : (hardware?.gpu?.vramFree ?? null)
+  return { hardware, vramFree, at: Date.now() }
+}
+
+/**
+ * The families this machine can hold, each with its memory verdict, priced
+ * against one reading. A family the machine cannot hold at all is moved to
+ * the blocked list with the verdict's own sentence. Without a reading nothing
+ * is priced, as availabilityOf does.
+ */
+function priced(cat: Catalogue, hardware: Hardware | null): Pick<Catalogue, 'families' | 'blocked'> {
+  if (!hardware) return cat
+  const families: VideoFamily[] = []
+  const blocked = [...cat.blocked]
+  for (const family of cat.families) {
+    const verdict = feasibility(family.def, cat.sizes, hardware)
+    if (verdict.selectable) families.push({ ...family, verdict })
+    else blocked.push({ label: family.def.label, why: verdict.reason })
+  }
+  return { families, blocked }
+}
+
+/** `14:05`, for saying when a figure was measured. */
+const clock = (at: number) => new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
 
 function readSpec(info: Record<string, unknown>, cls: string | null, field: string, fallback: NumSpec): NumSpec {
   if (!cls) return fallback
@@ -389,11 +436,10 @@ function readSpec(info: Record<string, unknown>, cls: string | null, field: stri
 }
 
 async function loadCatalogue(): Promise<Catalogue> {
-  const [info, hardware, sizes, stats] = await Promise.all([
+  const [info, sizes, machine] = await Promise.all([
     objectInfo(),
-    probeHardware().catch(() => null),
     modelFiles().catch(() => new Map<string, ModelFile>()),
-    systemStats().catch(() => null),
+    readMachine(),
   ])
 
   const inv = inventoryFrom(info)
@@ -405,12 +451,12 @@ async function loadCatalogue(): Promise<Catalogue> {
   for (const def of FAMILIES) {
     if (def.mode !== 'video') continue
 
-    const avail = availabilityOf(def, inv, hardware, sizes)
+    // Files only. Memory is priced against the desk's latest reading.
+    const avail = availabilityOf(def, inv, null, sizes)
     if (!avail.ok) {
       blocked.push({ label: def.label, why: avail.why })
       continue
     }
-    const verdict = avail.verdict
 
     const model = def.dualModel ? '' : (def.models.find((m) => weights.has(m)) ?? def.models[0] ?? '')
 
@@ -420,7 +466,7 @@ async function loadCatalogue(): Promise<Catalogue> {
       def,
       model,
       label: def.label,
-      verdict,
+      verdict: null,
       canStartFromPicture: deriveImageToVideo(def) !== null,
       needsStartFrame: !!def.bindings.image,
       fpsReachesEncoder: encoder.bound,
@@ -431,32 +477,34 @@ async function loadCatalogue(): Promise<Catalogue> {
     })
   }
 
-  const devices = (stats as { devices?: { vram_free?: number }[] } | null)?.devices
-  const vramFree = Array.isArray(devices) && typeof devices[0]?.vram_free === 'number'
-    ? devices[0].vram_free
-    : (hardware?.gpu?.vramFree ?? null)
-
   return {
     families,
     blocked,
     samplers: inv.samplers,
     schedulers: inv.schedulers,
-    hardware,
-    vramFree,
+    sizes,
+    machine,
   }
 }
 
 let cataloguePromise: Promise<Catalogue> | null = null
 
-/**
- * Read once per page load, not once per visit to the desk. A failed read is
- * forgotten, so the retry is a real retry and not the same rejected promise.
- */
 /** Forget the cached catalogue, so the next read sees files that just landed. */
 export function resetCatalogue(): void {
   cataloguePromise = null
 }
 
+// A family fetched from the catalogue can land while the reader is in another
+// room, or with the margin that holds the catalogue panel closed. The kept
+// reading is dropped here so the next visit reads what is installed now; the
+// desk on screen hears of it through its own listener.
+onPlanLanded(() => resetCatalogue())
+
+/**
+ * What is installed is read once per page load, not once per visit to the
+ * desk. Memory is not: see the reading in the desk. A failed read is
+ * forgotten, so the retry is a real retry and not the same rejected promise.
+ */
 function catalogue(): Promise<Catalogue> {
   if (!cataloguePromise) {
     cataloguePromise = loadCatalogue().catch((err: unknown) => {
@@ -668,10 +716,6 @@ export type VideoJob = {
   /** Position in ComfyUI's own queue; 0 means it is the one running. */
   queuePos: number | null
   cancelRequested: boolean
-  sighted: boolean
-  misses: number
-  /** Polls on which the server said the job had ended while no event came. */
-  terminalWaits: number
   /** True when ComfyUI releases its cached models before this clip runs. */
   release: boolean
 }
@@ -780,9 +824,6 @@ function startJob(opts: StartOptions): string {
     fps: opts.composition.fps ?? 0,
     queuePos: null,
     cancelRequested: false,
-    sighted: false,
-    misses: 0,
-    terminalWaits: 0,
     release: !!opts.release,
   }
   jobs = [job, ...jobs]
@@ -864,14 +905,31 @@ function startJob(opts: StartOptions): string {
     .catch((err: unknown) => {
       // The same classification the Pictures desk uses, so a clip that failed
       // on a bad frame names the node instead of saying something went wrong.
+      // run() rejects with a lost job itself when ComfyUI no longer knows the
+      // prompt, having first looked in /history for a clip that finished.
       const f = faultOf(err)
+      // A job the reader stopped and ComfyUI then forgot was stopped, not
+      // lost: a dequeued prompt leaves no record, and blaming a restart for
+      // the reader's own stop would be false.
+      if (f.lost && jobById(id)?.cancelRequested) {
+        patchJob(id, {
+          status: 'cancelled',
+          error: null,
+          fault: { ...f, lost: false, cancelled: true },
+          finishedAt: Date.now(),
+          previewUrl: null,
+          stage: 'Stopped',
+          queuePos: null,
+        })
+        return
+      }
       patchJob(id, {
         status: f.cancelled ? 'cancelled' : 'error',
         error: f.message || 'Something went wrong.',
         fault: f,
         finishedAt: Date.now(),
         previewUrl: null,
-        stage: f.cancelled ? 'Stopped' : 'Failed',
+        stage: f.cancelled ? 'Stopped' : f.lost ? 'Lost' : 'Failed',
         queuePos: null,
       })
     })
@@ -879,13 +937,15 @@ function startJob(opts: StartOptions): string {
   return id
 }
 
-/** Polls to wait for a socket event the server says has already happened. */
-const LOST_TERMINAL_WAITS = 3
-
 /**
- * Reconcile against ComfyUI's own queue every five seconds, so a job that the
- * server has forgotten is reported rather than spinning forever, and so the
- * desk can say honestly how many clips are ahead of this one.
+ * Read ComfyUI's own queue every five seconds while a clip is unfinished, so
+ * the desk can say honestly how many clips are ahead of this one.
+ *
+ * Finding a job the server has forgotten is not done here. run() follows every
+ * prompt it queued for that itself, settles one that finished from its
+ * /history record so the clip is still filed, and rejects with a lost job when
+ * there is no record at all, which the catch in startJob reports. A second
+ * watch here raced it and called a finished clip lost.
  */
 function managePoll(): void {
   const live = jobs.some(unfinished)
@@ -897,8 +957,7 @@ function managePoll(): void {
 }
 
 async function reconcile(): Promise<void> {
-  const watching = jobs.filter(unfinished)
-  if (!watching.length) return
+  if (!jobs.some(unfinished)) return
 
   let ids: string[]
   try {
@@ -908,51 +967,12 @@ async function reconcile(): Promise<void> {
     return // the connection notice covers an unreachable server
   }
 
-  for (const job of watching) {
+  // Read again after the await: a job may have settled while the list was on
+  // its way, and its place in line is then nobody's business.
+  for (const job of jobs.filter(unfinished)) {
     if (!job.promptId) continue
     const at = ids.indexOf(job.promptId)
-    if (at >= 0) {
-      patchJob(job.id, { queuePos: at, sighted: true, misses: 0 })
-      continue
-    }
-    if (!job.sighted && Date.now() - job.startedAt < 20_000) continue
-
-    const misses = job.misses + 1
-    if (misses < 2) {
-      patchJob(job.id, { misses })
-      continue
-    }
-    const server = await getJob(job.promptId).catch(() => null)
-    if (server && (server.status === 'completed' || server.status === 'failed' || server.status === 'cancelled')) {
-      // The terminal socket event is the authority, so it gets a few more
-      // cycles to arrive. Not forever: comfy.ts looks for a missed event once,
-      // when the socket reopens, and if that one look fails nothing looks
-      // again, so the card would run its stopwatch for as long as the page
-      // stays open.
-      const waits = job.terminalWaits + 1
-      if (waits < LOST_TERMINAL_WAITS) {
-        patchJob(job.id, { misses: 0, sighted: true, terminalWaits: waits })
-        continue
-      }
-      if (jobById(job.id)?.status === 'done') continue
-      patchJob(job.id, {
-        status: 'error',
-        error: 'ComfyUI says this job has ended but never sent the result. Look in the archive: the clip may be on disk anyway.',
-        finishedAt: Date.now(),
-        stage: 'Lost',
-        queuePos: null,
-      })
-      continue
-    }
-    if (jobById(job.id)?.status === 'done') continue
-    patchJob(job.id, {
-      status: 'error',
-      error:
-        'We lost track of this job. ComfyUI no longer lists it. Check the archive. It may have finished anyway.',
-      finishedAt: Date.now(),
-      stage: 'Lost',
-      queuePos: null,
-    })
+    if (at >= 0 && at !== job.queuePos) patchJob(job.id, { queuePos: at })
   }
 }
 
@@ -972,55 +992,6 @@ function useNow(active: boolean): number {
   return now
 }
 
-/** Hold to confirm. A mis-click must not destroy four minutes of GPU time. */
-function useHold(onConfirm: () => void, ms = 600) {
-  const [progress, setProgress] = useState(0)
-  const frame = useRef<number | null>(null)
-  const start = useRef(0)
-
-  const stop = useCallback(() => {
-    if (frame.current !== null) cancelAnimationFrame(frame.current)
-    frame.current = null
-    setProgress(0)
-  }, [])
-
-  const begin = useCallback(() => {
-    if (frame.current !== null) return
-    start.current = performance.now()
-    const tick = () => {
-      const p = clamp((performance.now() - start.current) / ms, 0, 1)
-      setProgress(p)
-      if (p >= 1) {
-        stop()
-        onConfirm()
-        return
-      }
-      frame.current = requestAnimationFrame(tick)
-    }
-    frame.current = requestAnimationFrame(tick)
-  }, [ms, onConfirm, stop])
-
-  useEffect(() => stop, [stop])
-
-  return {
-    progress,
-    handlers: {
-      onPointerDown: begin,
-      onPointerUp: stop,
-      onPointerLeave: stop,
-      onPointerCancel: stop,
-      onKeyDown: (e: ReactKeyboardEvent) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          begin()
-        }
-      },
-      onKeyUp: stop,
-      onBlur: stop,
-    },
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Presentational pieces
 // ---------------------------------------------------------------------------
@@ -1038,28 +1009,37 @@ function Head({ title, children }: { title: string; children?: ReactNode }) {
  * Stopping a clip takes a deliberate 600 ms hold with a burgundy wipe. A
  * mis-click must never destroy four minutes of GPU time, and the wipe shows
  * the reader exactly how much of the hold is left.
+ *
+ * The hold is the shell's own, so it behaves as every other stop does: a key
+ * held past the hold does not start another through auto-repeat, and a screen
+ * reader, which presses with a bare click and can never hold, arms the stop
+ * and confirms it with a second press.
  */
 function HoldToStop({ jobId, label = 'Hold to stop' }: { jobId: string; label?: string }) {
-  const stop = useCallback(() => {
+  const hold = useHoldToConfirm(() => {
     void stopJob(jobId)
-  }, [jobId])
-  const hold = useHold(stop, 600)
+  }, 600)
   return (
-    <button
-      type="button"
-      {...hold.handlers}
-      aria-label="Hold to stop this clip"
-      className={`sg-hold relative block w-full overflow-hidden border border-burgundy-900 px-4 py-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] text-burgundy-900 ${RING}`}
-    >
-      <span
-        aria-hidden
-        className="absolute inset-y-0 left-0 bg-burgundy-900"
-        style={{ width: `${Math.round(hold.progress * 100)}%` }}
-      />
-      <span className="relative" style={{ color: hold.progress > 0.5 ? 'var(--color-newsprint)' : undefined }}>
-        {label}
-      </span>
-    </button>
+    <>
+      <button
+        type="button"
+        {...hold.bind}
+        aria-label={hold.armed ? 'Press again to stop this clip' : 'Hold to stop this clip'}
+        className={`sg-hold relative block w-full overflow-hidden border border-burgundy-900 px-4 py-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] text-burgundy-900 ${RING}`}
+      >
+        <span
+          aria-hidden
+          className="absolute inset-y-0 left-0 bg-burgundy-900"
+          style={{ width: `${Math.round(hold.progress * 100)}%` }}
+        />
+        <span className="relative" style={{ color: hold.progress > 0.5 ? 'var(--color-newsprint)' : undefined }}>
+          {hold.armed ? 'Press again to stop' : label}
+        </span>
+      </button>
+      <p aria-live="polite" className="sr-only">
+        {hold.armed ? 'Stop armed. Press the button again within three seconds to stop the clip.' : ''}
+      </p>
+    </>
   )
 }
 
@@ -1218,7 +1198,7 @@ function reasonFor(family: VideoFamily | null, c: Composition, hardware: Hardwar
   if (c.mode === 'i2v' && !family.canStartFromPicture) return `${family.label} works from words only.`
   if (c.mode === 'i2v' && !c.source?.name) return 'Add a start frame, or work from words.'
   // Uploaded by an older player, which sent the whole clip rather than a frame.
-  if (c.mode === 'i2v' && c.source && CLIP_FILE.test(c.source.name)) {
+  if (c.mode === 'i2v' && c.source && VIDEO_EXT.test(c.source.name)) {
     return 'The start frame is a whole clip, not one frame of it. Clear it and use one frame.'
   }
   return null
@@ -1302,12 +1282,50 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     }
   }, [attempt])
 
+  // The margin's catalogue panel says when a fetch lands, but only while it
+  // is open. A family that lands with it closed is heard of here.
+  useEffect(() => onPlanLanded(() => setAttempt((a) => a + 1)), [])
+
   useEffect(() => watchConnection(setConnection), [])
 
+  // --- free memory, read afresh -------------------------------------------
+  /**
+   * The catalogue is read once per page load, and the page is an installed app
+   * that stays open for hours. Its memory reading went stale with it: the
+   * verdicts compared the weights against what was free when the tab was
+   * opened, and the margin called that figure free "right now". So memory is
+   * read again on every visit to the desk, whenever the page comes back into
+   * view, and after every clip, which is when the most memory changes hands.
+   * A reading that fails keeps the last good one, and its time.
+   */
+  const [freshMachine, setFreshMachine] = useState<Machine | null>(null)
+  const [machineAsk, setMachineAsk] = useState(0)
+  const lastEnded = useMemo(() => allJobs.reduce((t, j) => Math.max(t, j.finishedAt ?? 0), 0), [allJobs])
+  useEffect(() => {
+    let alive = true
+    void readMachine().then((m) => {
+      if (alive && m.hardware) setFreshMachine(m)
+    })
+    return () => {
+      alive = false
+    }
+  }, [machineAsk, lastEnded])
+  useEffect(() => {
+    const onShow = () => {
+      if (document.visibilityState === 'visible') setMachineAsk((n) => n + 1)
+    }
+    document.addEventListener('visibilitychange', onShow)
+    return () => document.removeEventListener('visibilitychange', onShow)
+  }, [])
+  const machine = freshMachine ?? cat?.machine ?? null
+  const hardware = machine?.hardware ?? null
+  const offer = useMemo(() => (cat ? priced(cat, hardware) : null), [cat, hardware])
+  const families = useMemo(() => offer?.families ?? [], [offer])
+
   const family = useMemo<VideoFamily | null>(() => {
-    if (!cat || !cat.families.length) return null
-    return cat.families.find((f) => f.def.id === composition.familyId) ?? cat.families[0]
-  }, [cat, composition.familyId])
+    if (!families.length) return null
+    return families.find((f) => f.def.id === composition.familyId) ?? families[0]
+  }, [families, composition.familyId])
 
   // Load the family's verified recipe the first time, and whenever the chosen
   // style is no longer installed. Fields the reader has touched survive it.
@@ -1352,8 +1370,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   }, [family, fps, frames])
   const notes = useMemo(() => (family ? marginaliaOf(family) : []), [family])
   const memory = useMemo(
-    () => (family ? clipMemory(family.def, clipOf(family, composition), cat?.hardware ?? null) : null),
-    [family, composition, cat],
+    () => (family ? clipMemory(family.def, clipOf(family, composition), hardware) : null),
+    [family, composition, hardware],
   )
 
   const myJobs = allJobs
@@ -1534,7 +1552,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         // and the next clip would take all of them as its opening. An older
         // player sent the whole clip this way, and a draft saved then may
         // still hold it.
-        if (CLIP_FILE.test(ref.filename)) {
+        if (VIDEO_EXT.test(ref.filename)) {
           setSource(null)
           setNotice({
             kind: 'correction',
@@ -1639,8 +1657,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     return { target, stack, specs: resolved.specs, installed, excluded, ran }
   }, [rackOf])
 
+  /** The graph one run sends, and the positive prompt in it, trigger words and all. */
   const buildGraph = useCallback(
-    (fam: VideoFamily, c: Composition, seed: number): ApiWorkflow | null => {
+    (fam: VideoFamily, c: Composition, seed: number): { graph: ApiWorkflow; positive: string } | null => {
       // Sent from words, the start-frame-only family would go out with its
       // LoadImage still holding the placeholder, which ComfyUI refuses.
       if (fam.needsStartFrame && c.mode !== 'i2v') return null
@@ -1655,14 +1674,14 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       if (words.length) params.positive = params.positive.trim() ? `${params.positive}, ${words.join(', ')}` : words.join(', ')
       const graph = instantiate(chained ?? shaped, params)
       applyShift(graph, c.shift)
-      return graph
+      return { graph, positive: params.positive }
     },
     [resolvedLoras],
   )
 
   const blockedReason = useMemo(
-    () => reasonFor(family, composition, cat?.hardware ?? null),
-    [family, composition, cat],
+    () => reasonFor(family, composition, hardware),
+    [family, composition, hardware],
   )
 
   /**
@@ -1681,7 +1700,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     // would queue a record's size, length and steps on a model it was never
     // made with, and file the result under the wrong name. A blank desk has
     // no family yet, and takes the first.
-    const fam = cat?.families.find((f) => f.def.id === c.familyId) ?? (c.familyId ? null : cat?.families[0]) ?? null
+    const fam = families.find((f) => f.def.id === c.familyId) ?? (c.familyId ? null : families[0]) ?? null
     if (!fam) {
       if (cat && c.familyId) {
         setNotice({
@@ -1692,7 +1711,6 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       }
       return false
     }
-    const hardware = cat?.hardware ?? null
     if (reasonFor(fam, c, hardware)) return false
 
     const runs = c.runs ?? 1
@@ -1710,8 +1728,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         fps: fpsOf(fam, c),
         source: needsSource(c.mode) ? c.source : null,
       }
-      const graph = buildGraph(fam, snapshot, seed)
-      if (!graph) {
+      const built = buildGraph(fam, snapshot, seed)
+      if (!built) {
         setNotice({
           kind: 'error',
           title: 'That shape is not available',
@@ -1724,11 +1742,17 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       }
       const { ran } = resolvedLoras(fam)
       startJob({
-        composition: snapshot,
-        graph,
+        // The prompt exactly as sent, so the record carries the trigger words
+        // the rack added and not only the words the reader typed.
+        composition: { ...snapshot, positive: built.positive },
+        graph: built.graph,
         familyLabel: fam.def.label,
         modelLabel: modelLabelOf(fam),
-        loras: ran.length ? ran.map((s) => ({ name: s.name, strength: s.strength })) : undefined,
+        // Where each add-on ran, so reuse can tell a pair's partner that was
+        // switched off from one that was simply not on the rack.
+        loras: ran.length
+          ? ran.map((s) => ({ name: s.name, strength: s.strength, ...(s.half ? { half: s.half } : {}) }))
+          : undefined,
         release,
       })
     }
@@ -1737,7 +1761,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     setViewing(null)
     setNotice(null)
     return true
-  }, [cat, uploading, buildGraph, resolvedLoras])
+  }, [cat, families, hardware, uploading, buildGraph, resolvedLoras])
 
   /**
    * Put a record back on the desk. `Use these settings` restores everything and
@@ -1750,8 +1774,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
    */
   const reuse = useCallback(
     (entry: HistoryEntry, run: boolean) => {
-      const fam = cat?.families.find((f) => f.def.id === entry.familyId) ?? null
-      const installedModels = cat?.families.map((f) => f.model).filter(Boolean)
+      const fam = families.find((f) => f.def.id === entry.familyId) ?? null
+      const installedModels = cat ? families.map((f) => f.model).filter(Boolean) : undefined
       const priorRack = rackOf(entry.familyId)
       const applied = reuseIntoDesk(entry, {
         freshSeed: run,
@@ -1805,7 +1829,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       )
       if (!run) promptRef.current?.focus()
     },
-    [cat, make, rackOf, updateStack],
+    [cat, families, make, rackOf, updateStack],
   )
 
   // Ctrl/⌘+Enter runs, from inside the prompt too — the one deliberate
@@ -2180,7 +2204,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               </button>
 
               {showWorkflow ? (
-                <WorkflowPeek build={() => buildGraph(family, store.get(), composition.seed)} />
+                <WorkflowPeek build={() => buildGraph(family, store.get(), composition.seed)?.graph ?? null} />
               ) : null}
 
               {notes.length ? (
@@ -2192,9 +2216,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 </div>
               ) : null}
 
-              {cat?.vramFree != null ? (
+              {machine?.vramFree != null ? (
                 <p className="mt-2 text-caption italic text-grey-500 tabular-nums">
-                  The card has {gb(cat.vramFree)} free right now.
+                  The card had {gb(machine.vramFree)} free when it was last checked, at {clock(machine.at)}.
                 </p>
               ) : null}
 
@@ -2219,7 +2243,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
             <p className="text-small italic text-grey-500">Reading what this machine has…</p>
           ) : !family ? (
             <Notice tone="correction" title="Correction" >
-              No video model is installed. {cat.blocked.length ? `${cat.blocked[0].label} ${cat.blocked[0].why}.` : ''}
+              No video model is installed.{' '}
+              {offer?.blocked.length ? `${offer.blocked[0].label} ${offer.blocked[0].why.replace(/\.$/, '')}.` : ''}
             </Notice>
           ) : (
             <>
@@ -2387,7 +2412,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               </div>
 
               {/* Style — shown in simple mode only when there is a choice */}
-              {(cat.families.length > 1 || prefs.expert) && (
+              {(families.length > 1 || prefs.expert) && (
                 <div className="mb-5">
                   <Head title="Style" />
                   <select
@@ -2395,13 +2420,13 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                     className="field"
                     value={family.def.id}
                     onChange={(e) => {
-                      const next = cat.families.find((f) => f.def.id === e.target.value)
+                      const next = families.find((f) => f.def.id === e.target.value)
                       if (!next) return
                       const loaded = applyDefaults(store.get(), defaultsOf(next))
                       store.set(next.needsStartFrame ? { ...loaded, mode: 'i2v' } : loaded)
                     }}
                   >
-                    {cat.families.map((f) => (
+                    {families.map((f) => (
                       <option key={f.def.id} value={f.def.id}>
                         {f.label}
                       </option>
@@ -2414,7 +2439,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                     </p>
                   ) : null}
                   {family.verdict && family.verdict.level !== 'ok' ? (
-                    <p className="mt-1 text-caption italic text-grey-700">{family.verdict.reason}</p>
+                    <p className="mt-1 text-caption italic text-grey-700 tabular-nums">
+                      {family.verdict.reason}
+                      {machine ? ` Memory last checked at ${clock(machine.at)}.` : ''}
+                    </p>
                   ) : null}
                   {family.verdict?.offloads && family.verdict.level === 'ok' ? (
                     <p className="mt-1 text-caption italic text-grey-500 tabular-nums">
@@ -2592,7 +2620,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               {connection === 'closed' && live.length ? (
                 <div className="mt-4">
                   <Notice tone="correction" title="Correction">
-                    We lost the connection to ComfyUI. Your clip may still be running. We will reconnect and pick it up.
+                    We lost the connection to ComfyUI. If your clip is still running, we will pick it up when ComfyUI
+                    answers again. If ComfyUI restarted, the clip is gone and the desk will say so.
                   </Notice>
                 </div>
               ) : null}

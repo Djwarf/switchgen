@@ -29,11 +29,13 @@ import { Reading } from '../components/result/Reading'
 import type { ImageFacts, VisionReport } from '../lib/vision'
 import { AddOnOffers } from '../components/compose/AddOnOffers'
 import { RecipeProse } from '../components/compose/RecipeProse'
-import { faultOf as classifyFault, type Fault } from '../lib/faults'
+import { faultOf, type Fault as DeskFault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { measureImage as measure } from '../lib/images'
 import { clamp } from '../lib/num'
 import { ServerDown } from '../components/ServerDown'
+import { onPlanLanded } from '../lib/downloads'
+import { thumbSrcSet, thumbUrl } from '../lib/thumbs'
 import { Kicker, Link, Notice } from '../components/type'
 import {
   useCallback,
@@ -50,7 +52,6 @@ import {
   cancelJob,
   connectionState,
   fileUrl,
-  getJob,
   listJobs,
   objectInfo,
   run,
@@ -58,7 +59,8 @@ import {
   watchConnection,
   type ApiWorkflow,
   type ProgressEvent,
-  relPath
+  relPath,
+  VIDEO_EXT,
 } from '../lib/comfy'
 import {
   BY_ID,
@@ -387,6 +389,14 @@ function catalogue(reload = false): Promise<Catalogue> {
   return cataloguePromise
 }
 
+// A family fetched from the catalogue changes what this machine can run, and
+// the fetch can land while the reader is in another room. The desk reads the
+// catalogue once and keeps it, so the kept reading goes here, and the next
+// visit reads what is installed now.
+onPlanLanded(() => {
+  cataloguePromise = null
+})
+
 // ---------------------------------------------------------------------------
 // The job engine — module scope, so a job outlives a route change
 // ---------------------------------------------------------------------------
@@ -407,24 +417,6 @@ type DeskJob = {
   total: number
   startedAt: number
   finishedAt: number | null
-}
-
-/** The shared shape, with `lost` set by this desk's own watcher. See watchLost. */
-type DeskFault = Fault
-
-/**
- * A job ComfyUI has forgotten, as opposed to one it refused.
- *
- * Distinct from ComfyError so the desk can say which of the two happened: a
- * rejected graph is the reader's settings, a lost job is the server.
- */
-class LostJob extends Error {
-  readonly promptId: string
-  constructor(message: string, promptId: string) {
-    super(message)
-    this.name = 'LostJob'
-    this.promptId = promptId
-  }
 }
 
 type PressState = {
@@ -490,109 +482,6 @@ function busy(state: PressState): boolean {
   return s === 'submitting' || s === 'queued' || s === 'running'
 }
 
-/** How often to ask the server whether it still knows about our prompt. */
-const LOST_POLL_MS = 5000
-/** Consecutive absences from /api/jobs before the direct lookup. */
-const LOST_MISSES = 2
-/** A prompt accepted seconds ago may not be listed yet. */
-const LOST_GRACE_MS = 20_000
-/** Ticks to wait for a socket event the server says has already happened. */
-const LOST_TERMINAL_WAITS = 3
-
-/**
- * Reject when ComfyUI has forgotten the prompt this run is following.
- *
- * `run()` settles only on a terminal socket event carrying its own prompt id,
- * and a ComfyUI that restarts mid generation never sends one: comfy.ts's own
- * reconciler bails when /history has no record of the id, settling nothing.
- * Without this the await in drive() never returns, so `driving` stays true and
- * every later press of the run button is refused in silence, with no way back
- * but a page reload.
- *
- * The evidence is the same evidence Video.tsx and shell/jobs.tsx already use:
- * two consecutive absences from the server's own queue, confirmed by a direct
- * lookup that finds no record either. A terminal status with no socket event
- * gets a few more ticks first, because the socket is the authority and usually
- * lands within one.
- */
-function watchLost(): { promise: Promise<never>; stop: () => void } {
-  let timer: ReturnType<typeof setInterval> | null = null
-  const stop = () => {
-    if (timer !== null) clearInterval(timer)
-    timer = null
-  }
-
-  const promise = new Promise<never>((_resolve, reject) => {
-    const startedAt = Date.now()
-    let sighted = false
-    let misses = 0
-    let terminalWaits = 0
-    let checking = false
-
-    const giveUp = (message: string, promptId: string) => {
-      stop()
-      reject(new LostJob(message, promptId))
-    }
-
-    const tick = async () => {
-      if (checking || timer === null) return
-      checking = true
-      try {
-        const id = press.job?.promptId
-        if (!id) return // still submitting: there is nothing to look for yet
-
-        let ids: string[]
-        try {
-          const page = await listJobs({ status: ['pending', 'in_progress'], limit: 100 })
-          ids = page.jobs.map((j) => j.id)
-        } catch {
-          return // an unreachable server is the offline notice's business
-        }
-        if (timer === null) return
-
-        if (ids.includes(id)) {
-          sighted = true
-          misses = 0
-          return
-        }
-        if (!sighted && Date.now() - startedAt < LOST_GRACE_MS) return
-
-        misses += 1
-        if (misses < LOST_MISSES) return
-
-        const server = await getJob(id).catch(() => null)
-        if (timer === null) return
-
-        if (server && (server.status === 'pending' || server.status === 'in_progress')) {
-          sighted = true
-          misses = 0
-          return
-        }
-        if (server) {
-          misses = 0
-          terminalWaits += 1
-          if (terminalWaits < LOST_TERMINAL_WAITS) return
-          giveUp(
-            'ComfyUI says this job has ended but never sent the result. Look in the archive: the picture may be on disk anyway.',
-            id,
-          )
-          return
-        }
-        giveUp(
-          'We lost track of this job. ComfyUI has no record of it any more, which usually means it restarted. Nothing was saved.',
-          id,
-        )
-      } finally {
-        checking = false
-      }
-    }
-
-    timer = setInterval(() => void tick(), LOST_POLL_MS)
-  })
-
-  return { promise, stop }
-}
-
 function startRuns(plans: RunPlan[]) {
   if (driving || !plans.length) return
   queue = [...plans]
@@ -629,15 +518,10 @@ async function drive() {
         },
       })
 
-      // The run is raced against a watch on the server's own queue, because
-      // run() settles only on a socket event for this prompt and a restarted
-      // ComfyUI never sends one.
-      const lost = watchLost()
+      // run() also rejects when ComfyUI forgets the prompt, as after a
+      // restart mid job, so this await always returns and the desk is freed.
       try {
-        const files = await Promise.race([
-          run(plan.graph, (ev) => onProgress(ev, plan)),
-          lost.promise,
-        ])
+        const files = await run(plan.graph, (ev) => onProgress(ev, plan))
         const picture = files.find((f) => f.kind === 'image') ?? files[0] ?? null
         const durationMs = Date.now() - startedAt
         if (!picture) {
@@ -693,8 +577,6 @@ async function drive() {
         // A rejected queue or a stopped job ends the whole batch: three more of
         // the same mistake helps nobody.
         break
-      } finally {
-        lost.stop()
       }
     }
   } finally {
@@ -725,13 +607,6 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
     ? clamp(ev.value / ev.max, press.job.pct, 0.97)
     : Math.max(press.job.pct, 0.02)
   patchJob({ status: 'running', stage, value: ev.value, max: ev.max, pct })
-}
-
-function faultOf(err: unknown): DeskFault {
-  if (err instanceof LostJob) {
-    return { message: err.message, cancelled: false, lost: true, node: null, nodeType: null, detail: null }
-  }
-  return classifyFault(err)
 }
 
 async function stopRun() {
@@ -792,15 +667,21 @@ let held: Held | null = null
  * Whether the desk can rebuild the graph that made this picture.
  *
  * The face, hand, larger render and "make another" rows all re-render the
- * picture from its record. A region pass is filed as image to image of the
- * ORIGINAL picture with the region prompt and no pixel budget, and nothing on
- * the record says which region or what mask: rebuilt, it redraws the whole
- * original frame at the region's strength and throws the refine away. Plain
- * image to image always files its budget, so a missing one marks a region
- * pass, or a record recovered from ComfyUI that does not say how it was sized,
- * which cannot be rebuilt faithfully either.
+ * picture from its record. A region pass is filed against the ORIGINAL picture
+ * with the region prompt, and nothing on the record says which region or what
+ * mask: rebuilt, it redraws the whole original frame at the region's strength
+ * and throws the refine away. It is filed with the variant `refine` for that
+ * reason. A variant this build does not know came from a newer one sharing the
+ * archive, and what it ran cannot be read off this record here either.
+ *
+ * Region passes filed before `refine` existed say image to image with no pixel
+ * budget, which plain image to image always files. A record recovered from
+ * ComfyUI that does not say how it was sized looks the same, and cannot be
+ * rebuilt faithfully either.
  */
 function rebuildable(entry: HistoryEntry): boolean {
+  const v = entry.variant
+  if (v !== null && v !== 'img2img' && v !== 'nolora' && v !== 'i2v') return false
   return !(entry.mode === 'i2i' && entry.megapixels == null)
 }
 
@@ -1188,6 +1069,10 @@ export function Pictures() {
     load()
   }, [load])
 
+  // The panel that re-reads after a fetch is mounted only while More is open,
+  // so a family that lands with More closed is heard of here instead.
+  useEffect(() => onPlanLanded(() => load(true)), [load])
+
   // The desk recovers on its own when ComfyUI comes back. No reload.
   useEffect(() => {
     if (!catError) return
@@ -1523,6 +1408,17 @@ export function Pictures() {
   useEffect(() => {
     const s = c.source
     if (!s || s.name || !s.ref) return
+    // LoadImage reads a still, and a draft saved by an older build can hold a
+    // clip here. Copied across, the whole clip was uploaded for a run that
+    // could only fail on it. The mode is left alone so the well stays on
+    // screen to say why it is empty.
+    if (VIDEO_EXT.test(s.ref.filename)) {
+      store.patch({ source: null })
+      setSourceError('It is a clip, and this desk starts only from a still. Choose a picture instead.')
+      return
+    }
+    // A picture chosen after a refusal is a fresh start; the old notice goes.
+    setSourceError(null)
     let alive = true
     setUploading(true)
     ;(async () => {
@@ -1611,6 +1507,9 @@ export function Pictures() {
         // record prepends it blindly: rerun() rebuilds the whole prompt with
         // positiveFor(), which knows the words may already carry it.
         positivePrefix: prefixFiled(style?.positivePrefix ?? null, params.positive, plan.prompt),
+        // The prompt as the graph carries it, add-on words and any hand edit
+        // included, so the record can send the same words again.
+        positive: params.positive,
         negative: params.negative,
         source: needsSource(c.mode) ? base.source : null,
         width: params.width,
@@ -1811,14 +1710,17 @@ export function Pictures() {
       // The prompt as the desk sent it, not the bare words the record files.
       // Queued from the words alone, the pass drew a different picture at the
       // same seed: no trained prefix, and add-ons loaded without the words
-      // they answer to.
-      params.positive = positiveFor({
-        def: base,
-        model: composition.model,
-        prompt: composition.prompt,
-        loras: entry.loras ?? [],
-        lib,
-      })
+      // they answer to. A record that kept the prompt as sent is taken at its
+      // word, which also carries a hand edit; an older one is rebuilt.
+      params.positive =
+        entry.positive ??
+        positiveFor({
+          def: base,
+          model: composition.model,
+          prompt: composition.prompt,
+          loras: entry.loras ?? [],
+          lib,
+        })
       const graph = instantiate(def, params)
       if ('derived' in def) {
         writeExtras(graph, def, { hiresSteps: hiresStepsFor(params.steps) })
@@ -1834,7 +1736,7 @@ export function Pictures() {
       startRuns([
         {
           graph,
-          composition,
+          composition: { ...composition, positive: params.positive },
           seed: composition.seed,
           familyLabel: entry.familyLabel,
           modelLabel: entry.modelLabel,
@@ -2214,7 +2116,8 @@ export function Pictures() {
           ...base,
           // Filed as image-to-image, which is what it is: a partial denoise of
           // an existing picture. That files no width or height either, which is
-          // right: the output is the source's size, not the composer's.
+          // right: the output is the source's size, not the composer's. The
+          // variant `refine` below says it was one region, not the whole frame.
           mode: 'i2i',
           familyId: refineStyle.def.id,
           model: refineStyle.model,
@@ -2224,6 +2127,7 @@ export function Pictures() {
           scheduler: rd.scheduler,
           negative: rd.negative ?? null,
           positivePrefix: prefixFiled(refineStyle.positivePrefix, positive, req.prompt),
+          positive,
           shift: refineStyle.shift,
           clipSkip: refineStyle.clipSkip,
           prompt: req.prompt,
@@ -2261,7 +2165,8 @@ export function Pictures() {
             seed,
             familyLabel: refineStyle.group,
             modelLabel: refineStyle.label,
-            variant: 'img2img',
+            // What rebuildable() reads to keep the whole-picture passes off it.
+            variant: 'refine',
             label: `${refineStyle.label}, region refine`,
             // A refine pass carries no detail passes of its own; it IS the
             // detail pass.
@@ -2382,8 +2287,8 @@ export function Pictures() {
         {offline && (
           <div className="mb-4">
             <Notice tone="correction" title="Correction">
-              We have lost the connection to ComfyUI. Anything already running will be picked up
-              when it comes back.
+              We have lost the connection to ComfyUI. If ComfyUI is still running, a job already
+              under way is picked up when it answers again. If it restarted, that job is gone.
             </Notice>
           </div>
         )}
@@ -3236,7 +3141,18 @@ function TodayStrip({
                 on ? 'border-burgundy-900' : 'border-grey-300 hover:border-ink'
               } focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900`}
             >
-              <img src={fileUrl(r.file)} alt="" className="h-full w-full object-cover" />
+              {/* A 64 pixel tile needs a thumbnail, not the render, which is
+                  often a megabyte or more and was decoded in full for every
+                  picture made. */}
+              <img
+                src={thumbUrl(r.file, 256)}
+                srcSet={thumbSrcSet(r.file)}
+                sizes="64px"
+                alt=""
+                loading="lazy"
+                decoding="async"
+                className="h-full w-full object-cover"
+              />
             </button>
           )
         })}
@@ -3248,6 +3164,13 @@ function TodayStrip({
 // ---------------------------------------------------------------------------
 // Taking a source out of the archive
 // ---------------------------------------------------------------------------
+
+/**
+ * How wide a picker tile is drawn, for choosing a thumbnail: under a third of
+ * the screen in the three-column grid, and about 160 pixels at most in the
+ * four and five column grids, inside the dialog's 48rem and its margins.
+ */
+const PICKER_TILE = '(min-width: 640px) 160px, 33vw'
 
 function ArchivePicker({
   records,
@@ -3361,7 +3284,18 @@ function ArchivePicker({
                   className="group block w-full cursor-pointer text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
                 >
                   <span className="block aspect-square overflow-hidden border border-grey-300 group-hover:border-burgundy-900">
-                    <img src={fileUrl(r.file)} alt="" className="h-full w-full object-cover" />
+                    {/* Up to 120 tiles of about 160 pixels at most. Loaded as
+                        the original renders, the dialog fetched and decoded
+                        every one in full as it opened. */}
+                    <img
+                      src={thumbUrl(r.file, 256)}
+                      srcSet={thumbSrcSet(r.file)}
+                      sizes={PICKER_TILE}
+                      alt=""
+                      loading="lazy"
+                      decoding="async"
+                      className="h-full w-full object-cover"
+                    />
                   </span>
                   <span className="mt-1 block truncate text-caption text-grey-700">
                     {r.prompt || r.file.filename}

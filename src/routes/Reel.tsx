@@ -31,7 +31,8 @@
 import { ServerDown } from '../components/ServerDown'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { clipMemory, type ClipMemory } from '../lib/clipMemory'
-import { modelFiles, probeHardware, type Hardware, type ModelFile } from '../lib/hardware'
+import { feasibility, modelFiles, probeHardware, type Hardware, type ModelFile } from '../lib/hardware'
+import { onPlanLanded } from '../lib/downloads'
 import {
   useCallback,
   useEffect,
@@ -112,12 +113,32 @@ const START_FRAME_NODES = ['Wan22ImageToVideoLatent', 'WanImageToVideo', 'WanFir
 // ---------------------------------------------------------------------------
 
 type Catalogue = {
+  /** Families whose every file is installed. Memory is asked of a fresh reading; see {@link offered}. */
   families: ReelFamily[]
   blocked: { label: string; why: string }[]
   samplers: string[]
   schedulers: string[]
-  /** What the machine has, for the memory verdict on each clip. Null when the probe failed. */
+  /** Weight files on disk and their sizes, for pricing a family against a reading. */
+  sizes: Map<string, ModelFile>
+  /** What the machine had when the catalogue was read. Null when the probe failed. The desk reads it again. */
   hardware: Hardware | null
+}
+
+/**
+ * The families this machine can hold, priced against one memory reading. One
+ * it cannot hold at all goes to the blocked list with the verdict's sentence.
+ * Without a reading nothing is priced, as availabilityOf does.
+ */
+function offered(cat: Catalogue, hardware: Hardware | null): Pick<Catalogue, 'families' | 'blocked'> {
+  if (!hardware) return cat
+  const families: ReelFamily[] = []
+  const blocked = [...cat.blocked]
+  for (const family of cat.families) {
+    const verdict = feasibility(family.def, cat.sizes, hardware)
+    if (verdict.selectable) families.push(family)
+    else blocked.push({ label: family.def.label, why: verdict.reason })
+  }
+  return { families, blocked }
 }
 
 function latentClassOf(def: FamilyDef): string | null {
@@ -166,10 +187,10 @@ async function loadCatalogue(): Promise<Catalogue> {
   for (const def of FAMILIES) {
     if (def.mode !== 'video') continue
 
-    // Files, then memory. This desk used to skip the memory verdict, so it
-    // could offer a family the machine cannot hold and let the reader find out
-    // eight shots in.
-    const avail = availabilityOf(def, inv, hardware, sizes)
+    // Files here, memory in offered(). This desk used to skip the memory
+    // verdict, so it could offer a family the machine cannot hold and let the
+    // reader find out eight shots in.
+    const avail = availabilityOf(def, inv, null, sizes)
     if (!avail.ok) {
       blocked.push({ label: def.label, why: avail.why })
       continue
@@ -196,11 +217,20 @@ async function loadCatalogue(): Promise<Catalogue> {
     blocked,
     samplers: inv.samplers,
     schedulers: inv.schedulers,
+    sizes,
     hardware,
   }
 }
 
 let cataloguePromise: Promise<Catalogue> | null = null
+
+// A family fetched from the catalogue can land while the reader is in another
+// room. What is installed is read once and kept, so the kept reading is
+// dropped here and the next visit reads what is installed now; the desk on
+// screen hears of it through its own listener.
+onPlanLanded(() => {
+  cataloguePromise = null
+})
 
 function catalogue(): Promise<Catalogue> {
   if (!cataloguePromise) {
@@ -377,10 +407,45 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     }
   }, [attempt])
 
+  useEffect(() => onPlanLanded(() => setAttempt((a) => a + 1)), [])
+
+  /**
+   * Memory, read again on every visit and whenever the page comes back into
+   * view, rather than once per page load with the catalogue. The reel's own
+   * checks read the machine's total memory, which does not move, but a probe
+   * that failed when the catalogue was read used to leave the desk without a
+   * reading until the page was reloaded. A reading that fails keeps the last
+   * good one.
+   */
+  const [freshHardware, setFreshHardware] = useState<Hardware | null>(null)
+  const [hardwareAsk, setHardwareAsk] = useState(0)
+  useEffect(() => {
+    let alive = true
+    probeHardware().then(
+      (hw) => {
+        if (alive) setFreshHardware(hw)
+      },
+      () => {},
+    )
+    return () => {
+      alive = false
+    }
+  }, [hardwareAsk])
+  useEffect(() => {
+    const onShow = () => {
+      if (document.visibilityState === 'visible') setHardwareAsk((n) => n + 1)
+    }
+    document.addEventListener('visibilitychange', onShow)
+    return () => document.removeEventListener('visibilitychange', onShow)
+  }, [])
+  const hardware = freshHardware ?? cat?.hardware ?? null
+  const offer = useMemo(() => (cat ? offered(cat, hardware) : null), [cat, hardware])
+  const families = useMemo(() => offer?.families ?? [], [offer])
+
   const family = useMemo<ReelFamily | null>(() => {
-    if (!cat || !cat.families.length) return null
-    return cat.families.find((f) => f.def.id === draft.familyId) ?? cat.families[0] ?? null
-  }, [cat, draft.familyId])
+    if (!families.length) return null
+    return families.find((f) => f.def.id === draft.familyId) ?? families[0] ?? null
+  }, [families, draft.familyId])
 
   // The family's recipe, applied when the draft does not match the family it
   // resolves to: a first load, or a saved family that is no longer installed.
@@ -453,7 +518,6 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
 
   // --- what may be sent ----------------------------------------------------
 
-  const hardware = cat?.hardware ?? null
   const memoryFor = useCallback(
     (job: ShotJob): ClipMemory | null =>
       family
@@ -569,7 +633,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
   const patchBench = useCallback(
     (p: Partial<ReelDraft>) => {
       if (p.familyId !== undefined && p.familyId !== draft.familyId) {
-        const next = cat?.families.find((f) => f.def.id === p.familyId)
+        const next = families.find((f) => f.def.id === p.familyId)
         if (next) {
           reel.patch({ ...p, ...recipeFor(next) })
           return
@@ -585,7 +649,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
       }
       reel.patch(p)
     },
-    [cat, draft.familyId, draft.seedLocked, draft.shots, run.states, plan.jobs],
+    [families, draft.familyId, draft.seedLocked, draft.shots, run.states, plan.jobs],
   )
 
   useEffect(() => {
@@ -945,9 +1009,9 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
         <div className="order-1 lg:order-2">
           <Bench
             draft={draft}
-            families={cat?.families ?? []}
+            families={families}
             family={family}
-            blocked={cat?.blocked ?? []}
+            blocked={offer?.blocked ?? []}
             shapes={shapes}
             lengthOptions={lengthOptions}
             samplers={cat?.samplers ?? []}
