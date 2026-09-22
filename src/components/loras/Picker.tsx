@@ -144,7 +144,7 @@ export function Picker({
       }}
     >
       <div className="flex items-baseline justify-between gap-2">
-        <Kicker tone="burgundy">Library</Kicker>
+        <Kicker tone="burgundy">All add-ons</Kicker>
         <button type="button" className={`sg-link text-caption ${RING}`} onClick={onClose}>
           Close
         </button>
@@ -154,10 +154,10 @@ export function Picker({
         ref={search}
         type="search"
         className="field mt-2 w-full"
-        placeholder="Search: nipples, skin, eyes, hands"
+        placeholder="Search: skin, hands, eyes, lighting, film grain"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        aria-label="Search the LoRA library"
+        aria-label="Search all add-ons"
       />
 
       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -165,7 +165,7 @@ export function Picker({
           fits this model
         </Tap>
         <Tap active={installedOnly} onClick={() => setInstalledOnly((v) => !v)}>
-          on disk
+          downloaded
         </Tap>
         <span className="ml-auto text-caption tabular-nums text-grey-500">
           {rows.length} of {lib.all.length}
@@ -174,7 +174,7 @@ export function Picker({
 
       {fitsOnly && hidden > 0 ? (
         <p className="mt-2 text-caption italic text-grey-500">
-          {hidden} hidden: trained for a different architecture than {ARCH_LABEL[target.arch]}.
+          {hidden} hidden: made for a different kind of model than {ARCH_LABEL[target.arch]}.
         </p>
       ) : null}
 
@@ -206,9 +206,9 @@ export function Picker({
                               ? 'fits'
                               : fit.level === 'untested'
                                 ? 'untested'
-                                : 'wrong base'}
+                                : 'wrong model'}
                           </Badge>
-                          {info.installed ? null : <Badge tone="plain">to fetch</Badge>}
+                          {info.installed ? null : <Badge tone="plain">download</Badge>}
                         </div>
                         <p className="mt-0.5 text-[0.6875rem] text-grey-500">
                           {ARCH_LABEL[info.arch]}
@@ -217,7 +217,7 @@ export function Picker({
                           {info.trigger ? (
                             <>
                               <span className="px-1 text-grey-300">|</span>
-                              <span className="italic">trigger: {info.trigger}</span>
+                              <span className="italic">say: {info.trigger}</span>
                             </>
                           ) : null}
                         </p>
@@ -238,7 +238,7 @@ export function Picker({
 
                       <div className="flex shrink-0 flex-col items-end gap-1">
                         {present ? (
-                          <Badge tone="plain">in stack</Badge>
+                          <Badge tone="plain">in use</Badge>
                         ) : info.installed ? (
                           <Tap onClick={() => onAdd(info)}>add</Tap>
                         ) : job && (job.progress.state === 'starting' || job.progress.state === 'downloading') ? (

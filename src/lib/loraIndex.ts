@@ -238,15 +238,15 @@ export function withoutTriggerData(): LoraIndexEntry[] {
 export function triggerNote(entry: LoraIndexEntry): string {
   switch (entry.confidence) {
     case 'strong':
-      return `Trigger ${entry.triggerPhrase}, read from the training captions of ${entry.imageCount} images.`
+      return `Needs ${entry.triggerPhrase} in the prompt - that is how all ${entry.imageCount} of its training pictures were labelled.`
     case 'likely':
-      return `Trigger ${entry.triggerPhrase}, in ${Math.round((entry.triggers[0]?.share ?? 0) * 100)} percent of its training captions.`
+      return `Needs ${entry.triggerPhrase} in the prompt - ${Math.round((entry.triggers[0]?.share ?? 0) * 100)} percent of its training pictures were labelled that way.`
     case 'weak':
-      return `Probable trigger ${entry.triggerPhrase}, on weak evidence. ${entry.notes[0] ?? ''}`.trim()
+      return `Probably needs ${entry.triggerPhrase} in the prompt, but the evidence is thin. ${entry.notes[0] ?? ''}`.trim()
     case 'none':
-      return 'No trigger word. Its training captions carry nothing unique to it, so it works on weight alone.'
+      return 'Needs no special word. Nothing in its training marks it out, so it simply applies.'
     case 'no-data':
-      return 'No trigger data in the file. Whether it wants a trigger word is unknown, not none.'
+      return 'The file records nothing about this. It may need a special word in the prompt - we do not know, which is not the same as no.'
   }
 }
 

@@ -45,6 +45,7 @@ import {
 import { modelFiles } from '../lib/hardware'
 import {
   adoptSource,
+  requestRegionEdit,
   reuseIntoDesk,
   settings,
   type DeskId,
@@ -543,6 +544,15 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       onReuse: () => reuse(entry, false),
       onAnother: () => reuse(entry, true),
       onSource: (desk) => sendAsSource(entry, desk),
+      // Video records have no single frame to paint on, so the bench is not
+      // offered for them; the frame picker is the route in for those.
+      onRegion:
+        entry.kind === 'video'
+          ? undefined
+          : () => {
+              requestRegionEdit(entry)
+              goToDesk('images')
+            },
       onStar: () => starRecord(entry.id, !entry.starred),
       onDownload: () => {
         saveToDisk(entry).catch((err: unknown) =>
@@ -560,7 +570,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       },
       onSelect: () => toggleSelection(entry, null),
     }),
-    [reuse, sendAsSource, removeRecords, toggleSelection],
+    [reuse, sendAsSource, removeRecords, toggleSelection, goToDesk],
   )
 
   // -- keyboard -------------------------------------------------------------

@@ -96,6 +96,24 @@ export type RegionRefineProps = {
   progress?: number | null
   /** A reason the pass cannot run, from the desk. Printed, and blocks the button. */
   blocked?: string | null
+  /**
+   * Which model draws the region, and the alternatives.
+   *
+   * Plain `{id, label, group}` rows rather than registry types, so this folder
+   * still knows nothing about families or graphs. Omit it and nothing is
+   * printed, which is what a bench with only one capable model should do.
+   *
+   * Offered because the picture's own model often cannot redraw a region at
+   * all, and the bench used to resolve that by silently taking whichever
+   * capable model happened to come first.
+   */
+  model?: {
+    options: readonly { id: string; label: string; group?: string }[]
+    value: string
+    onChange: (id: string) => void
+    /** Why the picture's own model is not the one drawing. */
+    note?: string | null
+  }
   onRun: (req: RefineRequest) => void
   onStop?: () => void
 }
@@ -116,6 +134,7 @@ export function RegionRefine({
   busy = false,
   progress = null,
   blocked = null,
+  model,
   onRun,
   onStop,
 }: RegionRefineProps) {
@@ -239,6 +258,31 @@ export function RegionRefine({
               </label>
             ) : null}
           </div>
+
+          {model && model.options.length > 1 && (
+            <div className="mb-3">
+              <label className="block">
+                <span className="text-overline font-semibold uppercase tracking-[0.18em] text-grey-700">
+                  Drawn by
+                </span>
+                <select
+                  className="mt-1 block w-full max-w-[42ch] rounded border border-grey-300 bg-white px-2 py-1.5 text-body text-grey-900"
+                  value={model.value}
+                  disabled={busy}
+                  onChange={e => model.onChange(e.target.value)}
+                >
+                  {model.options.map(o => (
+                    <option key={o.id} value={o.id}>
+                      {o.group && o.group !== o.label ? `${o.group} - ${o.label}` : o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {model.note ? (
+                <p className="mt-1.5 max-w-[62ch] text-caption text-grey-500">{model.note}</p>
+              ) : null}
+            </div>
+          )}
 
           <div className="flex justify-center">
             <MaskCanvas

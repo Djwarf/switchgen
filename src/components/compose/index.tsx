@@ -19,6 +19,7 @@
  * The pieces are exported individually too, for a desk that wants to set its
  * own page: they hold no state between them and no context.
  */
+export { AddOnOffers } from './AddOnOffers'
 export { ComposeDesk, type ComposeDeskProps } from './ComposeDesk'
 export { PromptField } from './PromptField'
 export { LookPicker } from './LookPicker'

@@ -33,7 +33,7 @@ import type { DeskId } from '../../lib/session'
 const STAGES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^(UnetLoaderGGUF|UNETLoader|CheckpointLoaderSimple|VAELoader|CLIPVisionLoader)$/, 'Loading the model'],
   [/^(CLIPLoader|DualCLIPLoader|CLIPTextEncode|TextEncodeQwenImage.*|CLIPSetLastLayer)$/, 'Reading the prompt'],
-  [/^LoraLoader/, 'Loading the LoRA'],
+  [/^LoraLoader/, 'Loading add-ons'],
   [/^(VAEEncode|ImageScaleToTotalPixels|LoadImage|FluxKontextImageScale|ImageScale.*)$/, 'Preparing your picture'],
   [/^(Wan22ImageToVideoLatent|WanImageToVideo|Empty.*Latent.*)$/, 'Setting up the frames'],
   [/^(KSampler|KSamplerAdvanced|SamplerCustomAdvanced|CFGGuider)$/, 'Drawing'],

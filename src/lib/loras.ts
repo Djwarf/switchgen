@@ -166,20 +166,20 @@ export type LoraCategory =
   | 'other'
 
 export const CATEGORY_LABEL: Record<LoraCategory, string> = {
-  anatomy: 'Anatomy',
-  photoreal: 'Photoreal',
+  photoreal: 'Realistic skin and texture',
   anime: 'Anime and cartoon',
   hands: 'Hands, eyes and faces',
-  edit: 'Picture editing',
-  speed: 'Fewer steps',
-  'flux1d-no-base': 'Flux.1 dev, no base installed',
-  other: 'In the folder, not in the catalogue',
+  edit: 'Changing a picture',
+  speed: 'Faster, slightly rougher',
+  anatomy: 'Bodies and explicit detail',
+  'flux1d-no-base': 'Needs Flux.1 dev, which is not downloaded',
+  other: 'In your folder, no details known',
 }
 
 /** One line per category, for the picker's section heads. */
 export const CATEGORY_NOTE: Record<LoraCategory, string> = {
   anatomy:
-    'Breasts, nipples, vulvas, penises and pubic hair. Most of these were trained on close framing, so they pay off in the refine pass rather than the first render.',
+    'Explicit anatomy. Most were made from close-up photographs, so they do far more when you paint over a specific area than across a whole picture at once.',
   photoreal: 'Skin texture, pores, film grain and the absence of plastic sheen.',
   anime: 'Line quality, eye detail and screencap flatness on the booru bases.',
   hands: 'The regions the automatic detailers can find on their own.',
@@ -194,9 +194,9 @@ export const CATEGORY_NOTE: Record<LoraCategory, string> = {
 export type LoraUsage = 'base' | 'refine' | 'both'
 
 export const USAGE_LABEL: Record<LoraUsage, string> = {
-  base: 'first pass',
-  refine: 'refine pass',
-  both: 'either pass',
+  base: 'whole picture',
+  refine: 'touch-ups only',
+  both: 'either',
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,13 +1524,17 @@ export async function loadLoraLibrary(): Promise<LoraLibrary> {
     unlisted += 1
   }
 
+  // Section order, which is also what the picker opens on. 'anatomy' used to
+  // lead, so the first thing anyone saw when browsing add-ons was the explicit
+  // section, whatever they were making. It is still here and still complete -
+  // it just no longer greets everyone at the door.
   const rank: LoraCategory[] = [
-    'anatomy',
     'photoreal',
     'anime',
     'hands',
     'edit',
     'speed',
+    'anatomy',
     'other',
     'flux1d-no-base',
   ]
@@ -1562,7 +1566,7 @@ export type Fit = { level: FitLevel; why: string }
 export const FIT_LABEL: Record<FitLevel, string> = {
   match: 'Matches',
   untested: 'Untested',
-  mismatch: 'Wrong base',
+  mismatch: 'Wrong model',
 }
 
 /** The checkpoint a stack is being built against. */
@@ -1640,7 +1644,7 @@ export function fitFor(info: LoraInfo, target: LoraTarget): Fit {
   if (SDXL_LINEAGE.has(info.arch) && SDXL_LINEAGE.has(target.arch)) {
     return {
       level: 'untested',
-      why: `Trained on ${ARCH_LABEL[info.arch]} and applied to ${ARCH_LABEL[target.arch]}. The UNet keys match, so it loads and does part of its job. The conditioning differs, so expect a partial effect.`,
+      why: `Made for ${ARCH_LABEL[info.arch]}, being used on ${ARCH_LABEL[target.arch]}. They are close relatives, so it works, but only partly. Expect a weaker version of what it promises.`,
     }
   }
   if (info.arch === 'unknown') {
@@ -1651,7 +1655,7 @@ export function fitFor(info: LoraInfo, target: LoraTarget): Fit {
   }
   return {
     level: 'mismatch',
-    why: `Trained on ${ARCH_LABEL[info.arch]}. ${ARCH_LABEL[target.arch]} is a different architecture, so almost no weights match. ComfyUI reports no error for this: it renders noise, or a picture quietly poisoned. It will not be sent.`,
+    why: `Made for ${ARCH_LABEL[info.arch]}. ${ARCH_LABEL[target.arch]} is a different kind of model entirely. It would not fail, it would quietly spoil the picture with no error anywhere, so it is never sent.`,
   }
 }
 

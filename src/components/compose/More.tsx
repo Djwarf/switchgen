@@ -21,7 +21,7 @@ export function MoreFootnote({
   children,
   open: controlled,
   onOpenChange,
-  summary = 'Every model, every LoRA, every strength, the sampler, the size and the full ranking. Nothing was removed from this desk, it was moved here.',
+  summary = 'Every model, every add-on, every setting, and why each one was chosen. Nothing was taken away - it was moved here.',
   aside,
 }: {
   children?: ReactNode

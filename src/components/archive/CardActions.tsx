@@ -19,6 +19,11 @@ export type EntryActions = {
   onAnother: () => void
   /** Send only the picture to a desk. */
   onSource: (desk: DeskId) => void
+  /**
+   * Open the region bench on this picture, over on the Pictures desk.
+   * Absent on a video record, where there is no single frame to paint on.
+   */
+  onRegion?: () => void
   onStar: () => void
   onDownload: () => void
   /** Remove the record. The file stays. */
@@ -51,6 +56,7 @@ export function CardActions({
   onReuse,
   onAnother,
   onSource,
+  onRegion,
   onStar,
   onDownload,
   onRemove,
@@ -166,6 +172,19 @@ export function CardActions({
               <button role="menuitem" className={item} onClick={run(() => onSource('video'))}>
                 Use as a start frame on the Video desk
               </button>
+              {onRegion ? (
+                <button
+                  role="menuitem"
+                  className={item}
+                  onClick={run(onRegion)}
+                  disabled={entry.missing}
+                >
+                  Change part of it…
+                  <span className="block text-caption text-grey-500 italic">
+                    Paint over an area and have just that redrawn.
+                  </span>
+                </button>
+              ) : null}
             </>
           )}
 

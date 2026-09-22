@@ -34,8 +34,9 @@
 import type { ReactNode, RefObject } from 'react'
 import type { AnatomyLevel, Look, Recipe } from '../../lib/recipe'
 import type { SourceRef } from '../../lib/session'
+import { AddOnOffers } from './AddOnOffers'
 import { AnatomyPicker } from './AnatomyPicker'
-import { Deck, Kicker } from './bits'
+import { Deck, EditorialLink, Kicker } from './bits'
 import { LookPicker } from './LookPicker'
 import { MoreFootnote } from './More'
 import { PromptField } from './PromptField'
@@ -52,6 +53,10 @@ export type ComposeDeskProps = {
   onLook: (v: Look) => void
   onAnatomy: (v: AnatomyLevel) => void
 
+  /** Add-ons the wording matched. Offered, never applied without a decision. */
+  onAcceptAddOn?: (file: string) => void
+  onDeclineAddOn?: (file: string) => void
+
   /** What decide() returned for those three answers, plus this machine. */
   recipe: Recipe
 
@@ -66,6 +71,12 @@ export type ComposeDeskProps = {
   sourceError?: string | null
   /** Open the picker. It should offer a file and the archive, as it always has. */
   onPickSource?: () => void
+  /**
+   * Open the region bench on the attached picture. Offered for any picture the
+   * desk is holding, whichever way it arrived: uploaded, pasted, dropped, or
+   * adopted from the archive. Omit it and nothing is printed.
+   */
+  onEditRegion?: () => void
   onClearSource?: () => void
 
   // --- the press -----------------------------------------------------------
@@ -100,6 +111,8 @@ export function ComposeDesk({
   onPrompt,
   onLook,
   onAnatomy,
+  onAcceptAddOn,
+  onDeclineAddOn,
   recipe,
   source = null,
   needsSource = false,
@@ -107,6 +120,7 @@ export function ComposeDesk({
   sourceError = null,
   onPickSource,
   onClearSource,
+  onEditRegion,
   onRun,
   onStop,
   running = false,
@@ -166,12 +180,28 @@ export function ComposeDesk({
         <AnatomyPicker value={anatomy} onChange={onAnatomy} />
 
         {showWell && canPickSource && (
-          <SourceWell
-            source={source}
-            busy={sourceBusy}
-            error={sourceError}
-            onPick={() => onPickSource?.()}
-            onClear={() => onClearSource?.()}
+          <div>
+            <SourceWell
+              source={source}
+              busy={sourceBusy}
+              error={sourceError}
+              onPick={() => onPickSource?.()}
+              onClear={() => onClearSource?.()}
+            />
+            {source && onEditRegion ? (
+              <p className="mt-1.5 text-caption text-grey-500">
+                <EditorialLink onClick={onEditRegion}>Change part of this picture</EditorialLink>{' '}
+                instead, by painting over the area you want redrawn.
+              </p>
+            ) : null}
+          </div>
+        )}
+
+        {recipe.ok && recipe.offers.length > 0 && onAcceptAddOn && onDeclineAddOn && (
+          <AddOnOffers
+            offers={recipe.offers}
+            onAccept={onAcceptAddOn}
+            onDecline={onDeclineAddOn}
           />
         )}
 

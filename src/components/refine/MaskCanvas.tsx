@@ -140,7 +140,20 @@ export function MaskCanvas({
     })
   }, [redraw])
 
-  useEffect(() => () => { if (frameRef.current) cancelAnimationFrame(frameRef.current) }, [])
+  // Clear the flag as well as the frame. schedule() reads a non-zero frameRef as
+  // "a redraw is already queued", and the only thing that ever reset it was the
+  // callback this cleanup cancels. StrictMode mounts, cleans up, then mounts
+  // again, so in development the dead handle survives into the second mount and
+  // schedule() becomes a permanent no-op: strokes still commit (they are mapped
+  // off getBoundingClientRect, not the backing store) but nothing is ever
+  // painted -- no tint, no draft stroke, no crop rect, no brush ring.
+  useEffect(
+    () => () => {
+      if (frameRef.current) cancelAnimationFrame(frameRef.current)
+      frameRef.current = 0
+    },
+    [],
+  )
 
   // Redraw on every committed change, and on every change to what is drawn on
   // top of the mask. The stroke list gets a new identity on each edit, which is

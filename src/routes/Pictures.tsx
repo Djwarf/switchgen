@@ -86,6 +86,7 @@ import {
   randomSeed,
   recordOf,
   settings,
+  takeRegionRequest,
   toParams,
   type Composition,
   type Mode,
@@ -163,7 +164,7 @@ const PLAIN_NAMES: Record<string, string> = {
 const STAGES: [RegExp, string][] = [
   [/^(UnetLoaderGGUF|UNETLoader|CheckpointLoaderSimple|VAELoader)$/, 'Loading the model'],
   [/^(CLIPLoader|CLIPSetLastLayer|CLIPTextEncode|TextEncodeQwen|ConditioningZeroOut)/, 'Reading the prompt'],
-  [/^LoraLoaderModelOnly$/, 'Loading the LoRA'],
+  [/^LoraLoaderModelOnly$/, 'Loading add-ons'],
   [/^(LoadImage|VAEEncode|ImageScaleToTotalPixels|FluxKontext)/, 'Preparing your picture'],
   [/^(KSampler|KSamplerAdvanced|SamplerCustomAdvanced)/, 'Drawing'],
   [/^(VAEDecode|VAEDecodeTiled)$/, 'Developing the picture'],
@@ -928,6 +929,15 @@ type RefineSource = {
   height: number
   entryId: string
   prompt: string
+  /**
+   * The model that actually made this picture, when it is known.
+   *
+   * Null for an upload, which has no maker we know of. The bench used to state
+   * the DESK's current model as the picture's provenance, which was true only
+   * while the bench could be opened on a picture the desk had just produced.
+   * Both new routes in - the archive and an uploaded file - break that.
+   */
+  madeBy: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1031,9 @@ function editRecipe(input: {
     sharpness: null,
     missingLoras: [],
     refineLoras: [],
+    // The edit desk follows an instruction rather than a described scene, so
+    // there is no wording to match add-ons against. Nothing is offered here.
+    offers: [],
     passes: {
       face: offer(
         capabilities.faceDetail,
@@ -1057,7 +1070,7 @@ function waitingRecipe(prompt: string, look: Look, anatomy: AnatomyLevel, why: s
   }
 }
 
-/** The three modes, as a choice, printed only inside the advanced panel. */
+/** The three modes. The first question on the page, above the desk. */
 const MODE_CHOICES: readonly { id: Mode; label: string; blurb: string }[] = [
   { id: 't2i', label: 'From words', blurb: 'A picture from the prompt alone.' },
   {
@@ -1145,6 +1158,16 @@ export function Pictures() {
   const refineToken = useRef(0)
   /** True between queueing a refine and its result landing on the plate. */
   const awaitingRefine = useRef(false)
+  /**
+   * The picture on screen when a region pass was queued.
+   *
+   * The result is 'the first picture that is not this one'. This used to be
+   * compared against refineSource.entryId, which works for an archive record
+   * (the bench opens on it, so it IS the current picture) but not for an
+   * uploaded one, which has no entry id at all: the guard then matched
+   * nothing and the composer's last picture was adopted as the refined result.
+   */
+  const refineBaseline = useRef<string | null>(null)
 
   const fileInput = useRef<HTMLInputElement | null>(null)
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
@@ -1330,8 +1353,13 @@ export function Pictures() {
       installed: pinned ? [pinned] : cat.installed,
       loras: lib,
       seed: seed0,
+      // The reader's own decisions, threaded in so they survive this recompute.
+      // decide() runs on every keystroke; a decision held anywhere but here
+      // would be silently overwritten by the next suggestion.
+      addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
     })
-  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, lib, seed0, editStyle])
+  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, lib, seed0, editStyle,
+      c.addOnsAccepted, c.addOnsDeclined])
 
   const plan = recipe.ok ? recipe : null
 
@@ -1695,10 +1723,26 @@ export function Pictures() {
    * would leave exactly the pictures with the worst anatomy unfixable, so the
    * bench falls back to a picture style and says so in print.
    */
+  /** Every model that can actually draw a region, not just the first one found. */
+  const refineOptions = useMemo(
+    () => pictureStyles.filter((s) => deriveRefine(s.def) !== null),
+    [pictureStyles],
+  )
+
+  /** The reader's own pick, as `familyId::model`. Null means "follow the recipe". */
+  const [refinePick, setRefinePick] = useState<string | null>(null)
+
   const refineStyle = useMemo(() => {
+    // A pick the reader made outranks both the recipe and the fallback, and it
+    // is checked against the current list so a stale pick cannot strand the
+    // bench on a model that is no longer installed.
+    if (refinePick) {
+      const chosen = refineOptions.find((s) => `${s.def.id}::${s.model}` === refinePick)
+      if (chosen) return chosen
+    }
     if (style && deriveRefine(style.def)) return style
-    return pictureStyles.find((s) => deriveRefine(s.def) !== null) ?? null
-  }, [style, pictureStyles])
+    return refineOptions[0] ?? null
+  }, [style, refineOptions, refinePick])
 
   const canRefine = !!refineStyle
 
@@ -1761,6 +1805,7 @@ export function Pictures() {
         height: measured.height,
         entryId: entry.id,
         prompt: entry.prompt,
+        madeBy: entry.modelLabel || null,
       })
     } catch (err) {
       if (refineToken.current !== token) return
@@ -1772,6 +1817,77 @@ export function Pictures() {
       if (refineToken.current === token) setOpeningRefine(false)
     }
   }, [])
+
+  /**
+   * Open the bench on the picture currently attached to the desk.
+   *
+   * This is the upload route. A record from the archive goes through
+   * openRefine, which fetches it out of the OUTPUT folder and copies it into
+   * the input folder; an attached source is already in the input folder by the
+   * time the well shows it (see the copy effect above), so `source.name` is all
+   * LoadImage needs and there is nothing to upload again.
+   */
+  const openRefineFromSource = useCallback(async (src: SourceRef) => {
+    if (!src.name) return
+    const token = (refineToken.current += 1)
+    awaitingRefine.current = false
+    setRefining(true)
+    setRefineSource(null)
+    setRefineResult(null)
+    setRefineFault(null)
+    setOpeningRefine(true)
+    // Paint on the INPUT-FOLDER copy, not on the well's preview.
+    //
+    // src.name is already the LoadImage filename, so this URL serves the exact
+    // bytes the graph will read, and it is a stable server URL. The well's
+    // previewUrl is a blob: object URL owned by the desk store, which Clear,
+    // paste and drop all revoke - out from under the bench, which does not own
+    // it. It is also absent entirely for an upload restored from localStorage,
+    // which would offer the link and then fault on it.
+    const cut = src.name.lastIndexOf('/')
+    const url = fileUrl(
+      cut === -1
+        ? { filename: src.name, subfolder: '', type: 'input' }
+        : { filename: src.name.slice(cut + 1), subfolder: src.name.slice(0, cut), type: 'input' },
+    )
+    try {
+      // MEASURE THE FILE, never trust the declared size. A record files the size
+      // the composer ASKED for, and a second pass upscales on the way to disk, so
+      // a hires picture would open the bench at two thirds of its real resolution
+      // and paste a correctly drawn patch into the wrong part of the frame.
+      // openRefine's own doc comment says this; this used to do the opposite.
+      const measured =
+        (await measure(url)) ??
+        (src.width && src.height ? { width: src.width, height: src.height } : null)
+      if (!measured) throw new Error('the size could not be read')
+      if (refineToken.current !== token) return
+      setRefineSource({
+        name: src.name,
+        url,
+        width: measured.width,
+        height: measured.height,
+        // Carried when the picture came from the archive; empty for a plain
+        // upload, which genuinely has no record behind it.
+        entryId: src.fromEntryId ?? '',
+        prompt: store.get().prompt,
+        madeBy: null,
+      })
+    } catch (err) {
+      if (refineToken.current !== token) return
+      const why = err instanceof Error ? err.message : String(err)
+      setRefineFault(`That picture could not be opened for region editing (${why}).`)
+    } finally {
+      if (refineToken.current === token) setOpeningRefine(false)
+    }
+  }, [])
+
+  // A record handed over from the Archive, which is a different route and so
+  // cannot call openRefine directly. Runs once per request: takeRegionRequest()
+  // clears the slot as it reads it.
+  useEffect(() => {
+    const handed = takeRegionRequest()
+    if (handed) void openRefine(handed)
+  }, [openRefine])
 
   const closeRefine = useCallback(() => {
     refineToken.current += 1
@@ -1820,7 +1936,7 @@ export function Pictures() {
           source: {
             name: refineSource.name,
             previewUrl: refineSource.url,
-            label: `region of ${refineSource.entryId}`,
+            label: `region of ${refineSource.entryId || refineSource.name}`,
             width: refineSource.width,
             height: refineSource.height,
             fromEntryId: refineSource.entryId,
@@ -1842,7 +1958,13 @@ export function Pictures() {
           prompt: req.prompt,
           seed,
         })
-        awaitingRefine.current = true
+        // `press` is the live module singleton, read the same way busy(press) reads it
+      // above. `state` is the render-scoped snapshot and runRefine's dependency list
+      // does not include it, so closing over it would freeze the baseline at the
+      // render where refineSource last changed - reintroducing the very bug this
+      // line exists to fix.
+      refineBaseline.current = press.current?.id ?? null
+      awaitingRefine.current = true
         startRuns([
           {
             graph,
@@ -1871,30 +1993,28 @@ export function Pictures() {
   useEffect(() => {
     if (!awaitingRefine.current) return
     const cur = state.current
-    if (!cur || cur.id === refineSource?.entryId) return
+    if (!cur || cur.id === refineBaseline.current) return
     awaitingRefine.current = false
     setRefineResult(cur)
   }, [state, refineSource])
 
   const refineBlocked =
     refineFault ??
-    (!refineDef
-      ? 'No installed style can re render a region. Every one of them samples through a custom schedule with no denoise control.'
-      : openingRefine
-        ? 'Copying the picture into ComfyUI’s input folder.'
-        : null)
+    // The catalogue comes first. The archive can now open this bench straight
+    // from another route, which happens before `cat` has loaded, and claiming
+    // "no installed style can do this" while we have not yet read the model
+    // list is a confident falsehood rather than a delay.
+    (!cat
+      ? 'Reading the list of installed models from ComfyUI.'
+      : !refineDef
+        ? 'None of your installed models can redraw part of a picture. They all sample through a fixed schedule with no way to redraw just an area.'
+        : openingRefine
+          ? 'Getting the picture ready.'
+          : null)
 
   // --- the advanced panel, mounted only while More is open ----------------
   const advanced = (
     <div className="space-y-7">
-      <Choice
-        legend="What this desk is doing"
-        hint="A picture dropped or pasted on the page sets this on its own."
-        options={MODE_CHOICES.filter((m) => m.id !== 'edit' || !!editStyle)}
-        value={c.mode}
-        onChange={setMode}
-      />
-
       <div>
         <Choice legend="The look, in full" options={INTENTS} value={look} onChange={setLook} />
         <p className="mt-1.5 max-w-[62ch] text-caption text-grey-500">
@@ -1990,6 +2110,23 @@ export function Pictures() {
           </div>
         )}
 
+        {/*
+          What you are doing is the first question, not a parameter. It sits
+          here, above the desk, rather than inside one: `c.mode === 'edit'`
+          swaps EditDesk for ComposeDesk wholesale, so a control mounted inside
+          either desk would unmount itself the moment it was used to cross that
+          boundary, taking keyboard focus with it.
+        */}
+        <div className="mb-6">
+          <Choice
+            legend="What you want to do"
+            hint="Dropping or pasting a picture on the page switches this for you."
+            options={MODE_CHOICES.filter((m) => m.id !== 'edit' || !!editStyle)}
+            value={c.mode}
+            onChange={setMode}
+          />
+        </div>
+
         {c.mode === 'edit' ? (
           <EditDesk
             prompt={c.prompt}
@@ -2023,12 +2160,35 @@ export function Pictures() {
               setAnatomySaid(true)
               setAnatomy(next)
             }}
+            onAcceptAddOn={(file) =>
+              store.patch({
+                addOnsAccepted: [...new Set([...c.addOnsAccepted, file])],
+                addOnsDeclined: c.addOnsDeclined.filter((f) => f !== file),
+              })
+            }
+            onDeclineAddOn={(file) =>
+              store.patch({
+                addOnsDeclined: [...new Set([...c.addOnsDeclined, file])],
+                addOnsAccepted: c.addOnsAccepted.filter((f) => f !== file),
+              })
+            }
             recipe={recipe}
             source={c.source}
             needsSource={c.mode === 'i2i'}
+            // Reachable now that the mode control is on the page rather than buried
+            // in More: a reader can ask to work from a picture before handing one
+            // over. Refuse in plain words instead of quietly rendering from the
+            // prompt alone and throwing the intent away.
+            disabled={c.mode === 'i2i' && !c.source}
+            disabledWhy="Add a picture to work from, or choose From words."
             sourceBusy={uploading}
             sourceError={sourceError}
             onPickSource={canI2I ? () => setPicking(true) : undefined}
+            onEditRegion={
+              c.source && c.source.name && canRefine
+                ? () => void openRefineFromSource(c.source!)
+                : undefined
+            }
             onClearSource={clearSource}
             onRun={start}
             onStop={() => void stopRun()}
@@ -2075,8 +2235,8 @@ export function Pictures() {
               <p className="mb-3 text-caption leading-snug text-grey-700">
                 <Kicker className="block">Drawn by {refineStyle.label}</Kicker>
                 {refineBorrows
-                  ? `${style?.label ?? 'The model the recipe chose'} cannot re render a region, so the region is drawn by ${refineStyle.label} at its own settings. The rest of the picture is untouched, and any LoRAs are held back because they were resolved against a different architecture.`
-                  : 'The region is drawn by the model the recipe chose, at its own settings, with the LoRAs applied.'}
+                  ? `${refineSource?.madeBy ?? 'The model this desk is set to'} cannot redraw a region, so the area is drawn by ${refineStyle.label} at its own settings. The rest of the picture is untouched, and your add-ons are held back because they were chosen for a different model.`
+                  : 'The area is redrawn by the same model, at its own settings, with your add-ons applied.'}
               </p>
             )}
             {refineResult && (
@@ -2089,6 +2249,20 @@ export function Pictures() {
               </p>
             )}
             <RegionRefine
+              model={{
+                options: refineOptions.map((o) => ({
+                  id: `${o.def.id}::${o.model}`,
+                  label: o.label,
+                  group: o.group,
+                })),
+                value: refineStyle ? `${refineStyle.def.id}::${refineStyle.model}` : '',
+                onChange: (id: string) => setRefinePick(id),
+                note: refineBorrows
+                  ? refineSource?.madeBy
+                    ? `This picture was made with ${refineSource.madeBy}, which cannot redraw a region. This one will.`
+                    : 'The model this desk is set to cannot redraw a region. This one will.'
+                  : null,
+              }}
               source={refineSource}
               parentPrompt={refineSource?.prompt ?? ''}
               result={refineResult ? { url: fileUrl(refineResult.file) } : null}

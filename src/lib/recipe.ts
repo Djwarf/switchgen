@@ -86,9 +86,17 @@ export const LOOKS: readonly { id: Look; label: string; blurb: string }[] = [
 export type AnatomyLevel = 'off' | 'natural' | 'emphasised'
 
 export const ANATOMY_LEVELS: readonly { id: AnatomyLevel; label: string; blurb: string }[] = [
-  { id: 'off', label: 'Off', blurb: 'No anatomy LoRAs.' },
-  { id: 'natural', label: 'Natural', blurb: 'Measured 1.14x base sharpness.' },
-  { id: 'emphasised', label: 'Emphasised', blurb: 'Measured 0.92x base sharpness.' },
+  { id: 'off', label: 'Standard', blurb: 'Nothing extra.' },
+  {
+    id: 'natural',
+    label: 'Sharper faces and hands',
+    blurb: 'Adds two helpers for body structure and skin texture. Measured 1.14x sharper.',
+  },
+  {
+    id: 'emphasised',
+    label: 'Also explicit anatomy',
+    blurb: 'Adds a nude-detail helper on top. Measured 0.92x, softer than no helper at all.',
+  },
 ] as const
 
 // ---------------------------------------------------------------------------
@@ -126,7 +134,7 @@ const NATURAL_STACK: MeasuredStack = {
   ],
   laplacian: 189.2,
   ratio: 1.14,
-  verdict: 'Sharper than no LoRA at all, while carrying anatomy help.',
+  verdict: 'Sharper than using none, while still helping with bodies and hands.',
 }
 
 const EMPHASISED_STACK: MeasuredStack = {
@@ -138,14 +146,14 @@ const EMPHASISED_STACK: MeasuredStack = {
   laplacian: 152.4,
   ratio: 0.919,
   verdict:
-    'Below base. Three anatomy LoRAs overrun what micro details repays at 0.7, so more is not better here.',
+    'Worse than using none. Three body add-ons together overrun what the detail one repays, so more is not better here.',
 }
 
 export const MEASURED = {
   method:
     'Laplacian variance over the whole frame. Pony V6 XL at 832x1216, 28 steps, CFG 7, dpmpp_2m with karras, seed 99 held constant and the prompt unchanged.',
   metricCaveat:
-    'Laplacian variance measures sharpness, not anatomical correctness. A drop is a flag to inspect, never proof that a LoRA is wrong.',
+    'This measures sharpness, not whether a body came out right. A drop is a reason to look, never proof that an add-on is wrong.',
   baselineLaplacian: 165.9,
   /** anatomy-helper degrades monotonically. This is why it is capped at 0.4. */
   helperCurve: [
@@ -163,7 +171,7 @@ export const MEASURED = {
   faceDetailer: { ratio: 0.714 },
   /** Rule 5 of the handoff: these figures are Pony's, not Illustrious's. */
   transferNote:
-    'Measured on Pony V6. Illustrious and NoobAI share the LoRA ecosystem but were not measured, so treat the strengths there as a starting point.',
+    'Tested on Pony V6. Illustrious and NoobAI take the same add-ons but were not tested, so treat those strengths as a starting point.',
 } as const
 
 /** Denoise and pixel budget the picture desk already uses for image to image. */
@@ -235,6 +243,14 @@ export type Plan = {
   missingLoras: { file: string; label: string; why: string }[]
   /** Region LoRAs held for the refine pass, where close framing is what they need. */
   refineLoras: RecipeLora[]
+  /**
+   * Matched from your wording and NOT applied. These are offers: the reader
+   * accepts one and it joins {@link loras}, or ignores it and nothing happens.
+   * Previously these were pushed straight into the chain, which is the
+   * "auto parameters" complaint: the app decided, printed what it had decided,
+   * and gave the reader no moment to disagree before the press.
+   */
+  offers: RecipeLora[]
 
   passes: RecipePasses
   capabilities: Capabilities
@@ -280,6 +296,15 @@ export type RecipeInput = {
   installed?: Iterable<string>
   /** From loadLoraLibrary(). Omitted, no LoRA can be resolved and the recipe says so. */
   loras?: LoraLibrary
+  /**
+   * The reader's own decisions about offered add-ons, by filename. `accepted`
+   * are applied as if measured-for-this-prompt; `declined` are never offered
+   * again for this composition. Anything in neither list is still an open offer.
+   * decide() is pure, so these must be threaded in rather than remembered here:
+   * that is what makes a choice survive the next recompute instead of being
+   * quietly overwritten by the next suggestion.
+   */
+  addOns?: { accepted?: readonly string[]; declined?: readonly string[] }
   /** Omitted, one is rolled. */
   seed?: number
 }
@@ -408,7 +433,15 @@ export function decide(input: RecipeInput): Recipe {
   // 1. The brief. The anatomy control is a statement about the picture, so it
   // sets `explicit` on its own; the prompt can set it too, which is what keeps
   // a nude described in words off a base that was trained without any.
-  const explicit = anatomy !== 'off' || wantsExplicitAnatomy(prompt)
+  // Detail and explicitness are SEPARATE questions and must not share a switch.
+  // This line used to read `anatomy !== 'off' || wantsExplicitAnatomy(prompt)`,
+  // which made "I want better hands and faces" the identical input as "I want
+  // porn": intent.ts weightsFor() swings anatomy 0.05 -> 0.40 and craft 0.35 ->
+  // 0.15 on this boolean, so asking for detail actively demoted the craft models
+  // (Chroma, Z-Image, Flux, Qwen) in favour of booru bases. Wanting good anatomy
+  // is a universal quality need; wanting explicit content is a content choice.
+  // Only the brief itself decides the latter now.
+  const explicit = wantsExplicitAnatomy(prompt)
   const brief: Brief = { intent: look as Intent, explicit, mode: 'image' }
 
   // 2. Rank. feasibility() runs inside intentReport when hardware and sizes are
@@ -461,26 +494,34 @@ export function decide(input: RecipeInput): Recipe {
   // attach to Chroma, Z-Image, Flux or Qwen. When the reader asked for anatomy
   // help, a base that can carry it beats one that cannot, and the base that was
   // displaced is named rather than quietly dropped.
-  if (anatomy !== 'off') {
-    // Prefer the base the stack was MEASURED on. anatomy-helper and
-    // add-micro-details are catalogued as Pony files, so on an Illustrious
-    // carrier resolveStack drops them and the figure printed on screen
-    // describes a stack that is not running. Any booru base still beats a
-    // non-booru one; this only orders the booru candidates.
+  if (anatomy !== 'off' && !carriesAnatomy(pick.def, pick.model)) {
+    // THE LOOK PICKS THE MODEL. THE DETAIL SETTING NEVER DOES.
+    //
+    // This block used to REPLACE `pick` with a booru base whenever the detail
+    // setting was on, so asking for sharper faces on a photoreal brief quietly
+    // swapped Flux or Chroma for Pony and returned a painterly anime picture.
+    // The reader had chosen a look; a detail slider outranked it.
+    //
+    // Now the model the look earned is kept, the add-ons that cannot attach are
+    // simply not applied, and the trade is stated. A reader who actually wants
+    // the booru base can pick it themselves - that is a choice, not a silent
+    // substitution.
     const carriers = pool.filter(r => carriesAnatomy(r.def, r.model))
     const carrier =
       carriers.find(r => archFor(r.def, r.model) === MEASURED_ARCH) ?? carriers[0]
-    if (carrier && carrier !== pick) {
+    if (carrier) {
       notes.push(
         note(
           'model',
-          `${pick.label} ranks first on look alone. The anatomy LoRAs are SDXL booru files and will not attach to it, so ${carrier.label} was chosen: its training data carries explicit anatomy and it takes the stack.`,
+          `${pick.label} suits the look you asked for, so it is what renders. The face and hand helpers are SDXL booru files and will not attach to it, so they are not applied. ${carrier.label} would take them, if you would rather have the helpers than this look.`,
         ),
       )
-      pick = carrier
-    } else if (!carrier) {
-      warnings.push(
-        `No booru trained SDXL base is installed and runnable here, so the anatomy LoRAs have nothing to attach to. ${pick.label} will render the picture on its own.`,
+    } else {
+      notes.push(
+        note(
+          'model',
+          `${pick.label} renders this on its own. The face and hand helpers are SDXL booru files and nothing installed here can carry them.`,
+        ),
       )
     }
   }
@@ -508,7 +549,7 @@ export function decide(input: RecipeInput): Recipe {
     for (const [file, strength] of wanted.entries) {
       const info = lib.byFile.get(file)
       if (!info) {
-        missingLoras.push({ file, label: labelOf(lib, file), why: 'Not in the LoRA catalogue or the folder.' })
+        missingLoras.push({ file, label: labelOf(lib, file), why: 'Not in your add-ons folder, and no details known for it.' })
         continue
       }
       if (!info.installed) {
@@ -580,16 +621,16 @@ export function decide(input: RecipeInput): Recipe {
     notes.push(
       note(
         'anatomy',
-        `${pick.label} cannot take the anatomy LoRAs: they are SDXL booru files and this is a different architecture. The anatomy setting changes nothing about this render.`,
+        `${pick.label} cannot take those add-ons: they were made for a different kind of model. Your detail setting changes nothing for this render.`,
       ),
     )
   } else {
-    notes.push(note('anatomy', 'No anatomy LoRAs. The base renders on its own.'))
+    notes.push(note('anatomy', 'No body add-ons. The model is drawing this on its own.'))
   }
 
   if (missingLoras.length) {
     warnings.push(
-      `Not applied: ${missingLoras.map(m => m.label).join(', ')}. Download them in the LoRA panel and the level completes.`,
+      `Not applied: ${missingLoras.map(m => m.label).join(', ')}. Download them under Add-ons and they start being used.`,
     )
   }
 
@@ -610,7 +651,7 @@ export function decide(input: RecipeInput): Recipe {
   if (loras.length) {
     const chained = withLoras(def, loras.map(l => ({ name: l.file, strength: l.strength })))
     if (chained) def = chained
-    else warnings.push(`${pick.label} cannot take a LoRA chain, so the anatomy stack was not applied.`)
+    else warnings.push(`${pick.label} cannot take add-ons, so none were applied.`)
   }
 
   // 7. The prompt. The prefix and the trigger tokens are the two pieces of
@@ -634,7 +675,11 @@ export function decide(input: RecipeInput): Recipe {
   let promptPicks: { file: string; strength: number; why: string }[] = []
   try {
     const sug = suggestLoras({
-      prompt, model, installed: lib.byFile ? [...lib.byFile.keys()] : [], anatomy,
+      // Pass the LIBRARY, not a list of filenames. infoFor() returns null for a
+      // bare iterable, so every catalogue fact - category, label, recommended
+      // strength - was being thrown away, and the subject gate had nothing to
+      // read. InstalledLoras accepts either; only one of them works.
+      prompt, model, installed: lib, anatomy,
       already: resolvedFiles,
     } as never) as { stack?: { file: string; strength: number; why?: string }[] }
     promptPicks = (sug.stack ?? [])
@@ -645,20 +690,48 @@ export function decide(input: RecipeInput): Recipe {
     // suggestion is a bonus, never a dependency: a failure here must not stop a render
     promptPicks = []
   }
+  // OFFERS, NOT DECISIONS.
+  //
+  // These used to be pushed straight into `loras`. The reader asked for a
+  // picture and silently got two extra add-ons and their trigger words in the
+  // prompt. Now a pick is applied only if the reader has accepted it, hidden
+  // only if they have declined it, and otherwise carried out as an open offer
+  // the desk can print beside the button.
+  //
+  // The reader's decisions arrive as input, not as state kept here, so an
+  // accepted add-on survives every recompute. That is the whole point: a
+  // control that silently reverts is worse than no control.
+  const accepted = new Set(input.addOns?.accepted ?? [])
+  const declined = new Set(input.addOns?.declined ?? [])
+  const offers: RecipeLora[] = []
+  const appliedPicks: typeof promptPicks = []
   for (const pick of promptPicks) {
-    loras.push({ file: pick.file, label: labelOf(lib, pick.file), strength: pick.strength,
-      measured: false, why: pick.why })
+    if (declined.has(pick.file)) continue
+    const row: RecipeLora = {
+      file: pick.file,
+      label: labelOf(lib, pick.file),
+      strength: pick.strength,
+      measured: false,
+      why: pick.why,
+    }
+    if (accepted.has(pick.file)) {
+      loras.push(row)
+      appliedPicks.push(pick)
+    } else {
+      offers.push(row)
+    }
   }
-  if (promptPicks.length) {
-    notes.push(note('prompt', `Your wording also suggested ${promptPicks.length} LoRA` +
-      `${promptPicks.length === 1 ? '' : 's'}: ${promptPicks.map(p => labelOf(lib, p.file)).join(', ')}. ` +
-      `Those are matched from training vocabulary, not measured.`))
+  if (appliedPicks.length) {
+    notes.push(note('prompt', `You added ${appliedPicks.length} add-on` +
+      `${appliedPicks.length === 1 ? '' : 's'} matched to your wording: ` +
+      `${appliedPicks.map(p => labelOf(lib, p.file)).join(', ')}. ` +
+      `Matched from training vocabulary, not measured.`))
   }
 
   // Suggested LoRAs need their triggers as much as measured ones do. An
   // untriggered stack measured 0.786x of base, ie worse than using none, so
   // adding a LoRA without its token actively harms the picture.
-  const suggestedTriggers = promptPicks.flatMap(pick => {
+  const suggestedTriggers = appliedPicks.flatMap(pick => {
     const e = indexedTrigger(pick.file)
     return e ? [e] : []
   })
@@ -667,7 +740,7 @@ export function decide(input: RecipeInput): Recipe {
     .filter(t => !lower.includes(t.toLowerCase()))
   if (prefix.tokens.length) notes.push(note('prompt', prefix.why))
   if (triggers.length) {
-    notes.push(note('prompt', `Trigger tokens added for the LoRAs applied: ${triggers.join(', ')}.`))
+    notes.push(note('prompt', `These words were added to your prompt so the add-ons work: ${triggers.join(', ')}.`))
   }
 
   const positive = [...prefix.tokens, prompt, ...triggers].filter(Boolean).join(', ')
@@ -739,6 +812,7 @@ export function decide(input: RecipeInput): Recipe {
     sharpness,
     missingLoras,
     refineLoras,
+    offers,
     passes,
     capabilities,
     notes,

@@ -91,7 +91,7 @@ export const MEASURED_STACKS: readonly {
     ],
     ratio: 0.919,
     verdict:
-      'Slightly below base. Three anatomy LoRAs overrun what micro details repays at 0.7. Raise the restorer or drop one.',
+      'Slightly worse than using none. Three body add-ons overrun what the detail one repays. Raise that one, or drop a body add-on.',
   },
 ]
 
@@ -326,18 +326,18 @@ export function MeasurementNote({ target }: { target: LoraTarget }) {
     <div className="mt-2 border-t border-grey-300 pt-1.5">
       <Kicker>Where these numbers come from</Kicker>
       <p className="mt-1 text-caption leading-snug text-grey-700">
-        {MEASURED.method}, on {MEASURED.base} at {MEASURED.settings}. Only the LoRA stack changed
+        {MEASURED.method}, on {MEASURED.base} at {MEASURED.settings}. Only the add-ons changed
         between runs, so the differences are the stack's. Base frame: {MEASURED.baseline}.
       </p>
       <p className="mt-1 text-caption leading-snug italic text-warning">
-        It measures SHARPNESS, not anatomy. A LoRA can draw a body correctly and soften the skin
+        It measures SHARPNESS, not whether a body came out right. An add-on can draw a body correctly and soften the skin
         doing it, and this number marks that down. Use it to pick a strength. Judge the anatomy
         with your eyes.
       </p>
       {!measuredOnThisBase(target) ? (
         <p className="mt-1 text-caption leading-snug italic text-grey-700">
           Taken on {MEASURED.base} only, and that is not the checkpoint loaded here. Illustrious,
-          NoobAI and the Pony finetunes share the key layout, so the LoRAs load and the shape of
+          NoobAI and the Pony finetunes take the same add-ons, so they load and the shape of
           the effect should carry. The exact figures will not. Treat them as a starting point.
         </p>
       ) : null}

@@ -60,6 +60,7 @@
  * this method. {@link SuggestResult.blindSpot} carries the count so the UI can
  * say so instead of implying the other 39 are all there is.
  */
+import { wantsExplicitAnatomy } from './intent'
 import type { AnatomyLevel } from './recipe'
 import type { FamilyDef } from './registry'
 import {
@@ -383,6 +384,48 @@ const ANATOMY_TAGS = new Set([
   'breasts',
 ])
 
+/**
+ * Words that put a person in the frame.
+ *
+ * Deliberately broad and deliberately neutral: an add-on trained on human skin
+ * is equally wrong for a snow leopard whether the prompt is a clean portrait or
+ * an explicit one, so this asks only "is there a person here", never "what kind
+ * of picture is this". Explicit wording counts as a person and nothing more.
+ */
+const PERSON_WORDS = [
+  'person', 'people', 'man', 'men', 'woman', 'women', 'girl', 'boy', 'lady', 'guy',
+  'child', 'teen', 'adult', 'couple', 'human', 'figure', 'model', 'portrait',
+  'face', 'facial', 'eyes', 'eye', 'skin', 'hand', 'hands', 'finger', 'fingers',
+  'body', 'torso', 'chest', 'legs', 'arm', 'arms', 'shoulder', 'hair', 'lips',
+  'mouth', 'smile', 'smiling', 'freckles', 'nude', 'naked', 'she', 'he', 'her',
+  'his', 'him', 'herself', 'himself', 'selfie', 'headshot', 'bust',
+]
+
+/** True when the prompt puts a person in the picture. */
+function describesPerson(prompt: string): boolean {
+  const padded = ` ${prompt.toLowerCase().replace(/[^a-z0-9]+/g, ' ')} `
+  if (PERSON_WORDS.some(w => padded.includes(` ${w} `))) return true
+  // An explicit brief is a person brief, whatever else it names.
+  return wantsExplicitAnatomy(prompt)
+}
+
+/**
+ * True when an add-on only earns its keep on a human subject. Catalogued
+ * 'anatomy' and 'hands' add-ons are trained on bodies, skin, faces and fingers;
+ * applied to a landscape or an animal they spend capacity on features the
+ * picture does not contain.
+ */
+function isPersonSpecific(entry: LoraIndexEntry, info: LoraInfo | null): boolean {
+  if (info) return info.category === 'anatomy' || info.category === 'hands'
+  // No catalogue row. Fall back to what the file calls itself: these add-ons
+  // are named after the body parts they were trained on.
+  const name = `${entry.stem} ${entry.triggerPhrase}`.toLowerCase()
+  if (/\b(skin|hand|hands|finger|eyes|face|facial|anatomy|body|breast|nipple|areola|genital|pussy|penis|nude)\b/.test(name)) {
+    return true
+  }
+  return isAnatomyLora(entry, info)
+}
+
 function isAnatomyLora(entry: LoraIndexEntry, info: LoraInfo | null): boolean {
   if (info) return info.category === 'anatomy'
   const top = [...entry.promptTags, ...entry.concepts.slice(0, 8).map(c => c.tag)]
@@ -645,11 +688,21 @@ export function suggest(input: SuggestInput): SuggestResult {
     const cautions: string[] = []
     const anatomical = isAnatomyLora(entry, info)
 
-    if (anatomy === 'off' && anatomical) {
+    // THE SUBJECT GATE.
+    //
+    // This used to read `anatomy === 'off' && anatomical`, which hid every
+    // body-related add-on behind a global setting while happily recommending a
+    // human skin-hands-eyes add-on for a snow leopard, on the strength of both
+    // prompts containing the word 'photography'. The setting was never the
+    // right question. The right question is whether the picture has a person in
+    // it, and it is asked the same way for every subject: a hands add-on is
+    // wrong for a landscape for exactly the reason a landscape add-on would be
+    // wrong for a portrait.
+    if (isPersonSpecific(entry, info) && !describesPerson(input.prompt)) {
       rejected.push({
         file: entry.file,
         label,
-        why: 'Anatomy is set to off, and this is an anatomy LoRA. Turn anatomy on to see it.',
+        why: `${label} is trained on people, and nothing in this prompt names a person. It would spend its capacity on skin, hands and faces the picture does not contain.`,
       })
       return
     }

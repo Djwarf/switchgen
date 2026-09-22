@@ -90,14 +90,14 @@ export function Row({
               {label}
             </label>
             <Badge tone={fit.level} title={fit.why}>
-              {fit.level === 'match' ? 'fits' : fit.level === 'untested' ? 'untested' : 'wrong base'}
+              {fit.level === 'match' ? 'fits' : fit.level === 'untested' ? 'untested' : 'wrong model'}
             </Badge>
-            {info && !info.installed ? <Badge tone="mismatch">not installed</Badge> : null}
+            {info && !info.installed ? <Badge tone="mismatch">not downloaded</Badge> : null}
             {info?.slider ? <Badge tone="plain">slider</Badge> : null}
           </div>
 
           <p className="mt-0.5 text-[0.6875rem] leading-snug text-grey-500">
-            {info ? ARCH_LABEL[info.arch] : 'unknown base'}
+            {info ? ARCH_LABEL[info.arch] : 'model not known'}
             <span className="px-1 text-grey-300">|</span>
             {info ? USAGE_LABEL[info.usage] : 'either pass'}
             {info?.installed ? (
@@ -139,7 +139,7 @@ export function Row({
             // asked for, next to the number that was measured.
             recommended={capped ? undefined : info?.recommended}
             disabled={off}
-            label={`${label} strength`}
+            label={`How strongly ${label} applies`}
             onChange={(n) => onPatch({ strength: n })}
           />
         </div>
@@ -204,7 +204,7 @@ export function Row({
 
       {expert && clipPatched ? (
         <label className="mt-1 flex items-center justify-end gap-2 text-caption text-grey-700">
-          <span className="uppercase tracking-[0.14em]">text encoder</span>
+          <span className="uppercase tracking-[0.14em]">effect on wording</span>
           <input
             type="number"
             className="field w-16 px-1 py-0.5 text-center tabular-nums"
@@ -223,7 +223,7 @@ export function Row({
 
       {info?.trigger ? (
         <p className="mt-1 text-caption text-grey-700">
-          <span className="uppercase tracking-[0.14em] text-[0.5625rem] text-grey-500">trigger</span>{' '}
+          <span className="uppercase tracking-[0.14em] text-[0.5625rem] text-grey-500">needs this in the prompt</span>{' '}
           <span className="italic">{info.trigger}</span>
         </p>
       ) : null}

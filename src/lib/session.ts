@@ -160,6 +160,10 @@ const asNumberOrNull = (v: unknown): number | null => {
 const asNumber = (v: unknown, fallback: number): number => asNumberOrNull(v) ?? fallback
 const asString = (v: unknown, fallback: string): string => (typeof v === 'string' ? v : fallback)
 const asStringOrNull = (v: unknown): string | null => (typeof v === 'string' ? v : null)
+/** Filenames off disk, so anything that is not a string is dropped rather than trusted. */
+const asStringList = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+
 const asBoolean = (v: unknown, fallback: boolean): boolean =>
   typeof v === 'boolean' ? v : fallback
 
@@ -290,6 +294,17 @@ export type Composition = {
   runs: 1 | 2 | 4
 
   /**
+   * Add-ons the reader has decided about, by filename. The recipe matches
+   * add-ons to the wording and OFFERS them; nothing is applied until it appears
+   * in `addOnsAccepted`, and anything in `addOnsDeclined` is never offered
+   * again. Kept here rather than inside the recipe because decide() is pure and
+   * runs again on every keystroke: a decision held anywhere else would be
+   * recomputed away, which is the one thing a suggestion must never do.
+   */
+  addOnsAccepted: string[]
+  addOnsDeclined: string[]
+
+  /**
    * Fields the reader has set by hand. Everything else follows the family's
    * defaults and is re-derived when the style changes.
    */
@@ -376,6 +391,8 @@ export function newComposition(desk: DeskId, patch: Partial<Composition> = {}): 
     clipSkip: null,
     noLora: false,
     runs: 1,
+    addOnsAccepted: [],
+    addOnsDeclined: [],
     touched: [],
   }
   return { ...base, ...patch, desk }
@@ -662,6 +679,8 @@ function sanitiseDraft(desk: DeskId, raw: unknown): Composition {
     clipSkip: asNumberOrNull(d.clipSkip),
     noLora: asBoolean(d.noLora, base.noLora),
     runs: d.runs === 2 || d.runs === 4 ? d.runs : 1,
+    addOnsAccepted: asStringList(d.addOnsAccepted),
+    addOnsDeclined: asStringList(d.addOnsDeclined),
     touched,
   }
 }
@@ -1121,6 +1140,32 @@ export function reuseIntoDesk(entry: HistoryEntry, opts: ReuseOptions = {}): App
     clobbered,
     undo: () => target.set(previous),
   }
+}
+
+/**
+ * Cross-route handoff for the region bench.
+ *
+ * The bench lives on the Pictures desk, but a reader can ask for it from the
+ * Archive, which is a different route. Rather than thread a prop through the
+ * router, the Archive leaves the record here and navigates; Pictures takes it
+ * on its next render and opens the bench.
+ *
+ * Deliberately NOT part of Composition: this is a one-shot request, not desk
+ * state. Persisting it would reopen the bench on every reload, which is exactly
+ * the kind of sticky surprise the desk is trying to get away from.
+ */
+let pendingRegion: HistoryEntry | null = null
+
+/** Ask the Pictures desk to open the region bench on this record. */
+export function requestRegionEdit(entry: HistoryEntry): void {
+  pendingRegion = entry
+}
+
+/** Take the pending request, if any. Reading it clears it, so it fires once. */
+export function takeRegionRequest(): HistoryEntry | null {
+  const held = pendingRegion
+  pendingRegion = null
+  return held
 }
 
 /**

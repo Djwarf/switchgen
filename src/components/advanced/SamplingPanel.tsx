@@ -376,11 +376,11 @@ export function SamplingPanel({
       <Row
         label="Prompt as sent"
         id="adv-positive"
-        hint="prefix, your words, triggers"
+        hint="quality words, your words, add-on words"
         overridden={on('positive')}
         decided={<span className="not-italic">the recipe’s wording</span>}
         onRestore={() => clear('positive')}
-        note="Edit this and the prompt on the simple screen stops driving it, including the trigger tokens a LoRA needs."
+        note="Edit this and the box on the main screen stops driving it, including the words your add-ons need."
       >
         <textarea
           id="adv-positive"

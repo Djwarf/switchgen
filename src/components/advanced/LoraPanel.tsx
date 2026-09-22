@@ -94,11 +94,10 @@ export function LoraPanel({
   if (!plan.capabilities.loras) {
     return (
       <section className="mb-7">
-        <Head title="LoRAs" />
+        <Head title="Add-ons" />
         <Note>
-          {plan.label} loads a matched pair of weights, high noise and low noise, which take
-          different LoRAs at different strengths. One flat stack cannot express that, so the rack is
-          not offered on this family.
+          {plan.label} works in two halves that need different settings, and add-ons cannot yet be
+          set separately for each half. So they are not offered for this model.
         </Note>
       </section>
     )
@@ -107,9 +106,9 @@ export function LoraPanel({
   return (
     <section className="mb-7">
       <Head
-        title="LoRAs"
+        title="Add-ons"
         figure={stack.length ? `${enabled} of ${stack.length} on` : 'none'}
-        note="A LoRA changes what the model believes the subject looks like. A detail pass changes how many pixels it has to draw it in. Anatomy usually wants both."
+        note="An add-on teaches the model a style or a subject it does not draw well on its own. A detail pass just gives it more pixels to draw in. They fix different things."
       />
 
       {overridden ? (
@@ -119,18 +118,18 @@ export function LoraPanel({
           </span>
           <span>
             {decided.length
-              ? `The recipe resolved ${decided.length} LoRA${decided.length === 1 ? '' : 's'} for the anatomy level you chose.`
-              : 'The recipe resolved no LoRAs for the anatomy level you chose.'}
+              ? `${decided.length} add-on${decided.length === 1 ? ' was' : 's were'} picked for you. You have changed that.`
+              : 'Nothing was picked for you here. You added these yourself.'}
           </span>
-          <Link onClick={onRestore}>Put the decided stack back</Link>
+          <Link onClick={onRestore}>Go back to the picks</Link>
         </p>
       ) : null}
 
       {plan.sharpness && !overridden ? (
         <p className="mb-3 text-caption leading-snug text-grey-700">
           <Kicker>Measured</Kicker>
-          This stack came out at {ratio(plan.sharpness.ratio)} the sharpness of the same frame with
-          no LoRA on it. {plan.sharpness.verdict}{' '}
+          These add-ons came out {ratio(plan.sharpness.ratio)} as sharp as the same picture with none
+          of them on. {plan.sharpness.verdict}{' '}
           {plan.sharpness.onMeasuredModel
             ? `Measured on this checkpoint.`
             : `Measured on ${measuredOn}, not on this file, so treat it as a starting point.`}
@@ -169,25 +168,25 @@ export function LoraPanel({
           })}
         </ul>
       ) : (
-        <Note>No LoRAs in the chain. The base is rendering on its own.</Note>
+        <Note>No add-ons. The model is drawing this on its own, which is usually fine.</Note>
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <Quiet onClick={() => setPicking((v) => !v)} pressed={picking}>
-          {picking ? 'Close the library' : 'Add a LoRA'}
+          {picking ? 'Close' : 'Browse all add-ons'}
         </Quiet>
-        {stack.length ? <Quiet onClick={() => onStack([])}>Clear the chain</Quiet> : null}
+        {stack.length ? <Quiet onClick={() => onStack([])}>Remove all</Quiet> : null}
         {bytes ? (
-          <span className="text-caption tabular-nums text-grey-500">{size(bytes)} to load</span>
+          <span className="text-caption tabular-nums text-grey-500">{size(bytes)} of extra files to load</span>
         ) : null}
       </div>
 
       {stack.length > STACK_ADVICE_AT ? (
         <div className="mt-2">
           <Caution>
-            Past {STACK_ADVICE_AT} LoRAs the patches start fighting: each one rewrites the same
-            attention weights, and the sixth is usually the reason the fifth stopped working. This
-            is a soft limit, said out loud rather than enforced.
+            Past {STACK_ADVICE_AT} add-ons they start fighting each other: they all change the same
+              part of the model, so a newer one tends to undo the last. If one seems to have
+              stopped working, this is usually why. Nothing is blocked - it is a warning, not a limit.
           </Caution>
         </div>
       ) : null}
@@ -224,7 +223,7 @@ export function LoraPanel({
 
       {plan.missingLoras.length ? (
         <div className="mt-3">
-          <Kicker>Wanted by this level, not on disk</Kicker>
+          <Kicker>Would help here, not downloaded yet</Kicker>
           <ul className="mt-1 border-t border-grey-300">
             {plan.missingLoras.map((m) => (
               <li key={m.file} className="border-b border-grey-300 py-1.5">
@@ -233,20 +232,20 @@ export function LoraPanel({
               </li>
             ))}
           </ul>
-          <Note>Download them from the library above and the level completes on its own.</Note>
+          <Note>Download them from the list above and they start being used automatically.</Note>
         </div>
       ) : null}
 
       {plan.refineLoras.length ? (
         <details className="mt-4">
           <summary className="cursor-pointer text-caption text-grey-500">
-            Held for the refine pass ({plan.refineLoras.length})
+            Saved for touch-ups ({plan.refineLoras.length})
           </summary>
           <Note>
-            These were trained on close framing and do almost nothing at whole body scale, which is
-            the crop the refine pass renders. They are offered on the finished picture instead, where
-            you can see whether the region needs one. Adding one here applies it to the whole frame,
-            which is allowed and rarely what it was made for.
+            These were made from close-up photographs, so they do almost nothing across a whole
+              figure. They are offered on the finished picture instead, where you can paint over the
+              exact area and see whether it needs one. Adding one here applies it to the whole
+              picture, which is allowed and rarely what it was made for.
           </Note>
           <ul className="mt-1 border-t border-grey-300">
             {plan.refineLoras.map((l) => {
