@@ -13,7 +13,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { confineReal, guardMutation, readBody, send, tools } from './guard.mjs'
+import { confineReal, guardMutation, readBody, reqUrl, safely, send, tools } from './guard.mjs'
 
 const run = promisify(execFile)
 
@@ -172,7 +172,11 @@ const METHODS = new Map([
 
 export function switchgenApi() {
   const handler = async (req, res, next) => {
-    const url = new URL(req.url, 'http://local')
+    // This is the first of the SwitchGen middlewares, so a request path that
+    // is not a URL at all is answered here, for all of them. Handing it on
+    // would give the same unreadable path to everything after.
+    const url = reqUrl(req)
+    if (!url) return send(res, 400, { error: 'the request path is not a valid URL' })
     if (!url.pathname.startsWith('/api/')) return next()
 
     try {
@@ -286,7 +290,7 @@ export function switchgenApi() {
 
   return {
     name: 'switchgen-api',
-    configureServer(server) { server.middlewares.use(handler) },
-    configurePreviewServer(server) { server.middlewares.use(handler) },
+    configureServer(server) { server.middlewares.use(safely(handler)) },
+    configurePreviewServer(server) { server.middlewares.use(safely(handler)) },
   }
 }

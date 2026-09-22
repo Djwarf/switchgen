@@ -12,14 +12,14 @@
  * and the HuggingFace token is passed to aria2c through a 0600 input file so it
  * never reaches argv, a log line, or a response body.
  */
-import { promises as fs } from 'node:fs'
+import { promises as fs, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { TOOLS, confine, guardMutation, readBody, send, sse, sseOpen } from './guard.mjs'
+import { TOOLS, confine, guardMutation, readBody, reqUrl, safely, send, sse, sseOpen } from './guard.mjs'
 
 const run = promisify(execFile)
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -48,17 +48,25 @@ const human = n => (n >= GIB ? (n / GIB).toFixed(1) + ' GB' : n >= 1048576 ? Mat
 async function walk(dir, root = dir, out = []) {
   let entries
   try { entries = await fs.readdir(dir, { withFileTypes: true }) } catch { return out }
+  const names = new Set(entries.map(e => e.name))
   for (const e of entries) {
     const full = path.join(dir, e.name)
     if (e.isDirectory()) await walk(full, root, out)
     else if (WEIGHTS.test(e.name)) {
       try {
         const st = await fs.stat(full)
-        out.push({ name: e.name, rel: path.relative(root, full), size: st.size })
+        // aria2c's control file sits beside a download until its last byte
+        // lands. It is the only proof that a file is this app's own partial.
+        const resumable = names.has(e.name + '.aria2')
+        out.push({ name: e.name, rel: path.relative(root, full), size: st.size, resumable })
       } catch { /* vanished mid-walk */ }
     }
   }
   return out
+}
+
+async function exists(p) {
+  try { await fs.access(p); return true } catch { return false }
 }
 
 /** Filename -> {rel, size}, so a weight counts as installed wherever it sits in
@@ -139,7 +147,15 @@ function annotateDep(dep, index) {
   const want = dep.sizeBytes ?? null
   // A short file is a partial or a different quant under the same name; either
   // way it is not the file the graph expects, so do not call it installed.
-  const complete = !!hit && (want == null || dep.sizeApprox || hit.size >= want * 0.995)
+  // Nor is a file with aria2c's control file beside it: several connections
+  // fill pieces out of order, so a partial can already be full size.
+  const complete = !!hit && !hit.resumable && (want == null || dep.sizeApprox || hit.size >= want * 0.995)
+  // Only that control file shows a short file is the start of this download,
+  // and a resume happens only where the fetch writes, at `dest`. A short file
+  // at `dest` without one is some other file that shares the name (this
+  // machine's own Z-Image text encoder is one), and resuming onto it would
+  // append the catalogue file's tail to it and destroy both.
+  const atDest = !!hit && hit.rel === dep.dest
   return {
     filename: dep.filename,
     kind: dep.kind,
@@ -155,7 +171,8 @@ function annotateDep(dep, index) {
     installed: complete,
     installedPath: hit ? hit.rel : null,
     installedBytes: hit ? hit.size : 0,
-    partial: !!hit && !complete,
+    partial: atDest && !complete && hit.resumable,
+    conflict: atDest && !complete && !hit.resumable,
   }
 }
 
@@ -282,6 +299,13 @@ function fitVerdict(fam, ann, hw) {
     if (!f.installed && f.httpStatus && f.httpStatus !== 200 && !f.gated) {
       blockers.push(`${f.filename} answered HTTP ${f.httpStatus} when its URL was last checked.`)
     }
+    if (f.conflict) {
+      blockers.push(
+        `${f.dest} is already on disk at ${human(f.installedBytes)}` +
+        (f.sizeBytes ? `, not the ${human(f.sizeBytes)} this family expects,` : '') +
+        ` and it is not a fetch that stopped part way. It is probably another version of the file under the ` +
+        `same name, so it is left alone: move it aside to fetch this one.`)
+    }
   }
 
   if (vram && need) {
@@ -320,6 +344,65 @@ const jobs = new Map()
  */
 const MAX_ACTIVE_PLANS = 2
 let activePlans = 0
+/** How long a cancel waits for aria2c to let go of the file before forcing it. */
+const STOP_WAIT_MS = 10000
+
+/**
+ * Stop a plan: the file it is on, and every file after it.
+ *
+ * Nothing used to stop a plan as a whole. A cancel that landed while a file
+ * was still starting only flagged it, and fetchFile then marked it
+ * downloading again and spawned aria2c, and the loop went on to the next
+ * file. So the plan carries the flag, the check runs again before each spawn,
+ * and the size probe a starting file waits on is aborted with it. aria2c gets
+ * SIGTERM, which it treats as a clean stop: it keeps its control file, so
+ * the partial resumes on the next fetch unless the cancel removes it.
+ */
+function stopPlan(plan) {
+  plan.cancelled = true
+  plan.abort.abort()
+  const job = plan.current
+  if (job && (job.state === 'starting' || job.state === 'downloading')) {
+    job.state = 'cancelled'
+    if (job.pid) { try { process.kill(job.pid, 'SIGTERM') } catch { /* already gone */ } }
+  }
+}
+
+/**
+ * Every aria2c this process has running, stopped when the process exits.
+ *
+ * aria2c is not tied to the server's life. When `switchgen stop` ends the
+ * server, Vite exits before a closed response can stop its plan, and aria2c,
+ * which writes nothing to its pipes while it works, goes on downloading with
+ * nobody watching; the next fetch of that file then starts a second aria2c on
+ * the same bytes. SIGTERM from the exit hook stops each one cleanly, leaving
+ * its partial and control file for the next fetch to resume. Its input file
+ * goes too: that is where a gated fetch's token sits, and nothing else would
+ * remove it once this process is gone.
+ *
+ * The map lives on globalThis because Vite loads this file afresh each time
+ * its config reloads, and the hook must be added once, not once per load.
+ */
+const LIVE = Symbol.for('switchgen.aria2c')
+const liveAria2c = globalThis[LIVE] ??= (() => {
+  const live = new Map() // child -> its input file
+  process.once('exit', () => {
+    for (const [child, listFile] of live) {
+      try { child.kill('SIGTERM') } catch { /* already gone */ }
+      try { unlinkSync(listFile) } catch { /* already gone */ }
+    }
+  })
+  return live
+})()
+
+/** True when `promise` settles within `ms`, false when the time runs out first. */
+function within(promise, ms) {
+  let timer
+  return Promise.race([
+    promise.then(() => true, () => true),
+    new Promise(resolve => { timer = setTimeout(() => resolve(false), ms) }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 function publicJob(j) {
   return {
@@ -342,13 +425,32 @@ function publicJob(j) {
 }
 
 /**
+ * HuggingFace's own hosts: the site, and hf.co, which its file CDN answers
+ * under. Wider than TOKEN_HOSTS on purpose: this is where a redirect may lead,
+ * not where the token is attached by this code.
+ */
+function huggingFaceOwned(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase()
+    return h === 'huggingface.co' || h.endsWith('.huggingface.co') || h === 'hf.co' || h.endsWith('.hf.co')
+  } catch { return false }
+}
+
+/**
  * Content-Length for a URL, so progress is honest even when the catalogue size
  * is approximate. Uses Node's own fetch rather than shelling out to curl, so a
  * bearer token never appears in argv. Returns nulls rather than guessing.
+ *
+ * With a token it walks the redirects itself, and `offsite` names the first
+ * host on the way that HuggingFace does not own. aria2c sends its headers
+ * again on every redirect it follows, wherever that leads, so the caller uses
+ * this to refuse before handing aria2c the token.
  */
-async function remoteSize(url, token) {
+async function remoteSize(url, token, signal) {
   const ac = new AbortController()
   const t = setTimeout(() => ac.abort(), 30000)
+  const sig = signal ? AbortSignal.any([ac.signal, signal]) : ac.signal
+  let offsite = null
   try {
     // A one-byte ranged GET rather than a HEAD: undici drops Content-Length from
     // HEAD responses, but Content-Range on a 206 carries the true total.
@@ -359,15 +461,16 @@ async function remoteSize(url, token) {
       const mayAuth = !!token && tokenAllowedFor(url)
       if (mayAuth) headers.Authorization = `Bearer ${token}`
       let r = await fetch(url, {
-        method: 'GET', redirect: mayAuth ? 'manual' : 'follow', signal: ac.signal, headers,
+        method: 'GET', redirect: mayAuth ? 'manual' : 'follow', signal: sig, headers,
       })
       for (let hop = 0; mayAuth && r.status >= 300 && r.status < 400 && hop < 5; hop++) {
         const loc = r.headers.get('location')
         if (!loc) break
         const next = new URL(loc, url).toString()
+        if (!huggingFaceOwned(next)) offsite ??= new URL(next).hostname
         const h2 = { Range: 'bytes=0-0' }
         if (tokenAllowedFor(next)) h2.Authorization = `Bearer ${token}`
-        r = await fetch(next, { method: 'GET', redirect: 'manual', signal: ac.signal, headers: h2 })
+        r = await fetch(next, { method: 'GET', redirect: 'manual', signal: sig, headers: h2 })
       }
     let size = null
     const cr = r.headers.get('content-range')
@@ -378,9 +481,9 @@ async function remoteSize(url, token) {
       if (len && r.status === 200) size = Number(len)
     }
     try { await r.body?.cancel() } catch {}
-    return { size, status: r.status === 206 ? 200 : r.status }
+    return { size, status: r.status === 206 ? 200 : r.status, offsite }
   } catch {
-    return { size: null, status: null }
+    return { size: null, status: null, offsite }
   } finally { clearTimeout(t) }
 }
 
@@ -396,6 +499,24 @@ function fetchFile(job, onProgress) {
     if (!full) return reject(new Error('destination escapes the models root'))
     await fs.mkdir(path.dirname(full), { recursive: true })
 
+    // aria2c -c treats whatever bytes are already at the destination as the
+    // start of the remote file and appends the rest. Only its control file
+    // proves those bytes are this download's own. A file without one was
+    // there before, and is left exactly as it is.
+    const [present, resumable] = await Promise.all([exists(full), exists(full + '.aria2')])
+    if (present && !resumable) {
+      return reject(new Error(
+        `${job.dest} is already on disk and is not a fetch that stopped part way. It is probably another ` +
+        `version of the file under the same name, so it was left alone: move it aside to fetch this one.`))
+    }
+
+    // The token goes to HuggingFace and nowhere else, whatever marked the job
+    // gated. The size probe checks the host as well, but the probe is not the
+    // request that matters: aria2c, started below, carries the token to the
+    // real download.
+    if (job.gated && !tokenAllowedFor(job.url)) {
+      return reject(new Error(`${job.filename} is marked gated but its URL is not on HuggingFace, so the token is not sent`))
+    }
     const token = job.gated ? await hfToken() : null
     if (job.gated && !token) {
       return reject(new Error(`${job.filename} is gated and no HuggingFace token was found at ${HF_TOKEN_FILE}`))
@@ -405,6 +526,13 @@ function fetchFile(job, onProgress) {
     const lines = [job.url, `  dir=${path.dirname(full)}`, `  out=${path.basename(full)}`]
     if (token) lines.push(`  header=Authorization: Bearer ${token}`)
     await fs.writeFile(listFile, lines.join('\n') + '\n', { mode: 0o600 })
+
+    // A cancel can land during any of the awaits above. Nothing yields
+    // between this check and the spawn, so none can land after it.
+    if (job.state === 'cancelled') {
+      try { await fs.unlink(listFile) } catch {}
+      return reject(new Error('cancelled'))
+    }
 
     const child = spawn(ARIA2C, [
       '-i', listFile,
@@ -417,6 +545,7 @@ function fetchFile(job, onProgress) {
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
     job.pid = child.pid
     job.state = 'downloading'
+    liveAria2c.set(child, listFile)
 
     let stderr = ''
     child.stderr.on('data', d => {
@@ -442,6 +571,7 @@ function fetchFile(job, onProgress) {
 
     const finish = async (err) => {
       clearInterval(poll)
+      liveAria2c.delete(child)
       try { await fs.unlink(listFile) } catch {}
       job.pid = null
       if (err) return reject(err)
@@ -466,32 +596,50 @@ function fetchFile(job, onProgress) {
   })().catch(reject) })
 }
 
-/** Run a queue of files through aria2c, streaming SSE for each. */
-async function runPlan(res, queue, familyId, mine = new Set()) {
+/**
+ * Run a queue of files through aria2c, streaming SSE for each. `plan` is the
+ * request's own stop switch (see stopPlan), checked before each file starts
+ * and again once its size probe returns.
+ */
+async function runPlan(res, queue, familyId, plan) {
   const ids = []
   let bytes = 0
   for (let i = 0; i < queue.length; i++) {
     const f = queue[i]
     const id = crypto.randomUUID()
     ids.push(id)
+    let settle
     const job = {
       id, family: familyId, filename: f.filename, dest: f.dest, url: f.url,
       gated: !!f.gated, total: f.sizeBytes ?? 0, done: 0, speed: 0, etaSec: null,
       state: 'starting', startedAt: Date.now(), fileIndex: i + 1, fileCount: queue.length,
       error: null, pid: null,
+      plan,
+      // Settles when this file's turn is over, however it ended. A cancel
+      // waits on it so it never removes a partial aria2c still has open.
+      settled: new Promise(resolve => { settle = resolve }),
     }
     jobs.set(id, job)
-    mine.add(id)
+    plan.current = job
     sse(res, 'start', publicJob(job))
 
     try {
+      if (plan.cancelled) throw new Error('cancelled')
+      const full = confine(MODELS, job.dest)
+      if (!full) throw new Error('destination escapes the models root')
       // Trust the wire over the catalogue for the progress denominator.
       const token = job.gated && tokenAllowedFor(job.url) ? await hfToken() : null
-      const { size, status } = await remoteSize(job.url, token)
+      const { size, status, offsite } = await remoteSize(job.url, token, plan.abort.signal)
+      if (plan.cancelled) throw new Error('cancelled')
       if (size) job.total = size
       if (status && status >= 400) throw new Error(`${job.filename} answered HTTP ${status}`)
-      const already = await fs.stat(confine(MODELS, job.dest)).catch(() => null)
-      if (already && job.total && already.size >= job.total) {
+      if (token && offsite) {
+        throw new Error(`${job.filename} redirects to ${offsite}, outside HuggingFace, so the token is not sent`)
+      }
+      const already = await fs.stat(full).catch(() => null)
+      // A control file beside it means aria2c has not finished it, whatever its size.
+      const resumable = await exists(full + '.aria2')
+      if (already && !resumable && job.total && already.size >= job.total) {
         job.done = already.size
         job.state = 'done'
         bytes += job.done
@@ -504,15 +652,19 @@ async function runPlan(res, queue, familyId, mine = new Set()) {
       bytes += job.done
       sse(res, 'file', publicJob(job))
     } catch (err) {
-      job.state = job.state === 'cancelled' ? 'cancelled' : 'error'
+      job.state = job.state === 'cancelled' || plan.cancelled ? 'cancelled' : 'error'
       job.error = String(err?.message ?? err)
       sse(res, 'error', publicJob(job))
       jobs.delete(id)
       try { res.end() } catch {}
       return
+    } finally {
+      // Whatever happened, the disk may have changed under the index: a file
+      // landed, or a partial was left for the next fetch to resume.
+      installedCache = { at: 0, byName: new Map() }
+      settle()
     }
     jobs.delete(id)
-    installedCache = { at: 0, byName: new Map() }
   }
   sse(res, 'done', { ids, family: familyId, files: queue.map(f => f.filename), bytes })
   try { res.end() } catch {}
@@ -521,7 +673,10 @@ async function runPlan(res, queue, familyId, mine = new Set()) {
 // ---------------------------------------------------------------- handler ---
 
 export const downloadsMiddleware = async (req, res, next) => {
-  const url = new URL(req.url, 'http://local')
+  // An unreadable path is refused rather than parsed where it can throw.
+  // See reqUrl in guard.mjs for what that throw used to do.
+  const url = reqUrl(req)
+  if (!url) return send(res, 400, { error: 'the request path is not a valid URL' })
   const p = url.pathname
   if (!p.startsWith('/api/catalog') && !p.startsWith('/api/download')) return next()
 
@@ -621,25 +776,44 @@ export const downloadsMiddleware = async (req, res, next) => {
       if (!b || typeof b.id !== 'string') return send(res, 400, { error: 'id must be a string' })
       const job = jobs.get(b.id)
       if (!job) return send(res, 404, { error: 'no such download' })
-      job.state = 'cancelled'
-      if (job.pid) { try { process.kill(job.pid, 'SIGTERM') } catch {} }
-      // Give aria2c a moment to release the file, then drop the partial and its
-      // control file unless the caller wants to resume later.
+      // A file is cancelled by stopping its plan: a plan has always ended at
+      // its first failed file, and a cancelled one must not start the next.
+      // The job stays in the table until runPlan lets it go, so a file that
+      // is still starting stays visible, and a fetch of the same file is
+      // refused, until it has really stopped.
+      stopPlan(job.plan)
+      if (!(await within(job.settled, STOP_WAIT_MS)) && job.pid) {
+        try { process.kill(job.pid, 'SIGKILL') } catch { /* already gone */ }
+        await within(job.settled, 2000)
+      }
+      // Drop the partial and its control file unless the caller wants to
+      // resume later. Only a file with aria2c's control file beside it is a
+      // partial. Anything else at that path was there before this fetch, a
+      // finished file or another one under the same name, and is not the
+      // cancel's to delete.
       const full = confine(MODELS, job.dest)
-      let removed = []
-      if (full && b.keepPartial !== true) {
-        await new Promise(r => setTimeout(r, 400))
+      const removed = []
+      if (full && b.keepPartial !== true && await exists(full + '.aria2')) {
         for (const f of [full, full + '.aria2']) {
           try { await fs.unlink(f); removed.push(path.relative(MODELS, f)) } catch {}
         }
+        installedCache = { at: 0, byName: new Map() }
       }
-      jobs.delete(b.id)
       return send(res, 200, { cancelled: b.id, removed, keptPartial: b.keepPartial === true })
     }
 
     // ---- POST /api/download -----------------------------------------------
     if (p === '/api/download' && req.method === 'POST') {
       if (!guardMutation(req, res)) return
+      // The client hanging up stops the plan, and keeps the partial so -c can
+      // resume it. That has to be heard on the response. The request's own
+      // 'close' fires once its body is read, which readBody below does
+      // straight away, so a listener on it heard nothing: aria2c ran on to
+      // the end of the file, and the plan to the end of its queue. It is
+      // armed before the first await, because the checks below take long
+      // enough for a tab to close during them.
+      const plan = { cancelled: false, current: null, abort: new AbortController() }
+      res.on('close', () => { if (!res.writableEnded) stopPlan(plan) })
       const b = await readBody(req)
       if (!b) return send(res, 400, { error: 'body must be JSON under 1 MB' })
       if (activePlans >= MAX_ACTIVE_PLANS) {
@@ -674,8 +848,14 @@ export const downloadsMiddleware = async (req, res, next) => {
           : filename
         if (!confine(MODELS, dest)) return send(res, 400, { error: 'dest escapes the models root' })
         const cat = await catalog()
-        const known = cat.depsByName.get(path.basename(dest))
-        queue = [{ filename, dest, url: b.url, sizeBytes: known?.sizeBytes ?? null, gated: !!known?.gated /* never trust the caller: this decides whether a token is attached */ }]
+        // A catalogue entry vouches for its own URL and nothing else. It was
+        // matched by file name alone, so a caller could name a gated file as
+        // the destination, supply any URL, and have the HuggingFace token sent
+        // there. `gated` decides whether the token is attached, so it comes
+        // only from an entry whose URL is the one being fetched.
+        const entry = cat.depsByName.get(path.basename(dest))
+        const known = entry && entry.url === b.url ? entry : null
+        queue = [{ filename, dest, url: b.url, sizeBytes: known?.sizeBytes ?? null, gated: !!known?.gated }]
         // The family path is checked by fitVerdict. A bare URL gets the same
         // disk check, using the wire size when the catalogue has none, so a
         // LoRA fetch cannot fill the disk that the next generation needs.
@@ -683,7 +863,7 @@ export const downloadsMiddleware = async (req, res, next) => {
         let bytes = known?.sizeBytes ?? null
         if (bytes == null) {
           const token = queue[0].gated && tokenAllowedFor(b.url) ? await hfToken() : null
-          bytes = (await remoteSize(b.url, token)).size
+          bytes = (await remoteSize(b.url, token, plan.abort.signal)).size
         }
         if (disk && bytes != null && bytes + DISK_RESERVE > disk.free) {
           return send(res, 409, {
@@ -696,9 +876,13 @@ export const downloadsMiddleware = async (req, res, next) => {
         return send(res, 400, { error: 'send {family} or {url, dest, filename}' })
       }
 
-      const clash = queue.find(f => [...jobs.values()].some(j => j.dest === f.dest))
-      if (clash) {
-        return send(res, 409, { error: `${clash.filename} is already downloading`, dest: clash.dest })
+      for (const f of queue) {
+        const other = [...jobs.values()].find(j => j.dest === f.dest)
+        if (!other) continue
+        const error = other.state === 'cancelled'
+          ? `${f.filename} is still stopping; try again in a moment`
+          : `${f.filename} is already downloading`
+        return send(res, 409, { error, dest: f.dest })
       }
 
       if (!queue.length) {
@@ -716,21 +900,14 @@ export const downloadsMiddleware = async (req, res, next) => {
         if (!f.url) return send(res, 409, { error: `no verified URL for ${f.filename}; it must be placed by hand` })
       }
 
+      // Nobody is listening any more; do not start fetching for them.
+      if (plan.cancelled) return
+
       sseOpen(res)
       sse(res, 'plan', { family: familyId, files: queue.map(f => ({ filename: f.filename, dest: f.dest, sizeBytes: f.sizeBytes, gated: f.gated })) })
-      const mine = new Set()
-      req.on('close', () => {
-        for (const j of jobs.values()) {
-          if (mine.has(j.id) && j.state === 'downloading' && j.pid) {
-            // the client hung up; leave the partial so -c can resume it
-            j.state = 'cancelled'
-            try { process.kill(j.pid, 'SIGTERM') } catch {}
-          }
-        }
-      })
       activePlans += 1
       try {
-        await runPlan(res, queue, familyId, mine)
+        await runPlan(res, queue, familyId, plan)
       } finally {
         activePlans -= 1
       }
@@ -748,8 +925,8 @@ export const downloadsMiddleware = async (req, res, next) => {
 export function switchgenDownloads() {
   return {
     name: 'switchgen-downloads',
-    configureServer(server) { server.middlewares.use(downloadsMiddleware) },
-    configurePreviewServer(server) { server.middlewares.use(downloadsMiddleware) },
+    configureServer(server) { server.middlewares.use(safely(downloadsMiddleware)) },
+    configurePreviewServer(server) { server.middlewares.use(safely(downloadsMiddleware)) },
   }
 }
 

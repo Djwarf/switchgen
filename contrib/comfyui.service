@@ -18,7 +18,11 @@ ExecStart=%h/ComfyUI/venv/bin/python main.py \
   --output-directory %h/ai/outputs \
   --preview-method auto \
   --disable-smart-memory
-Restart=on-failure
+# always, not on-failure. earlyoom stops ComfyUI with SIGTERM, and systemd
+# counts a SIGTERM death as a clean exit, so on-failure never brought it back:
+# on 2026-09-22 earlyoom stopped it and it stayed down. `systemctl --user stop
+# comfyui` still stops it for good; always only restarts what it did not stop.
+Restart=always
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=30

@@ -68,7 +68,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { confineReal, guardMutation, readBody, send } from './guard.mjs'
+import { confineReal, guardMutation, readBody, reqUrl, safely, send } from './guard.mjs'
 
 const MODELS = process.env.SWITCHGEN_MODELS ?? '/mnt/storage/ai/models'
 const OUTPUTS = process.env.SWITCHGEN_OUTPUTS ?? '/mnt/storage/ai/outputs'
@@ -152,6 +152,20 @@ async function exists(p) {
 
 async function sizeOf(p) {
   try { return (await fs.stat(p)).size } catch { return null }
+}
+
+/**
+ * Is a fetched file all there? Being on disk is not enough: aria2c writes
+ * under the final name, so a fetch cut short leaves a file that exists and
+ * does not load, and nothing in the app would fetch it again. aria2c keeps its
+ * control file beside a download until the last byte lands, and with several
+ * connections it fills pieces out of order, so a file can reach full size
+ * while still a partial. A file cut short some other way is caught by its
+ * size, with the same 0.5% of slack the downloader's own check allows.
+ */
+async function whole(p, bytes) {
+  const [size, partial] = await Promise.all([sizeOf(p), exists(p + '.aria2')])
+  return size != null && !partial && size >= bytes * 0.995
 }
 
 /**
@@ -413,7 +427,10 @@ function runPython(request, signal) {
  * deleteFiles.
  */
 async function capabilities() {
-  const [python, model, tagsCsv] = await Promise.all([exists(PYTHON), exists(WD14_MODEL), exists(WD14_TAGS)])
+  const [modelSource, tagsSource] = WD14_SOURCE.files
+  const [python, model, tagsCsv, modelStarted] = await Promise.all([
+    exists(PYTHON), whole(WD14_MODEL, modelSource.sizeBytes), whole(WD14_TAGS, tagsSource.sizeBytes), exists(WD14_MODEL),
+  ])
   const [modelBytes, detectors] = await Promise.all([
     sizeOf(WD14_MODEL),
     (async () => {
@@ -441,7 +458,9 @@ async function capabilities() {
       ? null
       : !python
         ? `no interpreter at ${PYTHON}; set SWITCHGEN_PYTHON to one that has onnxruntime`
-        : `the tagger is not downloaded yet; it is ${(WD14_SOURCE.files[0].sizeBytes / 1048576).toFixed(0)} MB`,
+        : modelStarted && !model
+          ? 'the tagger download did not finish; fetch it again to complete it'
+          : `the tagger is not downloaded yet; it is ${(modelSource.sizeBytes / 1048576).toFixed(0)} MB`,
   }
 }
 
@@ -476,7 +495,10 @@ async function withUpload(req, fn) {
 }
 
 export const visionMiddleware = async (req, res, next) => {
-  const url = new URL(req.url, 'http://local')
+  // An unreadable path is refused rather than parsed where it can throw.
+  // See reqUrl in guard.mjs for what that throw used to do.
+  const url = reqUrl(req)
+  if (!url) return send(res, 400, { error: 'the request path is not a valid URL' })
   const p = url.pathname
   if (!p.startsWith('/api/vision')) return next()
 
@@ -585,8 +607,8 @@ export const visionMiddleware = async (req, res, next) => {
 export function switchgenVision() {
   return {
     name: 'switchgen-vision',
-    configureServer(server) { server.middlewares.use(visionMiddleware) },
-    configurePreviewServer(server) { server.middlewares.use(visionMiddleware) },
+    configureServer(server) { server.middlewares.use(safely(visionMiddleware)) },
+    configurePreviewServer(server) { server.middlewares.use(safely(visionMiddleware)) },
   }
 }
 

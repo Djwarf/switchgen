@@ -13,8 +13,37 @@ if [ -f .env ]; then set -a; . ./.env; set +a; fi
 COMFY_URL="${COMFY_URL:-http://127.0.0.1:8188}"
 PORT="${SWITCHGEN_PORT:-5273}"
 URL="http://localhost:${PORT}"
+LOG=/tmp/switchgen-preview.log
+NO_OPEN="${SWITCHGEN_NO_OPEN:-}"
+# README gives `switchgen --no-open`; the usage line gives `start --no-open`.
+if [ "${1:-}" = "--no-open" ] || [ "${2:-}" = "--no-open" ]; then NO_OPEN=1; fi
 
 comfy_up() { curl -sf -o /dev/null "$COMFY_URL/system_stats"; }
+
+# Is SwitchGen itself answering on the port? Anything could be listening
+# there, so ask the one route only this server answers that way.
+app_up() {
+  local body
+  body=$(curl -sf "$URL/api/capabilities" 2>/dev/null) || return 1
+  [[ $body == *'"server":"switchgen"'* ]]
+}
+
+# This checkout's preview server and nothing else. `pkill -f "vite preview"`
+# matched any process whose command line held those words: another
+# project's preview server, or a grep for them. The server's command line
+# begins with node and this checkout's own vite, so match that from the
+# start, with the regex characters in the path escaped.
+server_pattern() {
+  local esc
+  esc=$(printf '%s' "$APP" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+  printf '^([^ ]*/)?node %s/node_modules/\\.bin/vite preview' "$esc"
+}
+
+open_app() {
+  if [ -z "$NO_OPEN" ]; then
+    command -v xdg-open >/dev/null && xdg-open "$URL" >/dev/null 2>&1 || true
+  fi
+}
 
 ensure_comfy() {
   if comfy_up; then return; fi
@@ -22,7 +51,13 @@ ensure_comfy() {
     systemctl --user start comfyui
     printf "Waiting for ComfyUI at %s" "$COMFY_URL"
     for _ in $(seq 1 90); do comfy_up && break; printf "."; sleep 1; done
-    echo " up"
+    # The wait used to end with " up" whether or not anything answered.
+    if comfy_up; then
+      echo " up"
+    else
+      echo " still not answering. See why with: journalctl --user -u comfyui"
+      echo "The app will open anyway and retry every few seconds."
+    fi
   else
     cat >&2 <<MSG
 ComfyUI is not answering at $COMFY_URL and there is no user service to start.
@@ -42,16 +77,42 @@ needs_build() {
 }
 
 case "${1:-start}" in
-  start|"")
+  start|""|--no-open)
     [ -d node_modules ] || npm install
     ensure_comfy
-    if needs_build; then echo "Building."; npm run build; fi
-    nohup npm run preview >/tmp/switchgen-preview.log 2>&1 &
-    for _ in $(seq 1 30); do curl -sf -o /dev/null "$URL" && break; sleep 1; done
-    echo "SwitchGen: $URL"
-    if [ -z "${SWITCHGEN_NO_OPEN:-}" ] && [ "${2:-}" != "--no-open" ]; then
-      command -v xdg-open >/dev/null && xdg-open "$URL" >/dev/null 2>&1 || true
+    # A running server keeps serving the code it started with, and a second
+    # one cannot have the port. Building under it would pair a new page with
+    # the old server, so say what is running and leave it be.
+    if app_up; then
+      echo "SwitchGen is already running: $URL"
+      if needs_build; then
+        echo "Changes since it started are not being served. Run 'switchgen stop', then 'switchgen'."
+      fi
+      open_app
+      exit 0
     fi
+    if needs_build; then echo "Building."; npm run build; fi
+    nohup npm run preview >"$LOG" 2>&1 &
+    pid=$!
+    up=""
+    for _ in $(seq 1 30); do
+      if app_up; then up=1; break; fi
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    # The launcher used to print the address and open it whether or not
+    # anything had started. Say what happened, and where the log is.
+    if [ -z "$up" ]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "SwitchGen has not answered at $URL yet. Its log is $LOG." >&2
+      else
+        echo "SwitchGen did not start. The end of $LOG:" >&2
+        tail -n 20 "$LOG" >&2
+      fi
+      exit 1
+    fi
+    echo "SwitchGen: $URL"
+    open_app
     ;;
   dev)
     [ -d node_modules ] || npm install
@@ -61,8 +122,15 @@ case "${1:-start}" in
   build)    npm run build ;;
   validate) npm run validate ;;
   stop)
-    pkill -f "[v]ite preview" 2>/dev/null || true
-    echo "SwitchGen stopped (ComfyUI left running)"
+    pattern="$(server_pattern)"
+    if pkill -f "$pattern"; then
+      # Wait for the port to be let go, so `switchgen stop && switchgen`
+      # starts a fresh server instead of finding the old one still there.
+      for _ in $(seq 1 20); do pgrep -f "$pattern" >/dev/null || break; sleep 0.5; done
+      echo "SwitchGen stopped (ComfyUI left running)"
+    else
+      echo "SwitchGen was not running from $APP"
+    fi
     ;;
   install)
     mkdir -p "$HOME/.local/bin"

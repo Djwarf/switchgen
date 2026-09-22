@@ -24,7 +24,7 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn, execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { TOOLS, confineReal, guardMutation, readBody, send, sse, sseOpen } from './guard.mjs'
+import { TOOLS, confineReal, guardMutation, readBody, reqUrl, safely, send, sse, sseOpen } from './guard.mjs'
 
 const run = promisify(execFile)
 
@@ -553,7 +553,10 @@ async function assemble(b, clipRefs, res, url) {
 
 export function switchgenReel() {
   const handler = async (req, res, next) => {
-    const url = new URL(req.url, 'http://local')
+    // An unreadable path is refused rather than parsed where it can throw.
+    // See reqUrl in guard.mjs for what that throw used to do.
+    const url = reqUrl(req)
+    if (!url) return send(res, 400, { error: 'the request path is not a valid URL' })
     if (!url.pathname.startsWith('/api/reel')) return next()
 
     try {
@@ -622,7 +625,7 @@ export function switchgenReel() {
 
   return {
     name: 'switchgen-reel',
-    configureServer(server) { server.middlewares.use(handler) },
-    configurePreviewServer(server) { server.middlewares.use(handler) },
+    configureServer(server) { server.middlewares.use(safely(handler)) },
+    configurePreviewServer(server) { server.middlewares.use(safely(handler)) },
   }
 }

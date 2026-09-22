@@ -19,6 +19,7 @@
  */
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
@@ -30,6 +31,43 @@ export function send(res, code, body) {
   res.statusCode = code
   res.setHeader('Content-Type', 'application/json')
   res.end(JSON.stringify(body))
+}
+
+/**
+ * The request's URL, or null when it cannot be read as one.
+ *
+ * `new URL(req.url, base)` throws for a path such as `//`: two slashes open
+ * a host, and an empty host is not a URL. Every handler here is async, so a
+ * parse at the top of one, outside its own try, turned that throw into an
+ * unhandled rejection, and Node ends the process on those. One GET for `//`
+ * from anything that could reach the port stopped the app for every device.
+ */
+export function reqUrl(req) {
+  try { return new URL(req.url ?? '/', 'http://local') } catch { return null }
+}
+
+/**
+ * Mount an async handler so nothing it throws can reach the process.
+ *
+ * Connect ignores the promise a handler returns, so a rejection that escapes
+ * the handler's own try is unhandled, and an unhandled rejection exits Node.
+ * Each handler catches its own errors; this is the backstop for the lines
+ * that run before its try, where the `//` crash above came from.
+ */
+export function safely(handler) {
+  return (req, res, next) => {
+    const fail = err => {
+      try {
+        if (res.headersSent) res.end()
+        else send(res, 500, { error: String(err?.message ?? err) })
+      } catch { /* the socket is gone */ }
+    }
+    try {
+      Promise.resolve(handler(req, res, next)).catch(fail)
+    } catch (err) {
+      fail(err)
+    }
+  }
 }
 
 /** Resolve `rel` inside `root`, refusing anything that escapes it lexically. */
@@ -46,11 +84,23 @@ export function confine(root, rel) {
  * up to the nearest component that actually exists, resolves that for real, and
  * re-checks, so a missing leaf cannot skip the check on the directories above
  * it either.
+ *
+ * The root is resolved for real too, and the file is measured against that.
+ * It used to be taken as written while the file was resolved, so a root that
+ * is a link, or sits under one (an outputs folder linked to a data disk, or a
+ * /home that is a link to /var/home), made every file in it look as if it had
+ * climbed out: every delete, reel and picture read under it was refused.
+ *
+ * The answer is spelled under the root as configured, not under its real
+ * path, so a caller's `path.relative(root, full)` still reads as a path inside
+ * the root. Everything below the root in it is already resolved.
  */
 export async function confineReal(root, rel) {
   const base = path.resolve(root)
   const full = confine(base, rel)
   if (!full) return null
+  let realBase
+  try { realBase = await fs.realpath(base) } catch { return null }
   let head = full
   const tail = []
   for (;;) {
@@ -64,8 +114,9 @@ export async function confineReal(root, rel) {
       head = parent
       continue
     }
-    const back = confine(base, path.relative(base, real))
-    if (!back) return null
+    const inside = path.relative(realBase, real)
+    if (!confine(realBase, inside)) return null
+    const back = path.join(base, inside)
     return tail.length ? path.join(back, ...tail) : back
   }
 }
@@ -137,6 +188,44 @@ export function sameOrigin(req) {
   const self = String(req.headers.host ?? '')
   if (host.toLowerCase() === self.toLowerCase()) return true
   return TRUSTED.has(String(origin).toLowerCase())
+}
+
+/**
+ * Vite's allowedHosts rule, for the one path Vite does not apply it to.
+ *
+ * An IP address or localhost is always allowed; a name must be listed, and an
+ * entry with a leading dot allows that domain and everything under it. This
+ * mirrors Vite's own check so the two cannot disagree about a host.
+ */
+export function hostAllowed(hostHeader, allowedHosts) {
+  if (hostHeader === undefined) return true
+  const h = String(hostHeader).trim().toLowerCase()
+  if (h.startsWith('[')) {
+    const end = h.indexOf(']')
+    return end > 0 && isIP(h.slice(1, end)) === 6
+  }
+  const name = h.includes(':') ? h.slice(0, h.indexOf(':')) : h
+  if (isIP(name) === 4) return true
+  if (name === 'localhost' || name.endsWith('.localhost')) return true
+  return allowedHosts.some(a => {
+    const allowed = String(a).toLowerCase()
+    return allowed === name || (allowed.startsWith('.') && (allowed.slice(1) === name || name.endsWith(allowed)))
+  })
+}
+
+/**
+ * May this WebSocket handshake reach ComfyUI through the proxy?
+ *
+ * Vite checks Host on HTTP requests only. Its proxy takes an upgrade straight
+ * off the HTTP server, where that check never runs, and rewrites Origin to
+ * ComfyUI's own on the way through, so ComfyUI's check passes too: any page
+ * the user had open could watch the live feed. Two checks close it. The Host check is the one Vite skipped, and
+ * stops a hostile name rebound to this machine's address. The origin check
+ * stops a page elsewhere that names this machine by an allowed name, which a
+ * browser lets any page do for a WebSocket.
+ */
+export function upgradeAllowed(req, allowedHosts) {
+  return hostAllowed(req.headers.host, allowedHosts) && sameOrigin(req)
 }
 
 /**
