@@ -75,8 +75,10 @@ export function RunningSlug({ className = '' }: RunningSlugProps) {
   return (
     <div className={`flex min-w-0 items-center gap-3 ${className}`}>
       <SlugBody job={job} waiting={waiting} now={now} />
+      {/* Keyed by job, so a press armed for one job is not carried over to
+          the next one the slug turns to. */}
       {(job.status === 'running' || job.status === 'queued' || job.status === 'submitting') && (
-        <StopButton job={job} />
+        <StopButton key={job.id} job={job} />
       )}
     </div>
   )
@@ -110,9 +112,13 @@ function SlugBody({ job, waiting, now }: { job: Job; waiting: number; now: numbe
 
       <span className="text-small text-grey-700">·</span>
       <span className="truncate text-small text-grey-700">
-        {job.status === 'submitting' && 'Sending it over'}
-        {job.status === 'queued' && (waiting > 0 ? 'Waiting its turn' : 'Queued')}
-        {job.status === 'running' &&
+        {/* A stop asked for is not a stop made: the job may still finish, so
+            it reads as stopping until its desk reports how it ended. */}
+        {live && job.cancelling && 'Stopping'}
+        {!job.cancelling && job.status === 'submitting' && 'Sending it over'}
+        {!job.cancelling && job.status === 'queued' && (waiting > 0 ? 'Waiting its turn' : 'Queued')}
+        {!job.cancelling &&
+          job.status === 'running' &&
           (job.max > 0 ? `${job.stage} · step ${job.value} of ${job.max}` : job.stage)}
         {job.status === 'done' && 'Done'}
         {job.status === 'cancelled' && 'Stopped'}
@@ -146,29 +152,62 @@ function SlugBody({ job, waiting, now }: { job: Job; waiting: number; now: numbe
   )
 }
 
+/**
+ * What stopping does, per desk. A reel shot is one of a queue the reel walks
+ * in order, and a picture may be one of a batch of two or four that ends when
+ * one of them is stopped, so neither can promise that nothing else is
+ * affected.
+ */
+const STOP_WHAT = {
+  reel: {
+    thing: 'the reel',
+    title:
+      'Hold for a moment to stop the reel. This shot stops and the shots after it are not made. Finished shots stay in the Archive.',
+  },
+  images: {
+    thing: 'this picture',
+    title:
+      'Hold for a moment to stop this picture. If it is one of a batch, the rest of the batch is not made. Pictures already made stay in the Archive.',
+  },
+  video: {
+    thing: 'this clip',
+    title: 'Hold for a moment to stop this clip. Clips already made stay in the Archive.',
+  },
+} as const
+
 function StopButton({ job }: { job: Job }) {
   const hold = useHoldToConfirm(() => {
     void jobs.cancel(job.id)
   })
-  // A reel shot is one of a queue the reel walks in order, and stopping it
-  // stops the walk, so the promise that nothing else is affected would be
-  // false there.
-  const reel = job.desk === 'reel'
+  const what = STOP_WHAT[job.desk]
+  // A screen reader presses with a bare click, which arms the stop rather
+  // than firing it; the button and a polite announcement both say so, or the
+  // first press would seem to do nothing.
+  const armed = hold.armed && !job.cancelling
   return (
-    <button
-      type="button"
-      {...hold.bind}
-      disabled={job.cancelling}
-      className="sg-quiet sg-hold ring shrink-0"
-      aria-label={reel ? 'Hold to stop the reel' : `Hold to stop the ${DESK_LABEL[job.desk].toLowerCase()} job`}
-      title={
-        reel
-          ? 'Hold for a moment to stop the reel. This shot stops and the shots after it are not made. Finished shots stay in the Archive.'
-          : 'Hold for a moment to stop this job. Nothing else is affected.'
-      }
-    >
-      <span className="sg-hold-wipe" style={{ width: `${Math.round(hold.progress * 100)}%` }} aria-hidden />
-      <span className="relative">{job.cancelling ? 'Stopping' : 'Hold to stop'}</span>
-    </button>
+    <>
+      <button
+        type="button"
+        {...hold.bind}
+        disabled={job.cancelling}
+        className="sg-quiet sg-hold ring shrink-0"
+        aria-label={
+          job.cancelling
+            ? `Stopping ${what.thing}`
+            : armed
+              ? `Press again to stop ${what.thing}`
+              : `Hold to stop ${what.thing}`
+        }
+        title={what.title}
+      >
+        <span className="sg-hold-wipe" style={{ width: `${Math.round(hold.progress * 100)}%` }} aria-hidden />
+        <span className="relative">
+          {job.cancelling ? 'Stopping' : armed ? 'Press again to stop' : 'Hold to stop'}
+        </span>
+      </button>
+      <span aria-live="polite" className="sr-only">
+        {armed ? `Stop armed. Press the button again within three seconds to stop ${what.thing}.` : ''}
+      </span>
+    </>
   )
 }

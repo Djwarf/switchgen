@@ -149,8 +149,11 @@ type Bridge = {
   kind: 'image' | 'video'
   subscribe: (fn: () => void) => () => void
   read: () => Reported[]
-  /** The desk's own stop, for a desk where one job is not the whole story. */
-  stop?: () => void
+  /**
+   * The desk's own stop, given the desk's id for the job, for a desk where
+   * stopping means more than cancelling one prompt.
+   */
+  stop?: (key: string) => void
   /**
    * Desk job id → ledger job id, kept on the bridge rather than inside the
    * mirror, so that a remount — StrictMode's double effect in development, or
@@ -280,6 +283,8 @@ function mirror(bridge: Bridge): () => void {
           seen.set(report.key, '')
           continue
         }
+        const stop = bridge.stop
+        const key = report.key
         id = jobs.start({
           desk: bridge.desk,
           kind: bridge.kind,
@@ -287,7 +292,7 @@ function mirror(bridge: Bridge): () => void {
           prompt: report.prompt,
           promptId: report.promptId,
           steps: report.max || undefined,
-          stop: bridge.stop,
+          stop: stop ? () => stop(key) : undefined,
         })
         seen.set(report.key, id)
       }
@@ -300,12 +305,16 @@ function mirror(bridge: Bridge): () => void {
         jobs.attach(id, report.promptId)
       }
 
+      // The desk's ending is the job's ending. It holds the run that settled
+      // it, so its word replaces anything the ledger shows, and the ledger
+      // takes a new ending only when it differs from the one it has.
       switch (report.status) {
         case 'running':
           if (
-            ledgerJob.status !== 'running' ||
-            ledgerJob.value !== report.value ||
-            ledgerJob.max !== report.max
+            LIVE.has(ledgerJob.status) &&
+            (ledgerJob.status !== 'running' ||
+              ledgerJob.value !== report.value ||
+              ledgerJob.max !== report.max)
           ) {
             jobs.apply(id, {
               phase: 'running',
@@ -316,17 +325,17 @@ function mirror(bridge: Bridge): () => void {
           }
           break
         case 'done':
-          if (LIVE.has(ledgerJob.status)) {
+          if (ledgerJob.status !== 'done' || (report.entryId && report.entryId !== ledgerJob.entryId)) {
             jobs.succeed(id, report.entryId ? { entryId: report.entryId } : undefined)
           }
           break
         case 'error':
-          if (LIVE.has(ledgerJob.status)) {
+          if (ledgerJob.status !== 'error') {
             jobs.fail(id, report.error ?? 'The job stopped short.')
           }
           break
         case 'cancelled':
-          if (LIVE.has(ledgerJob.status)) {
+          if (ledgerJob.status !== 'cancelled') {
             jobs.fail(id, report.error ?? 'Stopped.', { cancelled: true })
           }
           break

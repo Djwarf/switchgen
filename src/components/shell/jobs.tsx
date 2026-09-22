@@ -5,9 +5,16 @@
  * must not care that you walked over to the pictures desk. Every desk reports
  * its work here; the section bar reads it from wherever you happen to be.
  *
- * It also watches ComfyUI's own queue, so work started somewhere else — a
+ * It also counts ComfyUI's own queue, so work started somewhere else — a
  * second tab, the ComfyUI page itself — is reported honestly rather than
  * pretended away. There is one graphics card and one queue.
+ *
+ * What happened to a job is its desk's to say, never the ledger's. The desk
+ * follows the job to its end and decides, after asking the server about it
+ * and reading /history, whether it finished, failed, was stopped or was lost.
+ * A ledger that guessed an ending of its own, from a missing row or from a
+ * stop it had only asked for, said Stopped or Lost over work that was then
+ * filed.
  *
  * Desk integration is two lines:
  *
@@ -17,14 +24,15 @@
  */
 import { useSyncExternalStore } from 'react'
 import {
+  ComfyError,
   cancelJob,
   listJobs,
-  watch,
   type ApiWorkflow,
   type ProgressEvent,
-  type ServerJob,
+  type ServerJobsPage,
 } from '../../lib/comfy'
 import type { DeskId } from '../../lib/session'
+import { dismissNotice, postNotice } from './Notice'
 
 // ---------------------------------------------------------------------------
 // Stage names
@@ -85,7 +93,11 @@ export type Job = {
   startedAt: number
   finishedAt: number | null
   error: string | null
-  /** A stop has been asked for but the server has not confirmed it yet. */
+  /**
+   * A stop has been asked for and the job has not ended yet. It clears when
+   * the desk reports the ending, or when ComfyUI says there was nothing left
+   * to stop.
+   */
   cancelling: boolean
   /** The archive record it produced, when the desk tells us. */
   entryId: string | null
@@ -144,7 +156,6 @@ let ledger: Job[] = []
 let server: ServerQueue = { running: 0, pending: 0, foreign: 0, known: false }
 let snapshot: JobsSnapshot = build()
 const listeners = new Set<() => void>()
-const watchers = new Map<string, () => void>()
 /** Ledger job id → the owning desk's own stop, from `JobInit.stop`. */
 const stoppers = new Map<string, () => void>()
 
@@ -198,53 +209,45 @@ const KEEP = 50
 // ---------------------------------------------------------------------------
 
 let timer = 0
-let misses = new Map<string, number>()
 
 const BUSY_MS = 4000
 const IDLE_MS = 12000
 
+/** How many jobs a filtered list holds in all, not just on the page it sent. */
+const totalOf = (page: ServerJobsPage) => Math.max(page.pagination.total, page.jobs.length)
+
+/**
+ * Count ComfyUI's queue. Nothing here decides that a job of ours is lost: its
+ * desk does, after a direct lookup and a read of /history, and reports it like
+ * any other ending.
+ */
 async function poll(): Promise<void> {
   try {
-    const page = await listJobs({ status: ['pending', 'in_progress'], limit: 50 })
-    const ours = new Set(ledger.filter(isLive).map((j) => j.promptId).filter(Boolean) as string[])
-    let running = 0
-    let pending = 0
-    let foreign = 0
-    const live = new Set<string>()
-    for (const j of page.jobs as ServerJob[]) {
-      live.add(j.id)
-      if (j.status === 'in_progress') running += 1
-      else pending += 1
-      if (!ours.has(j.id)) foreign += 1
+    // Totals, not a page of rows. A page comes newest first, so behind a long
+    // queue the job that is running is not on it at all, and counting rows
+    // said nothing was running.
+    const [inProgress, waiting] = await Promise.all([
+      listJobs({ status: ['in_progress'], limit: 1 }),
+      listJobs({ status: ['pending'], limit: 1 }),
+    ])
+    const running = totalOf(inProgress)
+    const pending = totalOf(waiting)
+    // Which of those are ours is the desks' word: every job they report as
+    // live has been accepted by the queue and not yet ended.
+    const ours = ledger.filter((j) => isLive(j) && j.promptId !== null).length
+    const next: ServerQueue = {
+      running,
+      pending,
+      foreign: Math.max(0, running + pending - ours),
+      known: true,
     }
-    server = { running, pending, foreign, known: true }
-
-    // A job the server has never heard of, twice running, is lost. Say so
-    // rather than spinning a rule at somebody for an hour.
-    for (const job of ledger) {
-      if (!isLive(job) || !job.promptId) continue
-      if (live.has(job.promptId)) {
-        misses.delete(job.id)
-        continue
-      }
-      const n = (misses.get(job.id) ?? 0) + 1
-      misses.set(job.id, n)
-      if (n >= 2) {
-        misses.delete(job.id)
-        patch(job.id, (j) =>
-          isLive(j)
-            ? {
-                ...j,
-                status: 'error',
-                finishedAt: Date.now(),
-                error:
-                  'We lost track of this job. ComfyUI no longer lists it. Check the archive. It may have finished anyway.',
-              }
-            : j,
-        )
-      }
-    }
-    emit()
+    const same =
+      server.known &&
+      server.running === next.running &&
+      server.pending === next.pending &&
+      server.foreign === next.foreign
+    server = next
+    if (!same) emit()
   } catch {
     // The offline banner owns this news; the ledger just stops guessing.
     if (server.known) {
@@ -308,14 +311,20 @@ function start(init: JobInit): string {
   return job.id
 }
 
-/** The queue accepted it. If a stop was asked for first, honour it now. */
+/** The queue accepted it. If a stop was asked for first, send it now. */
 function attach(id: string, promptId: string): void {
+  const before = ledger.find((j) => j.id === id)
+  if (!before) return
   const job = patch(id, (j) => ({
     ...j,
     promptId,
     status: isLive(j) ? (j.status === 'submitting' ? 'queued' : j.status) : j.status,
   }))
-  if (job && job.status === 'cancelled') void cancelJob(promptId).catch(() => {})
+  // Only for the first id, and only when the ledger itself holds the stop: a
+  // desk with a stop of its own was already told.
+  if (job && !before.promptId && job.cancelling && isLive(job) && !stoppers.has(id)) {
+    void sendCancel(id, promptId)
+  }
   schedule()
 }
 
@@ -334,24 +343,31 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
         pass = node.inputs.return_with_leftover_noise === 'enable' ? 1 : 2
       }
       const stage = pass ? `Drawing, ${pass === 1 ? 'first' : 'second'} pass` : stageFor(cls)
-      patch(id, (j) => ({
-        ...j,
-        status: 'running',
-        value: e.value,
-        max: e.max || j.max,
-        pass: pass ?? j.pass,
-        stage,
-      }))
+      // A report that arrives after the ending must not bring the job back:
+      // that re-enabled Stop on finished work and froze its clock.
+      patch(id, (j) =>
+        isLive(j)
+          ? {
+              ...j,
+              status: 'running',
+              value: e.value,
+              max: e.max || j.max,
+              pass: pass ?? j.pass,
+              stage,
+            }
+          : j,
+      )
       return
     }
     case 'preview':
-      patch(id, (j) => ({ ...j, previewUrl: e.url }))
+      patch(id, (j) => (isLive(j) ? { ...j, previewUrl: e.url } : j))
       return
     case 'done':
       patch(id, (j) =>
-        isLive(j) ? { ...j, status: 'done', stage: 'Done', finishedAt: Date.now(), value: j.max } : j,
+        isLive(j)
+          ? { ...j, status: 'done', stage: 'Done', finishedAt: Date.now(), value: j.max, cancelling: false }
+          : j,
       )
-      release(id)
       schedule()
       return
     case 'error':
@@ -363,10 +379,10 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
               stage: e.cancelled ? 'Stopped' : 'Stopped short',
               finishedAt: Date.now(),
               error: e.cancelled ? null : e.message,
+              cancelling: false,
             }
           : j,
       )
-      release(id)
       schedule()
       return
   }
@@ -380,25 +396,13 @@ function handler(id: string, graph?: ApiWorkflow): (e: ProgressEvent) => void {
   return (e) => apply(id, e, graph)
 }
 
-/** Follow a prompt that was submitted elsewhere. Returns an unsubscribe. */
-function follow(id: string, promptId: string, graph?: ApiWorkflow): () => void {
-  attach(id, promptId)
-  release(id)
-  const stop = watch(promptId, (e) => apply(id, e, graph))
-  watchers.set(id, stop)
-  return () => release(id)
-}
-
-function release(id: string): void {
-  const stop = watchers.get(id)
-  if (stop) {
-    watchers.delete(id)
-    try {
-      stop()
-    } catch {
-      /* ignore */
-    }
-  }
+/**
+ * When an ending was reached. The same verdict reported twice keeps its first
+ * time; a different one is news, and the slug shows news for a few seconds
+ * from this moment.
+ */
+function endedAt(j: Job, status: JobStatus): number {
+  return j.status === status && j.finishedAt !== null ? j.finishedAt : Date.now()
 }
 
 /** The desk finished writing the record. */
@@ -407,67 +411,89 @@ function succeed(id: string, opts: { entryId?: string } = {}): void {
     ...j,
     status: 'done',
     stage: 'Done',
-    finishedAt: j.finishedAt ?? Date.now(),
+    finishedAt: endedAt(j, 'done'),
     value: j.max,
+    error: null,
+    cancelling: false,
     entryId: opts.entryId ?? j.entryId,
   }))
-  release(id)
   schedule()
 }
 
 function fail(id: string, message: string, opts: { cancelled?: boolean } = {}): void {
+  const status: JobStatus = opts.cancelled ? 'cancelled' : 'error'
   patch(id, (j) => ({
     ...j,
-    status: opts.cancelled ? 'cancelled' : 'error',
+    status,
     stage: opts.cancelled ? 'Stopped' : 'Stopped short',
-    finishedAt: j.finishedAt ?? Date.now(),
+    finishedAt: endedAt(j, status),
     error: opts.cancelled ? null : message,
+    cancelling: false,
   }))
-  release(id)
   schedule()
+}
+
+/** Give up asking: the stop was refused, or there was nothing left to stop. */
+function stopAsking(id: string): void {
+  patch(id, (j) => (j.cancelling ? { ...j, cancelling: false } : j))
+}
+
+/**
+ * Ask ComfyUI to stop one prompt, and leave the ending to the job's desk.
+ *
+ * Asking is not stopping. A running job carries on until ComfyUI next checks
+ * for the interrupt, and one on its last node can finish and save first, so
+ * the desk reports whatever really happened: stopped, finished or failed.
+ */
+async function sendCancel(id: string, promptId: string): Promise<void> {
+  const notice = `stop-${id}`
+  let stopped: boolean
+  try {
+    stopped = await cancelJob(promptId)
+  } catch (err) {
+    stopAsking(id)
+    const reason = err instanceof ComfyError ? err.message : 'We could not reach ComfyUI.'
+    postNotice({
+      key: notice,
+      tone: 'error',
+      title: 'Could not stop that job',
+      body: `${reason} It may still be running. Try again in a moment.`,
+    })
+    return
+  }
+  // A refusal from an earlier try is no longer news once one gets through.
+  dismissNotice(notice)
+  // False means it had already ended, and its desk is about to say how.
+  if (!stopped) stopAsking(id)
 }
 
 /**
  * Stop one job and only that job.
  *
  * `cancelJob` is prompt-targeted, so a picture stopped behind a four-minute
- * clip cannot take the clip with it.
+ * clip cannot take the clip with it. The job is marked as stopping and ends
+ * when its desk reports the ending.
  */
 async function cancel(id: string): Promise<void> {
   const job = ledger.find((j) => j.id === id)
-  if (!job || !isLive(job)) return
+  if (!job || !isLive(job) || job.cancelling) return
+  patch(id, (j) => ({ ...j, cancelling: true }))
   const stop = stoppers.get(id)
   if (stop) {
-    patch(id, (j) => ({ ...j, cancelling: true, stage: 'Stopping' }))
     try {
       stop()
     } catch {
-      patch(id, (j) => ({ ...j, cancelling: false }))
+      stopAsking(id)
     }
     return
   }
-  if (!job.promptId) {
-    // Nothing was submitted yet; `attach` will cancel it the moment it is.
-    patch(id, (j) => ({ ...j, status: 'cancelled', stage: 'Stopped', finishedAt: Date.now() }))
-    return
-  }
-  patch(id, (j) => ({ ...j, cancelling: true, stage: 'Stopping' }))
-  try {
-    await cancelJob(job.promptId)
-  } catch {
-    /* a cancel that did not land is reported by the next poll */
-  }
-  patch(id, (j) =>
-    isLive(j) ? { ...j, status: 'cancelled', stage: 'Stopped', cancelling: false, finishedAt: Date.now() } : j,
-  )
-  release(id)
-  schedule()
+  // Nothing was submitted yet; `attach` sends the stop the moment it is.
+  if (!job.promptId) return
+  await sendCancel(id, job.promptId)
 }
 
 /** Take a finished job off the bar without touching the archive. */
 function dismiss(id: string): void {
-  release(id)
-  misses.delete(id)
   stoppers.delete(id)
   const before = ledger.length
   ledger = ledger.filter((j) => j.id !== id)
@@ -481,7 +507,6 @@ function get(id: string): Job | null {
 function clearFinished(): void {
   const before = ledger.length
   ledger = ledger.filter(isLive)
-  misses = new Map()
   for (const id of stoppers.keys()) if (!ledger.some((j) => j.id === id)) stoppers.delete(id)
   if (ledger.length !== before) emit()
 }
@@ -492,7 +517,6 @@ export const jobs = {
   start,
   attach,
   handler,
-  follow,
   apply,
   succeed,
   fail,

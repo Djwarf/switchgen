@@ -11,8 +11,9 @@
  */
 import { useEffect, useRef, type ReactNode } from 'react'
 import { clearLoadIssue, clearQuotaIssue, isPersistent, loadIssue, quotaIssue } from '../../lib/history'
+import { draftIssue, subscribeDraftIssue } from '../../lib/session'
 import { Masthead, useEntryCount } from './Masthead'
-import { NoticeRail, postNotice } from './Notice'
+import { NoticeRail, dismissNotice, postNotice } from './Notice'
 import { Offline } from './Offline'
 import { SectionBar } from './SectionBar'
 import { Shortcuts, closeShortcuts, shortcutsOpen, toggleShortcuts, useShortcutsOpen } from './Shortcuts'
@@ -28,6 +29,9 @@ import {
   setArchiveQuery,
   useRoute,
 } from './route'
+
+/** One stable key, so a second desk failing replaces the notice, not stacks it. */
+const DRAFT_NOTICE = 'draft-quota'
 
 export type ShellProps = {
   /** "RTX 5060 Ti · 16 GB", once the hardware probe answers. */
@@ -89,6 +93,19 @@ export function Shell({ gpu, children }: ShellProps) {
         body: 'This browser will not let us save your archive, so it lasts only until you close the tab. Your files are still written to disk as usual.',
       })
     }
+  }, [])
+
+  // A desk whose draft the browser had no room to save. The session says so
+  // once when it starts and once when a save lands again, so the notice
+  // stands for as long as the trouble does and goes when it clears.
+  useEffect(() => {
+    const show = () => {
+      const message = draftIssue()
+      if (message) postNotice({ key: DRAFT_NOTICE, tone: 'warning', title: 'Draft not saved', body: message })
+      else dismissNotice(DRAFT_NOTICE)
+    }
+    show()
+    return subscribeDraftIssue(show)
   }, [])
 
   useGlobalKeys()

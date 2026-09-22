@@ -64,8 +64,10 @@ export type ProgressEvent =
   /**
    * Terminal failure. `cancelled` is true when the job was stopped on purpose
    * (`execution_interrupted`), which wants different copy from a real error.
+   * `node` and `nodeType` are the node ComfyUI named, when it named one, so a
+   * desk can say where the trouble is.
    */
-  | { phase: 'error'; message: string; cancelled: boolean; node: string | null }
+  | { phase: 'error'; message: string; cancelled: boolean; node: string | null; nodeType: string | null }
 
 /** Connection state of the shared socket, for the offline notice. */
 export type ConnectionState = 'connecting' | 'open' | 'closed'
@@ -101,6 +103,19 @@ export type PastRun = {
   startedAt: number | null
   finishedAt: number | null
   clientId: string | null
+  /**
+   * What ComfyUI said when the run failed, from the `execution_error` entry
+   * it keeps in the record. Null for a run that did not fail, or whose record
+   * holds no such entry.
+   */
+  error: PastRunError | null
+}
+
+export type PastRunError = {
+  /** ComfyUI's own text, which names an out-of-memory failure as one. */
+  message: string
+  node: string | null
+  nodeType: string | null
 }
 
 /**
@@ -392,7 +407,13 @@ function emit(st: PromptState, e: ProgressEvent) {
   }
 }
 
-type Failure = { ok: false; message: string; cancelled: boolean; node: string | null }
+type Failure = {
+  ok: false
+  message: string
+  cancelled: boolean
+  node: string | null
+  nodeType: string | null
+}
 type Outcome = { ok: true } | Failure
 
 const STOPPED: Failure = {
@@ -400,6 +421,7 @@ const STOPPED: Failure = {
   message: 'Job stopped. Nothing was saved.',
   cancelled: true,
   node: null,
+  nodeType: null,
 }
 
 const FAILED: Failure = {
@@ -407,6 +429,25 @@ const FAILED: Failure = {
   message: 'ComfyUI reported an error. The job did not finish.',
   cancelled: false,
   node: null,
+  nodeType: null,
+}
+
+/**
+ * A failed run's outcome, read from its /history record. The record keeps
+ * the `execution_error` the socket would have carried, so the failure says
+ * what ComfyUI said, and where. The fixed sentence is only for a record that
+ * holds no such entry: used for every failure read back from history, it hid
+ * an out-of-memory error from `faults.ts`, which knows one by ComfyUI's words.
+ */
+function failureOf(run: PastRun): Failure {
+  if (!run.error) return FAILED
+  return {
+    ok: false,
+    message: run.error.message || FAILED.message,
+    cancelled: false,
+    node: run.error.node,
+    nodeType: run.error.nodeType,
+  }
 }
 
 /**
@@ -427,7 +468,7 @@ async function settle(promptId: string, outcome: Outcome) {
   if (outcome.ok && (st.files.length === 0 || st.gap)) {
     const run = await fetchPastRun(promptId).catch(() => null)
     if (run?.status === 'cancelled') outcome = STOPPED
-    else if (run?.status === 'error') outcome = FAILED
+    else if (run?.status === 'error') outcome = failureOf(run)
     else if (run) st.files = run.files
   }
 
@@ -438,6 +479,7 @@ async function settle(promptId: string, outcome: Outcome) {
         message: outcome.message,
         cancelled: outcome.cancelled,
         node: outcome.node,
+        nodeType: outcome.nodeType,
       }
 
   st.terminal = event
@@ -563,7 +605,7 @@ function handleText(raw: string) {
     }
 
     case 'execution_interrupted':
-      if (id) void settle(id, { ...STOPPED, node: d.node_id == null ? null : String(d.node_id) })
+      if (id) void settle(id, { ...STOPPED, ...nodeOf(d) })
       return
 
     case 'execution_error':
@@ -572,7 +614,7 @@ function handleText(raw: string) {
           ok: false,
           message: String(d.exception_message ?? d.exception_type ?? 'ComfyUI reported an error.'),
           cancelled: false,
-          node: d.node_id == null ? null : String(d.node_id),
+          ...nodeOf(d),
         })
       return
 
@@ -580,6 +622,18 @@ function handleText(raw: string) {
       // progress_state, execution_cached, feature_flags, b_preview and any
       // future message type. Nothing here needs them.
       return
+  }
+}
+
+/**
+ * The node an `execution_error` or `execution_interrupted` names, from the
+ * socket message or the copy of it kept in /history. Both carry the class as
+ * `node_type`, which is what lets a failure say which kind of node it was.
+ */
+function nodeOf(d: any): { node: string | null; nodeType: string | null } {
+  return {
+    node: d?.node_id == null ? null : String(d.node_id),
+    nodeType: typeof d?.node_type === 'string' && d.node_type ? d.node_type : null,
   }
 }
 
@@ -670,7 +724,7 @@ export async function settleFromHistory(id: string): Promise<boolean> {
     return true
   }
   if (run.status === 'error') {
-    void settle(id, FAILED)
+    void settle(id, failureOf(run))
     return true
   }
   return false
@@ -738,8 +792,15 @@ export async function submit(workflow: ApiWorkflow): Promise<string> {
         .flatMap((n: any) => (n?.errors ?? []).map((e: any) => e?.message))
         .filter(Boolean)
         .join('; ')
+    // One refused node can be named outright. With several, the per-input
+    // detail names them all and no single one is "the" trouble.
+    const refused = Object.entries(nodeErrors ?? {})
+    const only = refused.length === 1 ? refused[0] : null
+    const onlyType = (only?.[1] as { class_type?: unknown } | undefined)?.class_type
     throw new ComfyError(detail || `The queue rejected the job (HTTP ${res.status}).`, {
       nodeErrors,
+      node: only ? only[0] : null,
+      nodeType: typeof onlyType === 'string' && onlyType ? onlyType : null,
     })
   }
 
@@ -947,7 +1008,12 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
       else if (e.phase === 'error')
         finish(() =>
           reject(
-            new ComfyError(e.message, { cancelled: e.cancelled, promptId, node: e.node }),
+            new ComfyError(e.message, {
+              cancelled: e.cancelled,
+              promptId,
+              node: e.node,
+              nodeType: e.nodeType,
+            }),
           ),
         )
     }
@@ -1093,9 +1159,9 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
   if (!graph || typeof graph !== 'object') return null
 
   const statusStr = raw?.status?.status_str
-  const interrupted = (raw?.status?.messages ?? []).some(
-    (m: any) => Array.isArray(m) && m[0] === 'execution_interrupted',
-  )
+  const messages: any[] = Array.isArray(raw?.status?.messages) ? raw.status.messages : []
+  const interrupted = messages.some((m: any) => Array.isArray(m) && m[0] === 'execution_interrupted')
+  const failed = messages.find((m: any) => Array.isArray(m) && m[0] === 'execution_error')?.[1]
   const status: PastRun['status'] = interrupted
     ? 'cancelled'
     : statusStr === 'success'
@@ -1115,6 +1181,13 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
       timestampOf(raw?.status, 'execution_error') ??
       timestampOf(raw?.status, 'execution_interrupted'),
     clientId: typeof tuple[3]?.client_id === 'string' ? tuple[3].client_id : null,
+    error:
+      status === 'error' && failed
+        ? {
+            message: String(failed.exception_message ?? failed.exception_type ?? ''),
+            ...nodeOf(failed),
+          }
+        : null,
   }
 }
 

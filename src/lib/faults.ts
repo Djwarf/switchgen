@@ -64,7 +64,10 @@ export function faultTitle(f: Fault): string {
   if (f.cancelled) return 'Correction'
   if (f.lost) return 'We lost track of that job'
   if (outOfMemory(f)) return 'The card ran out of memory'
-  if (f.detail || f.nodeType) return 'That job was rejected'
+  // Only the queue's refusal carries per-input detail. A node that failed
+  // while running is named too, and calling that job rejected would be false:
+  // ComfyUI accepted it and it broke part way.
+  if (f.detail) return 'That job was rejected'
   return 'That job did not finish'
 }
 
@@ -78,8 +81,12 @@ export function faultBody(f: Fault): string {
   return f.message || 'ComfyUI did not say why. Check its log and try again.'
 }
 
-/** "The trouble is in KSampler (node 3)." Null when ComfyUI named no node. */
+/**
+ * "The trouble is in KSampler (node 3)." Null when ComfyUI named no node, and
+ * for a stop: ComfyUI names the node an interrupt landed on too, and a job
+ * the reader stopped had no trouble in it.
+ */
 export function faultWhere(f: Fault): string | null {
-  if (!f.nodeType) return null
+  if (f.cancelled || !f.nodeType) return null
   return `The trouble is in ${f.nodeType}${f.node ? ` (node ${f.node})` : ''}.`
 }

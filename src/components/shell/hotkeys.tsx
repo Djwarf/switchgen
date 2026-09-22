@@ -9,6 +9,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
+  FocusEvent as ReactFocusEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -162,6 +163,7 @@ export type HoldHandlers = {
     onKeyDown: (e: ReactKeyboardEvent) => void
     onKeyUp: (e: ReactKeyboardEvent) => void
     onClick: (e: ReactMouseEvent) => void
+    onBlur: (e: ReactFocusEvent) => void
   }
   /** 0 → 1. Drive the burgundy wipe with it. */
   progress: number
@@ -186,6 +188,11 @@ const ARMED_MS = 3000
  * after the hold has confirmed would otherwise start a second hold and confirm
  * again. Both keys have their default prevented on the way down and on the way
  * up, so neither turns into a click.
+ *
+ * A hold also ends when the button loses focus. A key held down while focus
+ * moves away, to another window or another control, sends its key up
+ * somewhere else, and without this the wipe would run on and fire a stop
+ * nobody was still holding for.
  *
  * A screen reader presses a button with a bare click and no key or pointer
  * events at all, so it could never hold. Such a click arms the confirmation
@@ -282,6 +289,7 @@ export function useHoldToConfirm(onConfirm: () => void, ms = 600): HoldHandlers 
           setArmed(true)
         }
       },
+      onBlur: stop,
     },
   }
 }
