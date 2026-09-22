@@ -31,6 +31,12 @@ type Props = {
   /** File the outputs no record describes. */
   onRecover: () => void
   recovering: boolean
+  /** The tagger is installed on the server, so pictures can be read in bulk. */
+  canTag: boolean
+  /** Tag every picture that has no tags yet. */
+  onTagAll: () => void
+  /** Progress of that pass, or null when it is not running. */
+  tagging: { done: number; total: number } | null
 }
 
 function syncLine(sync: ArchiveSyncState | null): string {
@@ -68,8 +74,14 @@ function tally(entries: readonly HistoryEntry[], now: number = Date.now()) {
     month: 0,
   }
   const families = new Map<string, { label: string; count: number }>()
+  const tags = new Map<string, number>()
+  let untagged = 0
 
   for (const e of entries) {
+    if (e.kind === 'image' && !e.missing) {
+      if (e.tags?.length) for (const t of e.tags.slice(0, 20)) tags.set(t, (tags.get(t) ?? 0) + 1)
+      else untagged++
+    }
     if (e.kind === 'video') counts.videos++
     else counts.images++
 
@@ -91,7 +103,7 @@ function tally(entries: readonly HistoryEntry[], now: number = Date.now()) {
     else families.set(e.familyId, { label: e.familyLabel || e.familyId, count: 1 })
   }
 
-  return { counts, families }
+  return { counts, families, tags, untagged }
 }
 
 function Group({ title, rows, query, onToggle }: {
@@ -147,9 +159,12 @@ export function FacetRail({
   sync,
   onRecover,
   recovering,
+  canTag,
+  onTagAll,
+  tagging,
 }: Props) {
   const file = useRef<HTMLInputElement | null>(null)
-  const { counts, families } = useMemo(() => tally(entries), [entries])
+  const { counts, families, tags, untagged } = useMemo(() => tally(entries), [entries])
 
   const styleRows: Row[] = useMemo(
     () =>
@@ -157,6 +172,15 @@ export function FacetRail({
         .map(([id, f]) => ({ label: f.label, token: `family:${id}`, count: f.count }))
         .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label)),
     [families],
+  )
+
+  const contentRows: Row[] = useMemo(
+    () =>
+      [...tags.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 12)
+        .map(([tag, count]) => ({ label: tag.replace(/_/g, ' '), token: `tag:${tag}`, count })),
+    [tags],
   )
 
   const filtering = query.trim().length > 0
@@ -223,6 +247,8 @@ export function FacetRail({
         ]}
       />
 
+      {contentRows.length ? <Group title="Content" query={query} onToggle={onToggle} rows={contentRows} /> : null}
+
       <section className="border-t border-grey-300 pt-3">
         <h3 className="mb-2 text-[0.625rem] font-semibold tracking-[0.18em] text-grey-700 uppercase">
           The archive
@@ -238,6 +264,20 @@ export function FacetRail({
               Save a copy
             </button>
           </li>
+          {canTag && (untagged > 0 || tagging) ? (
+            <li>
+              <button
+                type="button"
+                onClick={onTagAll}
+                disabled={!!tagging}
+                className="text-burgundy-900 underline underline-offset-2 hover:no-underline disabled:text-grey-500 disabled:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+              >
+                {tagging
+                  ? `Tagging, ${tagging.done} of ${tagging.total}`
+                  : `Tag the ${untagged} ${untagged === 1 ? 'picture' : 'pictures'} with no tags`}
+              </button>
+            </li>
+          ) : null}
           {sync?.mode === 'server' ? (
             <li>
               <button

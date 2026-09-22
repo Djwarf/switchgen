@@ -77,6 +77,8 @@ export type ComposeDeskProps = {
    * adopted from the archive. Omit it and nothing is printed.
    */
   onEditRegion?: () => void
+  /** A reading of the attached picture, printed under the well. See result/Reading. */
+  sourceReading?: ReactNode
   onClearSource?: () => void
 
   // --- the press -----------------------------------------------------------
@@ -121,6 +123,7 @@ export function ComposeDesk({
   onPickSource,
   onClearSource,
   onEditRegion,
+  sourceReading,
   onRun,
   onStop,
   running = false,
@@ -194,6 +197,7 @@ export function ComposeDesk({
                 instead, by painting over the area you want redrawn.
               </p>
             ) : null}
+            {source && sourceReading ? <div className="mt-2">{sourceReading}</div> : null}
           </div>
         )}
 

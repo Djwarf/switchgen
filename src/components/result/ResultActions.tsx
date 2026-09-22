@@ -30,6 +30,7 @@
 import { useMemo } from 'react'
 import { Caution, Kicker, RING } from '../refine/bits'
 import type { DerivedDef } from '../../lib/refine'
+import type { ImageFacts } from '../../lib/vision'
 import type { FamilyDef } from '../../lib/workflows'
 import {
   SHARPNESS_CAVEAT,
@@ -55,6 +56,8 @@ export type ResultActionsProps = {
   def: FamilyDef | DerivedDef | null
   /** False removes the image to image row. See OfferOptions.canSource. */
   canSource?: boolean
+  /** What the detectors found, when the picture has been read. See OfferOptions.facts. */
+  facts?: ImageFacts | null
   /** The press is working. Every row is held, and the reason is printed once. */
   busy?: boolean
   /** A reason nothing can run, from the desk. Printed in place of the rows' own copy. */
@@ -66,6 +69,7 @@ export function ResultActions({
   picture,
   def,
   canSource = true,
+  facts = null,
   busy = false,
   blocked = null,
   onAction,
@@ -84,9 +88,10 @@ export function ResultActions({
     const opts: OfferOptions = {
       size: width && height ? { width, height } : null,
       canSource,
+      facts,
     }
     return offersFor(def, opts)
-  }, [url, def, width, height, canSource])
+  }, [url, def, width, height, canSource, facts])
 
   if (!picture || !offers.length) return null
 

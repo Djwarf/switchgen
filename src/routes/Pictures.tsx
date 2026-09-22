@@ -25,6 +25,8 @@
  * its progress while you read the archive is the difference between a tool and
  * a demo, and there is no press.ts in this build to do it for us.
  */
+import { Reading } from '../components/result/Reading'
+import type { ImageFacts, VisionReport } from '../lib/vision'
 import { AddOnOffers } from '../components/compose/AddOnOffers'
 import { RecipeProse } from '../components/compose/RecipeProse'
 import { faultOf as classifyFault, type Fault } from '../lib/faults'
@@ -56,6 +58,7 @@ import {
   watchConnection,
   type ApiWorkflow,
   type ProgressEvent,
+  relPath
 } from '../lib/comfy'
 import {
   BY_ID,
@@ -81,6 +84,7 @@ import {
   star as starRecord,
   subscribe as subscribeRecords,
   type HistoryEntry,
+  update as updateRecord
 } from '../lib/history'
 import {
   adoptValue,
@@ -108,7 +112,7 @@ import {
   type DerivedDef,
   type LoraSpec,
 } from '../lib/refine'
-import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitFor, targetFor, triggersFor } from '../lib/loras'
+import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitFor, targetFor, triggersFor, archFor } from '../lib/loras'
 import {
   LOOKS,
   decide,
@@ -1562,6 +1566,44 @@ export function Pictures() {
 
   const resultDef = useMemo(() => (current ? defOf(current) : null), [current, defOf])
 
+  /** Detector facts per finished picture, from a reading the reader asked for. */
+  const [facts, setFacts] = useState<ReadonlyMap<string, ImageFacts | null>>(() => new Map())
+  const noteReading = useCallback((id: string, report: VisionReport) => {
+    setFacts((prev) => new Map(prev).set(id, report.facts))
+    // The tags outlive the session: they go on the record, and the archive
+    // can search them.
+    if (report.tags) {
+      updateRecord(id, {
+        tags: report.tags.general.slice(0, 40).map((t) => t.tag),
+        rating: report.rating ?? undefined,
+      })
+    }
+  }, [])
+
+  /** The attached picture, read on request. One element, handed to whichever desk is up. */
+  const sourceReading = c.source?.name ? (
+    <Reading
+      compact
+      source={{ kind: 'input', rel: c.source.name }}
+      cacheKey={`input:${c.source.name}`}
+      arch={style ? archFor(style.def, style.model) : null}
+      anatomy={anatomy}
+      onAnatomy={(level) => {
+        setAnatomySaid(true)
+        setAnatomy(level)
+      }}
+      onAddOn={(file) =>
+        store.patch({
+          addOnsAccepted: [...new Set([...c.addOnsAccepted, file])],
+          addOnsDeclined: c.addOnsDeclined.filter((f) => f !== file),
+        })
+      }
+      onUseWords={(words) =>
+        store.patch({ prompt: c.prompt.trim() ? `${c.prompt.trim()}, ${words}` : words })
+      }
+    />
+  ) : null
+
   /**
    * Run one pass on the picture in front of the reader, or make another like it.
    *
@@ -2071,6 +2113,7 @@ export function Pictures() {
                 ? () => void openRefineFromSource(c.source!)
                 : undefined
             }
+            sourceReading={sourceReading}
           />
         ) : (
           <ComposeDesk
@@ -2112,6 +2155,7 @@ export function Pictures() {
                 ? () => void openRefineFromSource(c.source!)
                 : undefined
             }
+            sourceReading={sourceReading}
             onClearSource={clearSource}
             onRun={start}
             onStop={() => void stopRun()}
@@ -2259,6 +2303,7 @@ export function Pictures() {
                 }}
                 def={resultDef}
                 canSource={canI2I}
+                facts={facts.get(current.id) ?? null}
                 busy={running}
                 blocked={offline ? 'ComfyUI is not answering, so nothing can be queued.' : null}
                 onAction={(id) => {
@@ -2273,6 +2318,28 @@ export function Pictures() {
                 }}
               />
             )}
+
+            {/* What the machine sees in it, on request. The hand and face rows above read the result. */}
+            {current && !current.missing ? (
+              <div className="mt-6 border-t border-grey-300 pt-4">
+                <Reading
+                  source={{ kind: 'output', rel: relPath(current.file) }}
+                  cacheKey={current.id}
+                  arch={archFor(familyOwning(current.model), current.model)}
+                  known={current.tags ? { tags: current.tags, rating: current.rating ?? null } : null}
+                  onRead={(report) => noteReading(current.id, report)}
+                  onAddOn={(file) =>
+                    store.patch({
+                      addOnsAccepted: [...new Set([...c.addOnsAccepted, file])],
+                      addOnsDeclined: c.addOnsDeclined.filter((f) => f !== file),
+                    })
+                  }
+                  onUseWords={(words) =>
+                    store.patch({ prompt: c.prompt.trim() ? `${c.prompt.trim()}, ${words}` : words })
+                  }
+                />
+              </div>
+            ) : null}
           </>
         )}
       </section>
@@ -2332,6 +2399,7 @@ function EditDesk({
   onAcceptAddOn,
   onDeclineAddOn,
   onEditRegion,
+  sourceReading,
 }: {
   prompt: string
   onPrompt: (v: string) => void
@@ -2347,6 +2415,8 @@ function EditDesk({
   onDeclineAddOn?: (file: string) => void
   /** Open the region bench on the attached picture. Omit it and nothing is printed. */
   onEditRegion?: () => void
+  /** A reading of the attached picture, printed under the well. */
+  sourceReading?: ReactNode
   onRun: () => void
   onStop: () => void
   running: boolean
@@ -2404,6 +2474,7 @@ function EditDesk({
               over the area you want redrawn.
             </p>
           ) : null}
+          {source && sourceReading ? <div className="mt-2">{sourceReading}</div> : null}
         </div>
 
         {recipe.ok && recipe.offers.length > 0 && onAcceptAddOn && onDeclineAddOn && (

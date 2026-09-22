@@ -13,6 +13,7 @@
  *   3. Reuse lands in the right room. A clip restores into the Video desk and
  *      a picture into Pictures, with every parameter the record carried.
  */
+import { capabilities as visionCapabilities, tagImages } from '../lib/vision'
 import { useArchiveSync } from '../lib/archiveSync'
 import { recoverUnfiled } from '../lib/recover'
 import {
@@ -44,6 +45,7 @@ import {
   star as starRecord,
   subscribe,
   type HistoryEntry,
+  update
 } from '../lib/history'
 import { modelFiles } from '../lib/hardware'
 import {
@@ -199,6 +201,20 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const [checking, setChecking] = useState(false)
   const [recovering, setRecovering] = useState(false)
   const sync = useArchiveSync()
+  const [canTag, setCanTag] = useState(false)
+  const [tagging, setTagging] = useState<{ done: number; total: number } | null>(null)
+  const tagStop = useRef(false)
+
+  useEffect(() => {
+    let live = true
+    void visionCapabilities().then((c) => {
+      if (live) setCanTag(c.tagger)
+    })
+    return () => {
+      live = false
+      tagStop.current = true
+    }
+  }, [])
   const [sortKey, setSortKey] = useState<SortKey>('at')
   const [ascending, setAscending] = useState(false)
   const [issue, setIssue] = useState<string | null>(() => loadIssue())
@@ -527,6 +543,45 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     }
   }, [])
 
+  /**
+   * Read every picture that has no tags, 24 at a time, on the server's CPU.
+   * Stops when the page is left; what was tagged stays tagged.
+   */
+  const runTagging = useCallback(async () => {
+    const todo = all().filter((e) => e.kind === 'image' && !e.missing && !e.tags?.length)
+    if (!todo.length) return
+    tagStop.current = false
+    setTagging({ done: 0, total: todo.length })
+    let tagged = 0
+    try {
+      for (let i = 0; i < todo.length && !tagStop.current; i += 24) {
+        const slice = todo.slice(i, i + 24)
+        const rows = await tagImages(slice.map((e) => ({ kind: 'output' as const, rel: relPath(e.file) })))
+        for (const row of rows) {
+          if (row.error) continue
+          const e = slice.find((x) => relPath(x.file) === row.rel)
+          if (!e) continue
+          update(e.id, { tags: row.general.slice(0, 40).map((t) => t.tag), rating: row.rating ?? undefined })
+          tagged++
+        }
+        setTagging({ done: Math.min(todo.length, i + slice.length), total: todo.length })
+      }
+      setBanner({
+        variant: 'success',
+        title: 'Tagged',
+        text: `${tagged} ${tagged === 1 ? 'picture' : 'pictures'} read. Search tag:something, or use the Content facets.`,
+      })
+    } catch (err) {
+      setBanner({
+        variant: 'error',
+        title: 'The tagger stopped',
+        text: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setTagging(null)
+    }
+  }, [])
+
   const importFile = useCallback(async (file: File) => {
     try {
       const added = await file.text().then(importJson)
@@ -764,6 +819,9 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           sync={sync}
           onRecover={() => void runRecover()}
           recovering={recovering}
+          canTag={canTag}
+          onTagAll={() => void runTagging()}
+          tagging={tagging}
         />
 
         <main className="min-w-0 flex-1">

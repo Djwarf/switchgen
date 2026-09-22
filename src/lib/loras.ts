@@ -64,6 +64,7 @@
  * A file on disk with no catalogue row is still offered. It is simply marked as
  * having no verified base, which is the truth.
  */
+import { downloadFile, type FetchProgress } from './downloads'
 import { byFilename as indexedLora } from './loraIndex'
 
 /**
@@ -1958,25 +1959,12 @@ export function resolveStack(
 // Fetching one that is not installed yet
 // ---------------------------------------------------------------------------
 
-export type FetchProgress = {
-  state: 'starting' | 'downloading' | 'done' | 'error' | 'cancelled'
-  /** 0 to 1. Zero until the server has the content length. */
-  pct: number
-  done: number
-  total: number
-  /** Bytes per second, as aria2c reports it. */
-  speed: number
-  etaSec: number | null
-  error: string | null
-}
+export type { FetchProgress } from './downloads'
 
 /**
- * Download one catalogue LoRA into the LoRA folder.
- *
- * POST /api/download answers with an event stream rather than JSON, so this
- * reads the body as a stream instead of using EventSource, which cannot POST.
- * The server keeps the partial file when the request is aborted, so a cancelled
- * fetch resumes rather than starting again.
+ * Download one catalogue LoRA into the LoRA folder. The reader lives in
+ * downloads.ts now, shared with the tagger and the catalogue; this names the
+ * destination.
  */
 export async function fetchLora(
   info: LoraInfo,
@@ -1985,74 +1973,11 @@ export async function fetchLora(
   signal?: AbortSignal,
 ): Promise<void> {
   if (!info.url) throw new Error(`${info.label} has no verified download URL.`)
-
-  const res = await fetch('/api/download', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      url: info.url,
-      filename: info.file,
-      dest: `${folder || DEFAULT_LORA_FOLDER}/${info.file}`,
-    }),
+  await downloadFile(
+    { url: info.url, filename: info.file, dest: `${folder || DEFAULT_LORA_FOLDER}/${info.file}` },
+    onProgress,
     signal,
-  })
-
-  // A rejected plan answers JSON, not a stream: bad URL, a clashing download,
-  // a destination outside the models root.
-  if (!res.ok || !res.body) {
-    let message = `HTTP ${res.status}`
-    try {
-      const body = (await res.json()) as { error?: string }
-      if (body.error) message = body.error
-    } catch {
-      /* not JSON either */
-    }
-    throw new Error(message)
-  }
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let failure: string | null = null
-
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const blocks = buffer.split('\n\n')
-    buffer = blocks.pop() ?? ''
-    for (const block of blocks) {
-      let event = 'message'
-      let data = ''
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event:')) event = line.slice(6).trim()
-        else if (line.startsWith('data:')) data += line.slice(5).trim()
-      }
-      if (!data) continue
-      let payload: Record<string, unknown>
-      try {
-        payload = JSON.parse(data) as Record<string, unknown>
-      } catch {
-        continue
-      }
-      if (event === 'start' || event === 'progress' || event === 'file' || event === 'skip') {
-        onProgress({
-          state: event === 'start' ? 'starting' : event === 'progress' ? 'downloading' : 'done',
-          pct: typeof payload.pct === 'number' ? payload.pct : 0,
-          done: typeof payload.done === 'number' ? payload.done : 0,
-          total: typeof payload.total === 'number' ? payload.total : 0,
-          speed: typeof payload.speed === 'number' ? payload.speed : 0,
-          etaSec: typeof payload.etaSec === 'number' ? payload.etaSec : null,
-          error: null,
-        })
-      } else if (event === 'error') {
-        failure = typeof payload.error === 'string' ? payload.error : 'the download failed'
-        onProgress({ state: 'error', pct: 0, done: 0, total: 0, speed: 0, etaSec: null, error: failure })
-      }
-    }
-  }
-
-  if (failure) throw new Error(failure)
+  )
 }
 
 /** `217.9 MB`, `1.4 GB`. Sizes, never durations. */

@@ -16,6 +16,9 @@ import { adoptValue, type DeskId, type TunableField } from '../../lib/session'
 import { ArchiveVideo } from './ArchiveVideo'
 import { CardActions, type EntryActions } from './CardActions'
 import { Notice } from '../type'
+import { Reading } from '../result/Reading'
+import { archFor } from '../../lib/loras'
+import { familyOwning } from '../../lib/workflows'
 import { duration, editionNo, fullDate, madeFrom } from './query'
 
 type Props = EntryActions & {
@@ -350,6 +353,30 @@ export function Detail({
               <Row label="File" value={relPath(entry.file)} wrap />
               <Row label="Job" value={entry.promptId} wrap />
             </dl>
+
+            {entry.kind === 'image' && !entry.missing ? (
+              <div className="mt-6">
+                <h3 className="border-b border-grey-300 pb-1 text-[0.625rem] font-semibold tracking-[0.18em] text-grey-700 uppercase">
+                  What is in it
+                </h3>
+                <div className="mt-2">
+                  <Reading
+                    compact
+                    source={{ kind: 'output', rel: relPath(entry.file) }}
+                    cacheKey={entry.id}
+                    arch={archFor(familyOwning(entry.model), entry.model)}
+                    known={entry.tags ? { tags: entry.tags, rating: entry.rating ?? null } : null}
+                    onRead={(report) => {
+                      if (!report.tags) return
+                      updateEntry(entry.id, {
+                        tags: report.tags.general.slice(0, 40).map((t) => t.tag),
+                        rating: report.rating ?? undefined,
+                      })
+                    }}
+                  />
+                </div>
+              </div>
+            ) : null}
 
             {source && (
               <div className="mt-6">

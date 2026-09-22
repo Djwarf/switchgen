@@ -830,6 +830,45 @@ export async function recipeInputFromImage(
   }
 }
 
+/** One tagged row of a batch, with the reference it was asked about. */
+export type TaggedRow = ImageTags & { kind: ImageKind; rel: string; error?: string }
+
+/**
+ * Tag up to 24 images the server can reach, in one child process.
+ *
+ * For the archive's "tag everything that has no tags" pass. Rows come back
+ * with the caller's own reference attached, so a batch is reassembled by
+ * reference rather than by trusting array order. A row with `error` set is a
+ * file the server could not read; the others are still good.
+ */
+export async function tagImages(refs: readonly ImageRef[], signal?: AbortSignal): Promise<TaggedRow[]> {
+  if (!refs.length) return []
+  const res = await fetch('/api/vision/tag', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images: refs.slice(0, 24) }),
+    signal,
+  })
+  const text = await res.text()
+  let data: Record<string, unknown>
+  try { data = JSON.parse(text) as Record<string, unknown> } catch {
+    throw new Error('the vision endpoint is not mounted on this server')
+  }
+  if (!res.ok) throw new Error(String(data.error ?? res.statusText))
+  const rows = (data.tag as { rows?: (TagRow & { kind?: ImageKind; rel?: string })[] } | undefined)?.rows ?? []
+  return rows.map(row => ({
+    width: row.width,
+    height: row.height,
+    rating: row.rating,
+    ratings: row.ratings ?? [],
+    general: row.general ?? [],
+    character: row.character ?? [],
+    kind: row.kind ?? 'output',
+    rel: row.rel ?? '',
+    error: row.error,
+  }))
+}
+
 /**
  * Resolve a suggestion back to its index entry, for a caller holding only a
  * filename. A thin alias over byFilename, kept so the vision path does not have

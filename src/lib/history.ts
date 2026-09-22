@@ -136,6 +136,11 @@ export type HistoryEntry = {
   rev?: number
   /** Filed from the outputs folder after the fact, not by the desk that made it. */
   recovered?: boolean
+
+  /** What the tagger saw, booru spelling, strongest first. Absent until a reading. */
+  tags?: string[]
+  /** WD14's own four-way rating, when a reading was made. */
+  rating?: 'general' | 'sensitive' | 'questionable' | 'explicit'
 }
 
 /**
@@ -230,6 +235,8 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
       : undefined,
     rev: numOrNull(e.rev) ?? undefined,
     recovered: e.recovered === true ? true : undefined,
+    tags: Array.isArray(e.tags) ? e.tags.filter((t: unknown): t is string => typeof t === 'string') : undefined,
+    rating: ['general', 'sensitive', 'questionable', 'explicit'].includes(e.rating) ? e.rating : undefined,
     prompt: str(e.prompt, ''),
     negative: typeof e.negative === 'string' ? e.negative : null,
     familyId: str(e.familyId, ''),
@@ -870,6 +877,7 @@ export function searchIndex(e: HistoryEntry): string {
     e.source?.name ?? '',
     e.source?.ref?.filename ?? '',
     e.note ?? '',
+    ...(e.tags ?? []).map((t) => t.replace(/_/g, ' ')),
   ]
     .join(' \u0000 ')
     .toLowerCase()
@@ -923,6 +931,8 @@ function matchField(e: HistoryEntry, field: string, value: string): boolean {
           return !!e.missing
         case 'source':
           return !!e.source
+        case 'tagged':
+          return !!e.tags?.length
         default:
           return false
       }
@@ -936,6 +946,11 @@ function matchField(e: HistoryEntry, field: string, value: string): boolean {
       return `${e.model} ${e.modelLabel}`.toLowerCase().includes(value)
     case 'family':
       return `${e.familyId} ${e.familyLabel}`.toLowerCase().includes(value)
+    case 'tag': {
+      // Booru spelling has underscores; a person types spaces. Match either.
+      const want = value.replace(/_/g, ' ')
+      return (e.tags ?? []).some((t) => t.replace(/_/g, ' ').includes(want))
+    }
     case 'seed':
       return String(e.seed) === value
     case 'no':

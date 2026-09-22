@@ -41,6 +41,7 @@ import {
   hiresSize,
   type DerivedDef,
 } from '../../lib/refine'
+import type { ImageFacts } from '../../lib/vision'
 import type { FamilyDef } from '../../lib/workflows'
 
 // ---------------------------------------------------------------------------
@@ -122,6 +123,21 @@ export type OfferOptions = {
    * False removes the row: the recipe would have nothing to route it to.
    */
   canSource?: boolean
+  /**
+   * What the detectors found, when the picture has been read. The hand and
+   * face rows then say how many there are to fix and how big, which is the
+   * one fact that tells a reader whether the pass has anything to do.
+   */
+  facts?: ImageFacts | null
+}
+
+/** "The detector found 2 hands, the larger 3.1% of the frame." or that it found none. */
+function foundSentence(facts: ImageFacts | null | undefined, part: 'hand' | 'face'): string {
+  if (!facts) return ''
+  const list = facts[part]
+  if (!list.length) return ` The detector found no ${part}s in this picture, so this pass would have nothing to draw.`
+  const largest = Math.max(...list.map((d) => d.areaShare)) * 100
+  return ` The detector found ${list.length} ${part}${list.length === 1 ? '' : 's'}, the largest ${largest.toFixed(1)}% of the frame.`
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +183,8 @@ export function offersFor(
       id: 'hand',
       label: 'Fix the hands',
       what:
-        'Finds every hand and draws it again, guided to 768 pixels and capped at 1024, with more freedom than a face, because hands come out wrong rather than merely soft. The picture is rendered again at the same seed, so the composition is the one in front of you.',
+        'Finds every hand and draws it again, guided to 768 pixels and capped at 1024, with more freedom than a face, because hands come out wrong rather than merely soft. The picture is rendered again at the same seed, so the composition is the one in front of you.' +
+        foundSentence(opts.facts, 'hand'),
       measured: 'Not measured. Judge it against the picture you already have.',
       ...costOf(deriveAutoDetail(def, 'hand')),
       group: 'improve',
@@ -179,7 +196,8 @@ export function offersFor(
       id: 'face',
       label: 'Fix the face',
       what:
-        'Finds every face and draws it again, guided to 768 pixels and capped at 1024, where two eyes and a mouth finally have the cells to resolve. Rendered again at the same seed, so only the faces move.',
+        'Finds every face and draws it again, guided to 768 pixels and capped at 1024, where two eyes and a mouth finally have the cells to resolve. Rendered again at the same seed, so only the faces move.' +
+        foundSentence(opts.facts, 'face'),
       measured: `Measured ${ratio(MEASURED.faceDetailer.ratio)} whole frame sharpness, which is why it is offered rather than run for you.`,
       ...costOf(deriveAutoDetail(def, 'face')),
       group: 'improve',
