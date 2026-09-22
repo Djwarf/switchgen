@@ -96,7 +96,8 @@ export function blankDraft(): ReelDraft {
     anchor: null,
     reanchorEvery: 0,
     prefix: 'switchgen/reel',
-    shots: [newShot(), newShot(), newShot()],
+    // Empty on purpose: the desk prints an invitation, not three blank rows.
+    shots: [],
   }
 }
 
@@ -152,9 +153,12 @@ function readDraft(raw: string | null): ReelDraft {
   }
   if (!parsed || typeof parsed !== 'object') return base
   const d = parsed as Record<string, unknown>
-  const shots = Array.isArray(d.shots)
+  const rawShots = Array.isArray(d.shots)
     ? d.shots.map(readShot).filter((s): s is ReelShot => s !== null)
     : base.shots
+  // A strip of nothing but blank rows is the old default, not a reel someone
+  // wrote. Read it as empty so the invitation shows instead of the rows.
+  const shots = rawShots.some((s) => s.prompt.trim() || s.start || s.end || s.label) ? rawShots : []
   return {
     familyId: str(d.familyId, base.familyId),
     model: str(d.model, base.model),
@@ -172,7 +176,7 @@ function readDraft(raw: string | null): ReelDraft {
     anchor: readFrame(d.anchor),
     reanchorEvery: Math.max(0, Math.floor(num(d.reanchorEvery, 0))),
     prefix: str(d.prefix, base.prefix),
-    shots: shots.length ? shots : base.shots,
+    shots,
   }
 }
 
@@ -286,7 +290,7 @@ export const reel = {
   },
 
   clear(): void {
-    commit({ ...draft, shots: [newShot()] })
+    commit({ ...draft, shots: [] })
   },
 
   reset(): void {

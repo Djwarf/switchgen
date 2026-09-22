@@ -190,7 +190,10 @@ function ShotRow(p: RowProps) {
         ) : null}
 
         {state?.error ? (
-          <p className="mt-1 border-l-2 border-error pl-2 text-caption text-ink-error">{state.error}</p>
+          <p className="mt-1 border-l-2 border-error pl-2 text-caption text-ink-error">
+            {state.error}
+            {state.detail ? <span className="block text-grey-700">{state.detail}</span> : null}
+          </p>
         ) : null}
 
         {expert ? (

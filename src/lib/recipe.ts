@@ -887,6 +887,19 @@ export function explain(recipe: Recipe): string {
 
   const out: string[] = []
 
+  // An instruction model follows the change, not a look. The sentence about
+  // "photoreal work" would be wrong for it, and the size sentence matters more.
+  if (recipe.base.mode === 'edit') {
+    out.push(`${recipe.label} follows the instruction. The size and the shape come from your picture, not from a size control.`)
+    if (recipe.loras.length) {
+      out.push(
+        `${recipe.loras.length} add-on${recipe.loras.length === 1 ? '' : 's'} applied at the author's strength: ${recipe.loras.map(l => l.label).join(', ')}. Not measured here.`,
+      )
+    }
+    out.push('Faces, hands, a masked region and a larger render are offered once the change exists.')
+    return out.join(' ')
+  }
+
   const pickedFor =
     recipe.anatomy === 'off'
       ? `${recipe.label} for ${lookWord(recipe.look)} work.`

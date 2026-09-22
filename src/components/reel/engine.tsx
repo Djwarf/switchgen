@@ -26,6 +26,7 @@
 import { useSyncExternalStore } from 'react'
 
 import { cancelJob, run, type OutputFile, type ProgressEvent } from '../../lib/comfy'
+import { faultBody, faultOf, faultWhere } from '../../lib/faults'
 import { chainFrameOf, instantiateShot, type ShotJob } from '../../lib/continuation'
 import { history } from '../../lib/history'
 import { recordOf, type Composition } from '../../lib/session'
@@ -45,6 +46,8 @@ export type ShotState = {
   finishedAt: number | null
   durationMs: number
   error: string | null
+  /** "The trouble is in LoadImage (node 7)." when ComfyUI named the node. */
+  detail: string | null
   files: OutputFile[]
   /** The clip itself. */
   clip: OutputFile | null
@@ -96,6 +99,7 @@ function blankShot(shotId: string, frames: number): ShotState {
     finishedAt: null,
     durationMs: 0,
     error: null,
+    detail: null,
     files: [],
     clip: null,
     frame: null,
@@ -284,17 +288,18 @@ async function renderShot(
     })
     return 'done'
   } catch (err) {
-    const e = err as { message?: string; cancelled?: boolean }
+    const f = faultOf(err)
     const finishedAt = Date.now()
     setShot(shotId, {
-      status: e?.cancelled ? 'stopped' : 'error',
-      stage: e?.cancelled ? 'Stopped' : 'Failed',
-      error: e?.cancelled ? null : (e?.message ?? 'Something went wrong.'),
+      status: f.cancelled ? 'stopped' : 'error',
+      stage: f.cancelled ? 'Stopped' : 'Failed',
+      error: f.cancelled ? null : faultBody(f),
+      detail: f.cancelled ? null : faultWhere(f),
       finishedAt,
       durationMs: finishedAt - startedAt,
       previewUrl: null,
     })
-    return e?.cancelled ? 'stopped' : 'error'
+    return f.cancelled ? 'stopped' : 'error'
   }
 }
 

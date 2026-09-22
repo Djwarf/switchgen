@@ -25,6 +25,9 @@
  * its progress while you read the archive is the difference between a tool and
  * a demo, and there is no press.ts in this build to do it for us.
  */
+import { AddOnOffers } from '../components/compose/AddOnOffers'
+import { RecipeProse } from '../components/compose/RecipeProse'
+import { faultOf as classifyFault, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { measureImage as measure } from '../lib/images'
 import { clamp } from '../lib/num'
@@ -42,7 +45,6 @@ import {
   type RefObject,
 } from 'react'
 import {
-  ComfyError,
   cancelJob,
   connectionState,
   fileUrl,
@@ -105,7 +107,7 @@ import {
   type DerivedDef,
   type LoraSpec,
 } from '../lib/refine'
-import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary } from '../lib/loras'
+import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitFor, targetFor, triggersFor } from '../lib/loras'
 import {
   LOOKS,
   decide,
@@ -115,11 +117,11 @@ import {
   type PassOffer,
   type Recipe,
   type RecipeNote,
+  type RecipeLora
 } from '../lib/recipe'
 import { RegionRefine, type RefineRequest } from '../components/refine'
 import {
   ComposeDesk,
-  Hairline,
   MoreFootnote,
   PromptField,
   RunButton,
@@ -400,15 +402,8 @@ type DeskJob = {
   finishedAt: number | null
 }
 
-type DeskFault = {
-  message: string
-  cancelled: boolean
-  /** True when ComfyUI no longer has any record of the job. See watchLost. */
-  lost: boolean
-  node: string | null
-  nodeType: string | null
-  detail: string | null
-}
+/** The shared shape, with `lost` set by this desk's own watcher. See watchLost. */
+type DeskFault = Fault
 
 /**
  * A job ComfyUI has forgotten, as opposed to one it refused.
@@ -727,42 +722,9 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
 
 function faultOf(err: unknown): DeskFault {
   if (err instanceof LostJob) {
-    return {
-      message: err.message,
-      cancelled: false,
-      lost: true,
-      node: null,
-      nodeType: null,
-      detail: null,
-    }
+    return { message: err.message, cancelled: false, lost: true, node: null, nodeType: null, detail: null }
   }
-  if (err instanceof ComfyError) {
-    const detail = err.nodeErrors
-      ? Object.values(err.nodeErrors)
-          .flatMap((n) => {
-            const errs = (n as { errors?: { message?: string; details?: string }[] })?.errors ?? []
-            return errs.map((e) => [e.message, e.details].filter(Boolean).join(': '))
-          })
-          .filter(Boolean)
-          .join('; ')
-      : null
-    return {
-      message: err.message,
-      cancelled: err.cancelled,
-      lost: false,
-      node: err.node,
-      nodeType: err.nodeType,
-      detail: detail || null,
-    }
-  }
-  return {
-    message: err instanceof Error ? err.message : String(err),
-    cancelled: false,
-    lost: false,
-    node: null,
-    nodeType: null,
-    detail: null,
-  }
+  return classifyFault(err)
 }
 
 async function stopRun() {
@@ -871,19 +833,61 @@ function editRecipe(input: {
   source: string | null
   seed: number
   cat: Catalogue
+  lib: LoraLibrary
+  addOns?: { accepted?: readonly string[]; declined?: readonly string[] }
 }): Recipe {
   const { style, cat } = input
   const prompt = input.prompt.trim()
   const def = style.def
   const d = defaultsFor(def, style.model)
+  const warnings: string[] = []
+
+  // ADD-ONS FOR AN INSTRUCTION.
+  //
+  // suggest() scores a prompt's wording against each add-on's training
+  // vocabulary, and "make the jacket red" has nothing for it to match. So the
+  // edit desk offers every installed add-on that fits this model, the reader
+  // decides, and an accepted one is chained into the graph exactly as the
+  // compose desk chains its own. Declined ones stay declined across recomputes
+  // for the same reason they do there: the decision arrives as input.
+  const target = targetFor(def, style.model)
+  const accepted = new Set(input.addOns?.accepted ?? [])
+  const declined = new Set(input.addOns?.declined ?? [])
+  const loras: RecipeLora[] = []
+  const offers: RecipeLora[] = []
+  for (const info of input.lib.all) {
+    if (!info.installed || declined.has(info.file)) continue
+    if (fitFor(info, target).level !== 'match') continue
+    const row: RecipeLora = {
+      file: info.file,
+      label: info.label,
+      strength: defaultStrength(info),
+      measured: false,
+      why: info.does,
+    }
+    if (accepted.has(info.file)) loras.push(row)
+    else offers.push(row)
+  }
+  let planDef: FamilyDef | DerivedDef = def
+  if (loras.length) {
+    const chained = withLoras(def, loras.map((l) => ({ name: l.file, strength: l.strength })))
+    if (chained) planDef = chained
+    else warnings.push(`${style.label} cannot take add-ons, so none were applied.`)
+  }
+  const triggers = triggersFor(
+    loras.map((l) => ({ file: l.file, strength: l.strength, enabled: true })),
+    input.lib,
+    target,
+  ).filter((t) => !prompt.toLowerCase().includes(t.toLowerCase()))
   const report = intentReport(
     { intent: input.look as Intent, explicit: input.anatomy !== 'off', mode: 'edit' },
     { installed: cat.installed, sizes: cat.sizes, hardware: cat.hardware },
   )
 
+  const positiveBase = style.positivePrefix ? `${style.positivePrefix}${prompt}` : prompt
   const params: Params = {
     model: style.model,
-    positive: style.positivePrefix ? `${style.positivePrefix}${prompt}` : prompt,
+    positive: triggers.length ? `${positiveBase}, ${triggers.join(', ')}` : positiveBase,
     negative: d.negative ?? '',
     seed: input.seed,
     steps: d.steps,
@@ -897,8 +901,7 @@ function editRecipe(input: {
   if (style.shift != null) params.shift = style.shift
   if (input.source) params.image = input.source
 
-  const capabilities = capabilitiesOf(def)
-  const warnings: string[] = []
+  const capabilities = capabilitiesOf(planDef)
   if (style.verdict && style.verdict.level !== 'ok') warnings.push(style.verdict.reason)
   if (input.anatomy !== 'off') {
     warnings.push(
@@ -924,6 +927,13 @@ function editRecipe(input: {
     },
   ]
   if (style.note) notes.push({ kind: 'model', text: style.note, measured: false })
+  if (triggers.length) {
+    notes.push({
+      kind: 'prompt',
+      text: `These words were added to your instruction so the add-ons work: ${triggers.join(', ')}.`,
+      measured: false,
+    })
+  }
 
   const offer = (available: boolean, why: string): PassOffer => ({ available, auto: false, why })
 
@@ -937,15 +947,13 @@ function editRecipe(input: {
     label: style.label,
     familyLabel: style.group,
     base: def,
-    def,
+    def: planDef,
     params,
-    loras: [],
+    loras,
     sharpness: null,
     missingLoras: [],
     refineLoras: [],
-    // The edit desk follows an instruction rather than a described scene, so
-    // there is no wording to match add-ons against. Nothing is offered here.
-    offers: [],
+    offers,
     passes: {
       face: offer(
         capabilities.faceDetail,
@@ -1255,6 +1263,8 @@ export function Pictures() {
         source: sourceName || null,
         seed: seed0,
         cat,
+        lib,
+        addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
       })
     }
     return decide({
@@ -2049,6 +2059,23 @@ export function Pictures() {
             advanced={advanced}
             moreOpen={expert}
             onMoreOpenChange={(open) => settings.patch({ expert: open })}
+            onAcceptAddOn={(file) =>
+              store.patch({
+                addOnsAccepted: [...new Set([...c.addOnsAccepted, file])],
+                addOnsDeclined: c.addOnsDeclined.filter((f) => f !== file),
+              })
+            }
+            onDeclineAddOn={(file) =>
+              store.patch({
+                addOnsDeclined: [...new Set([...c.addOnsDeclined, file])],
+                addOnsAccepted: c.addOnsAccepted.filter((f) => f !== file),
+              })
+            }
+            onEditRegion={
+              c.source && c.source.name && canRefine
+                ? () => void openRefineFromSource(c.source!)
+                : undefined
+            }
           />
         ) : (
           <ComposeDesk
@@ -2307,6 +2334,9 @@ function EditDesk({
   advanced,
   moreOpen,
   onMoreOpenChange,
+  onAcceptAddOn,
+  onDeclineAddOn,
+  onEditRegion,
 }: {
   prompt: string
   onPrompt: (v: string) => void
@@ -2317,6 +2347,11 @@ function EditDesk({
   sourceError: string | null
   onPickSource: () => void
   onClearSource: () => void
+  /** Add-ons that fit the instruction model. Offered, never applied without a decision. */
+  onAcceptAddOn?: (file: string) => void
+  onDeclineAddOn?: (file: string) => void
+  /** Open the region bench on the attached picture. Omit it and nothing is printed. */
+  onEditRegion?: () => void
   onRun: () => void
   onStop: () => void
   running: boolean
@@ -2360,13 +2395,25 @@ function EditDesk({
           rows={3}
         />
 
-        <SourceWell
-          source={source}
-          busy={sourceBusy}
-          error={sourceError}
-          onPick={onPickSource}
-          onClear={onClearSource}
-        />
+        <div>
+          <SourceWell
+            source={source}
+            busy={sourceBusy}
+            error={sourceError}
+            onPick={onPickSource}
+            onClear={onClearSource}
+          />
+          {source && onEditRegion ? (
+            <p className="mt-1.5 text-caption text-grey-500">
+              <Link onClick={onEditRegion}>Change part of this picture</Link> instead, by painting
+              over the area you want redrawn.
+            </p>
+          ) : null}
+        </div>
+
+        {recipe.ok && recipe.offers.length > 0 && onAcceptAddOn && onDeclineAddOn && (
+          <AddOnOffers offers={recipe.offers} onAccept={onAcceptAddOn} onDecline={onDeclineAddOn} />
+        )}
 
         <div>
           <RunButton
@@ -2382,30 +2429,7 @@ function EditDesk({
             reduced={reducedMotion}
           />
 
-          <div className="mt-6">
-            <Hairline className="mb-3" />
-            <Kicker>{recipe.ok ? 'What the desk chose' : 'Nothing to run'}</Kicker>
-            {recipe.ok ? (
-              <>
-                <p className="mt-2 max-w-[62ch] text-body leading-relaxed text-ink">
-                  {recipe.label} follows the instruction. The size and the shape come from your
-                  picture, not from a size control. Faces, hands, a masked region and a larger
-                  render are offered once the change exists.
-                </p>
-                {recipe.warnings.map((w, i) => (
-                  <p key={i} className="mt-2 max-w-[62ch] text-caption text-grey-700">
-                    {w}
-                  </p>
-                ))}
-              </>
-            ) : (
-              <div className="mt-2 max-w-[62ch]">
-                <Notice tone="correction" title="Correction">
-                  {recipe.reason}
-                </Notice>
-              </div>
-            )}
-          </div>
+          <RecipeProse recipe={recipe} />
         </div>
       </div>
 

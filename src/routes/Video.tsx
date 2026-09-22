@@ -26,6 +26,7 @@
  * can never stop somebody else's picture.
  */
 
+import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { measureImage as measure } from '../lib/images'
 import { clamp } from '../lib/num'
@@ -593,6 +594,8 @@ export type VideoJob = {
   samplingAt: number | null
   finishedAt: number | null
   error: string | null
+  /** The classified failure, with ComfyUI's node and per-input detail when it gave them. */
+  fault: Fault | null
   files: OutputFile[]
   entryId: string | null
   composition: Composition
@@ -696,6 +699,7 @@ function startJob(opts: StartOptions): string {
     samplingAt: null,
     finishedAt: null,
     error: null,
+    fault: null,
     files: [],
     entryId: null,
     composition: opts.composition,
@@ -769,13 +773,16 @@ function startJob(opts: StartOptions): string {
       })
     })
     .catch((err: unknown) => {
-      const e = err as { message?: string; cancelled?: boolean }
+      // The same classification the Pictures desk uses, so a clip that failed
+      // on a bad frame names the node instead of saying something went wrong.
+      const f = faultOf(err)
       patchJob(id, {
-        status: e?.cancelled ? 'cancelled' : 'error',
-        error: e?.message ?? 'Something went wrong.',
+        status: f.cancelled ? 'cancelled' : 'error',
+        error: f.message || 'Something went wrong.',
+        fault: f,
         finishedAt: Date.now(),
         previewUrl: null,
-        stage: e?.cancelled ? 'Stopped' : 'Failed',
+        stage: f.cancelled ? 'Stopped' : 'Failed',
         queuePos: null,
       })
     })
@@ -2306,11 +2313,12 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
             <div className="mb-4">
               <Notice
                 tone={failed.status === 'cancelled' ? 'correction' : 'error'}
-                title={failed.status === 'cancelled' ? 'Correction' : errorTitle(failed.error)}
+                title={faultTitle(failed.fault ?? faultOf(new Error(failed.error ?? '')))}
               >
-                {failed.status === 'cancelled'
-                  ? 'Job stopped. Nothing was saved.'
-                  : errorBody(failed.error)}{' '}
+                {faultBody(failed.fault ?? faultOf(new Error(failed.error ?? '')))}{' '}
+                {failed.fault && faultWhere(failed.fault) ? (
+                  <span className="block text-caption">{faultWhere(failed.fault)}</span>
+                ) : null}
                 <button className="underline" onClick={() => dismissJob(failed.id)}>
                   Dismiss
                 </button>
@@ -2561,17 +2569,3 @@ function downloadName(file: FileRef, entry: HistoryEntry | null): string {
   return `switchgen-${entry.familyId}-${entry.seed}.${ext}`
 }
 
-function errorTitle(message: string | null): string {
-  const m = (message ?? '').toLowerCase()
-  if (m.includes('out of memory') || m.includes('oom')) return 'The card ran out of memory'
-  if (m.includes('rejected') || m.includes('queue')) return 'That job was rejected'
-  return 'That clip did not finish'
-}
-
-function errorBody(message: string | null): string {
-  const m = (message ?? '').toLowerCase()
-  if (m.includes('out of memory') || m.includes('oom')) {
-    return 'This size needs more than the card has. Try a shorter clip or a smaller shape, or close anything else using the GPU.'
-  }
-  return message ?? 'ComfyUI did not say why. Check its log and try again.'
-}

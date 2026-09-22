@@ -28,6 +28,7 @@
  * workflow from a registry family that was already validated against the live
  * schema. Nothing here builds a graph by hand.
  */
+import { ServerDown } from '../components/ServerDown'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { modelFiles, probeHardware, type ModelFile } from '../lib/hardware'
 import {
@@ -79,6 +80,7 @@ import {
   type ReelShot,
   type RunContext,
   type Shape,
+  EmptyStrip
 } from '../components/reel'
 
 import type { PlayerSlot } from './Video'
@@ -555,6 +557,10 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
 
   // --- the page ------------------------------------------------------------
 
+  // The other two desks print this page with a Try now link; this one printed
+  // one line and left the reader to wait.
+  if (catError && !cat) return <ServerDown onRetry={() => setAttempt((a) => a + 1)} detail={catError} />
+
   return (
     <main className="relative min-h-full px-6 py-6">
       <div className="mb-5 border-b-2 border-burgundy-900 pb-2">
@@ -657,7 +663,16 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
             </div>
           ) : null}
 
-          {family ? (
+          {family && !draft.shots.length ? (
+            <EmptyStrip
+              onLayOut={(text) => {
+                const shots = shotsFromLines(text)
+                if (shots.length) reel.patch({ shots })
+              }}
+              onStartOne={() => reel.add()}
+              onPaste={() => setPasting(true)}
+            />
+          ) : family ? (
             <Strip
               shots={draft.shots}
               jobs={plan.jobs}
