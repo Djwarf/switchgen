@@ -63,9 +63,9 @@ export type Footprint = {
  */
 const WEIGHT_INPUT = /^(ckpt|unet|clip|vae|lora)_name\d*$/
 
-function footprintOf(def: FamilyDef, sizes: Map<string, ModelFile>): Footprint {
+function footprintOf(graph: FamilyDef['graph'], sizes: Map<string, ModelFile>): Footprint {
   const names = new Set<string>()
-  for (const node of Object.values(def.graph)) {
+  for (const node of Object.values(graph)) {
     for (const [k, v] of Object.entries(node.inputs)) {
       if (WEIGHT_INPUT.test(k) && typeof v === 'string') names.add(v)
     }
@@ -101,8 +101,22 @@ export type Verdict = {
 
 export const gb = (n: number) => `${(n / 1024 ** 3).toFixed(1)} GB`
 
-export function feasibility(def: FamilyDef, sizes: Map<string, ModelFile>, hw: Hardware): Verdict {
-  const fp = footprintOf(def, sizes)
+/**
+ * Whether a family fits this machine, priced from the weight files on disk.
+ *
+ * `graph` is the graph that will be submitted, when the caller has one built:
+ * it names the weight file actually chosen, which may be a different quant
+ * from the one the family's own graph names, and every add-on chained in.
+ * Without it the family's own graph is priced, which is the default file and
+ * no add-ons.
+ */
+export function feasibility(
+  def: FamilyDef,
+  sizes: Map<string, ModelFile>,
+  hw: Hardware,
+  graph: FamilyDef['graph'] = def.graph,
+): Verdict {
+  const fp = footprintOf(graph, sizes)
   const offloads = !!hw.gpu && fp.largestBytes > hw.gpu.vramTotal
 
   if (fp.unknown.length && !fp.weightBytes) {

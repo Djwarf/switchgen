@@ -44,7 +44,9 @@ const HISTORY_VERSION = 2
  * 5,000 of them come close to the roughly five million characters a browser
  * allows one origin, which the desk drafts share. Beyond the cap the oldest
  * unstarred records fall off the end. With the server behind it, that only
- * narrows what this browser shows: the server keeps them all.
+ * narrows what this browser shows: the server keeps them all. A record that
+ * also keeps the prompt as sent (`positive`) is longer by that prompt, so the
+ * quota path in {@link writeNow} can be reached before the cap is.
  */
 const MAX_ENTRIES = 5000
 
@@ -71,8 +73,12 @@ export type HistoryEntry = {
   /** Base family id — never a derived `__img2img` / `__i2v` suffix. */
   familyId: string
   familyLabel: string
-  /** Which derived shape of the family ran, if any. */
-  variant: null | 'img2img' | 'i2v' | 'nolora'
+  /**
+   * Which derived shape of the family ran, if any. `refine` is a pass over a
+   * finished picture (a region repainted, say), which no set of scalars on
+   * this record can rebuild on its own.
+   */
+  variant: null | 'img2img' | 'i2v' | 'nolora' | 'refine'
   /** The weight file, e.g. `moodyCutieMixKrea2_v50_int8.safetensors`. */
   model: string
   modelLabel: string
@@ -82,6 +88,14 @@ export type HistoryEntry = {
   negative: string | null
   /** The author-card prefix that was prepended, when one was. */
   positivePrefix?: string
+  /**
+   * The positive prompt exactly as it was sent: the prefix, the words and any
+   * add-on words included, and any edit made to it by hand. `prompt` is what
+   * the reader wrote, and several things rewrite it on its way to the graph,
+   * so neither it nor the prefix is enough to send the same thing again.
+   * Absent on records filed before it was kept.
+   */
+  positive?: string
 
   seed: number
   steps: number
@@ -110,10 +124,12 @@ export type HistoryEntry = {
    */
   passes?: { face?: boolean; hand?: boolean; hires?: boolean }
   /**
-   * The LoRA chain that was inserted, resolved to files and strengths.
-   * Structurally `LoraSpec` from `src/lib/refine.ts`.
+   * The add-ons that were chained in, resolved to files and strengths.
+   * Structurally `LoraSpec` from `src/lib/refine.ts`, and `half` is
+   * `VideoLoraSpec`'s: on a two-model video family, which of the two models
+   * took the file. Absent on pictures, and on clips filed before it was kept.
    */
-  loras?: { name: string; strength: number; clipStrength?: number }[]
+  loras?: { name: string; strength: number; clipStrength?: number; half?: 'high' | 'low' | 'both' }[]
 
   /** The picture this was made from, when it was made from one. */
   source?: {
@@ -291,7 +307,11 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
     familyLabel: str(e.familyLabel, str(e.familyId, '')),
     model: str(e.model, ''),
     modelLabel: str(e.modelLabel, str(e.model, '')),
-    variant: e.variant ?? null,
+    // A name this build does not know is kept as it is. It came from a newer
+    // build sharing the archive, and a record saved back from here must not
+    // erase it; every reader here compares against the names it knows.
+    variant: typeof e.variant === 'string' && e.variant ? (e.variant as HistoryEntry['variant']) : null,
+    positive: typeof e.positive === 'string' ? e.positive : undefined,
     seed: num(e.seed, 0),
     steps: num(e.steps, 0),
     cfg: num(e.cfg, 0),
@@ -317,6 +337,7 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
             name: l.name,
             strength: num(l.strength, 1),
             clipStrength: numOrNull(l.clipStrength) ?? undefined,
+            half: l.half === 'high' || l.half === 'low' || l.half === 'both' ? l.half : undefined,
           }))
       : undefined,
   }
@@ -1067,6 +1088,7 @@ async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
     // router answers 404 with a different body when there is no endpoint.
     if (body?.error === 'not found') {
       remove(entry.id)
+      forgetOfflineCopy(entry.file)
       return { ok: true, freed: 0 }
     }
     return {
@@ -1084,7 +1106,51 @@ async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
 
   const body = await res.json().catch(() => null)
   remove(entry.id)
+  forgetOfflineCopy(entry.file)
   return { ok: true, freed: Number(body?.freed ?? 0) }
+}
+
+/**
+ * The service worker's caches of generated files and of their thumbnails, as
+ * `public/sw.js` names them, and how each spells the file in its query.
+ */
+const OFFLINE_COPIES: readonly { cache: string; holds: (q: URLSearchParams, f: FileRef) => boolean }[] = [
+  {
+    cache: 'switchgen-v2-media',
+    holds: (q, f) =>
+      q.get('filename') === f.filename &&
+      (q.get('subfolder') ?? '') === (f.subfolder ?? '') &&
+      (q.get('type') ?? 'output') === (f.type ?? 'output'),
+  },
+  {
+    cache: 'switchgen-v2-thumbs',
+    holds: (q, f) => (f.type ?? 'output') === 'output' && q.get('rel') === relPath(f),
+  },
+]
+
+/**
+ * Drop this browser's offline copies of a file that is gone from disk.
+ *
+ * The worker asks the network first, so a stale copy is served only while the
+ * connection is down, but that is exactly when a deleted picture should not
+ * reappear. Matched on the file's own fields rather than on one URL, because
+ * not every link to a file spells its query the same way. Best effort: there
+ * is no cache on a page served over plain HTTP from another machine, and a
+ * failure here changes nothing the reader asked for.
+ */
+function forgetOfflineCopy(f: FileRef): void {
+  if (typeof caches === 'undefined') return
+  for (const { cache: name, holds } of OFFLINE_COPIES) {
+    void (async () => {
+      if (!(await caches.has(name))) return
+      const cache = await caches.open(name)
+      for (const req of await cache.keys()) {
+        if (holds(new URL(req.url).searchParams, f)) await cache.delete(req)
+      }
+    })().catch(() => {
+      /* the file is gone either way; only the offline copy lingers */
+    })
+  }
 }
 
 /** Delete several files. Each result is reported separately. */
@@ -1155,7 +1221,8 @@ let indexCache = new WeakMap<HistoryEntry, string>()
 
 /**
  * The lowercased haystack one record is matched against: the positive prompt as
- * it was actually submitted (the author-card prefix included), the negative, the
+ * it was actually submitted (the author-card prefix and any add-on words
+ * included, where the record kept it), the negative, the
  * family and model in both machine and human spellings, the mode, the kind, the
  * desk, every filename the run produced, the source picture's filename and any
  * note.
@@ -1171,6 +1238,7 @@ function searchIndex(e: HistoryEntry): string {
   const built = [
     e.positivePrefix ?? '',
     e.prompt,
+    e.positive ?? '',
     e.negative ?? '',
     e.familyId,
     e.familyLabel,

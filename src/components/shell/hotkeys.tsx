@@ -8,7 +8,11 @@
  * thing you are writing is the one command you want from inside the field.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react'
 
 // ---------------------------------------------------------------------------
 // Typing guard
@@ -157,19 +161,42 @@ export type HoldHandlers = {
     onPointerCancel: (e: ReactPointerEvent) => void
     onKeyDown: (e: ReactKeyboardEvent) => void
     onKeyUp: (e: ReactKeyboardEvent) => void
+    onClick: (e: ReactMouseEvent) => void
   }
   /** 0 → 1. Drive the burgundy wipe with it. */
   progress: number
   holding: boolean
+  /**
+   * True for a few seconds after a click with no pointer or key behind it,
+   * which is how assistive technology presses a button. A second such click
+   * in that time confirms. Say so on the button while it is set: "Press again
+   * to stop".
+   */
+  armed: boolean
 }
+
+/** How long an armed confirmation waits for its second press. */
+const ARMED_MS = 3000
 
 /**
  * Destroying four minutes of GPU time should cost more than a mis-click, so
  * stopping a job is a 600 ms hold with a wipe you can watch.
+ *
+ * Enter and Space hold too, and their auto-repeat is ignored: a key still down
+ * after the hold has confirmed would otherwise start a second hold and confirm
+ * again. Both keys have their default prevented on the way down and on the way
+ * up, so neither turns into a click.
+ *
+ * A screen reader presses a button with a bare click and no key or pointer
+ * events at all, so it could never hold. Such a click arms the confirmation
+ * instead and a second one within three seconds fires it: still two
+ * deliberate acts, while a mouse click still does nothing without the hold.
+ * The same fallback `RunButton` has.
  */
 export function useHoldToConfirm(onConfirm: () => void, ms = 600): HoldHandlers {
   const [progress, setProgress] = useState(0)
   const [holding, setHolding] = useState(false)
+  const [armed, setArmed] = useState(false)
   const raf = useRef(0)
   const started = useRef(0)
   const done = useRef(false)
@@ -197,6 +224,8 @@ export function useHoldToConfirm(onConfirm: () => void, ms = 600): HoldHandlers 
       if (p >= 1) {
         if (!done.current) {
           done.current = true
+          // A press armed earlier is spent by the hold, not left to fire again.
+          setArmed(false)
           fire.current()
         }
         stop()
@@ -209,9 +238,19 @@ export function useHoldToConfirm(onConfirm: () => void, ms = 600): HoldHandlers 
 
   useEffect(() => () => cancelAnimationFrame(raf.current), [])
 
+  // An armed confirmation lapses on its own.
+  useEffect(() => {
+    if (!armed) return
+    const t = window.setTimeout(() => setArmed(false), ARMED_MS)
+    return () => window.clearTimeout(t)
+  }, [armed])
+
+  const isActivation = (e: ReactKeyboardEvent) => e.key === ' ' || e.key === 'Enter'
+
   return {
     holding,
     progress,
+    armed,
     bind: {
       onPointerDown: (e) => {
         e.preventDefault()
@@ -222,13 +261,26 @@ export function useHoldToConfirm(onConfirm: () => void, ms = 600): HoldHandlers 
       onPointerLeave: stop,
       onPointerCancel: stop,
       onKeyDown: (e) => {
-        if (e.key === ' ' || e.key === 'Enter') {
-          e.preventDefault()
-          begin()
-        }
+        if (!isActivation(e)) return
+        e.preventDefault()
+        if (e.repeat) return
+        begin()
       },
       onKeyUp: (e) => {
-        if (e.key === ' ' || e.key === 'Enter') stop()
+        if (!isActivation(e)) return
+        e.preventDefault()
+        stop()
+      },
+      onClick: (e) => {
+        // A pointer click has a detail of one or more and is hold only. Zero
+        // is a click with no pointer behind it: assistive technology.
+        if (e.detail !== 0) return
+        if (armed) {
+          setArmed(false)
+          fire.current()
+        } else {
+          setArmed(true)
+        }
       },
     },
   }

@@ -3807,7 +3807,7 @@ export const FAMILY_DEFS: FamilyDef[] = [
       ],
       "fps": [
         [
-          "15",
+          "16",
           "fps"
         ]
       ],
@@ -4080,6 +4080,10 @@ export const FAMILY_DEFS: FamilyDef[] = [
         [
           "6",
           "frame_rate"
+        ],
+        [
+          "12",
+          "fps"
         ]
       ]
     }

@@ -247,6 +247,13 @@ export type Composition = {
   negative: string | null
   /** Prepended to the prompt at submit time, from the model's author card. */
   positivePrefix: string | null
+  /**
+   * The positive prompt exactly as one run sent it, set by the desk on the
+   * copy that run is filed from, so {@link recordOf} can put it on the record.
+   * Never part of a draft: kept there it would outlive the next edit to the
+   * prompt and be filed with a picture it did not make.
+   */
+  positive?: string
 
   source: SourceRef | null
 
@@ -564,6 +571,7 @@ export function recordOf(
     length: c.length ?? undefined,
     fps: c.fps ?? undefined,
     positivePrefix: c.positivePrefix ?? undefined,
+    positive: c.positive,
     passes: ranAPass ? { ...passes } : undefined,
     loras: result.loras?.length ? result.loras.map((l) => ({ ...l })) : undefined,
     // A picture left on the desk after switching to a mode that does not take
@@ -752,9 +760,12 @@ function makeDeskStore(desk: DeskId): DeskStore {
     timer = null
     try {
       store.set(DESK_KEY[desk], JSON.stringify(current))
+      noteDraftSaved(desk, true)
     } catch {
-      // A full quota must never cost the reader their draft on screen; the
-      // archive's own eviction will free room on the next write.
+      // `store` throws only for a full quota. The draft on screen is kept
+      // either way, but it will not come back after a reload, and the reader
+      // is told so rather than finding out then.
+      noteDraftSaved(desk, false)
     }
   }
 
@@ -770,7 +781,9 @@ function makeDeskStore(desk: DeskId): DeskStore {
     timer = setTimeout(flush, SAVE_DEBOUNCE_MS)
   }
 
-  const set = (next: Composition) => {
+  const set = (incoming: Composition) => {
+    // The prompt one run sent belongs to that run's record, not to the draft.
+    const next = incoming.positive === undefined ? incoming : { ...incoming, positive: undefined }
     // `patch` and `edit` spread, so they hand back a fresh object even when
     // nothing in it moved. Announcing that would re-render every subscriber,
     // and a component that patches while rendering would never settle, because
@@ -808,6 +821,53 @@ function makeDeskStore(desk: DeskId): DeskStore {
 }
 
 const stores: Partial<Record<DeskId, DeskStore>> = {}
+
+/** Desks whose last draft save the browser refused for want of room. */
+const unsaved = new Set<DeskId>()
+let draftIssueMessage: string | null = null
+const draftIssueListeners = new Set<() => void>()
+
+const DESK_NAME: Record<DeskId, string> = { images: 'Pictures', video: 'Video' }
+
+function noteDraftSaved(desk: DeskId, saved: boolean): void {
+  // Said once when a desk starts failing and once when it recovers, not on
+  // every keystroke in between.
+  if (saved) {
+    if (!unsaved.delete(desk)) return
+  } else {
+    if (unsaved.has(desk)) return
+    unsaved.add(desk)
+  }
+  const names = [...unsaved].map((d) => `the ${DESK_NAME[d]} desk`)
+  draftIssueMessage = names.length
+    ? `This browser is out of room, so what is on ${names.join(' and ')} could not be saved. It stays on screen while this page is open, but it will not come back after a reload.`
+    : null
+  for (const fn of [...draftIssueListeners]) {
+    try {
+      fn()
+    } catch {
+      /* one broken subscriber must not stop the rest */
+    }
+  }
+}
+
+/**
+ * Set while a desk's draft could not be saved because the browser is out of
+ * room, with the sentence to show. Null again once a save lands. The same
+ * string until it changes, so `useSyncExternalStore(subscribeDraftIssue,
+ * draftIssue)` works.
+ */
+export function draftIssue(): string | null {
+  return draftIssueMessage
+}
+
+/** Hear {@link draftIssue} change. Returns an unsubscribe. */
+export function subscribeDraftIssue(fn: () => void): () => void {
+  draftIssueListeners.add(fn)
+  return () => {
+    draftIssueListeners.delete(fn)
+  }
+}
 
 /**
  * The store for one desk. A module singleton, so a desk keeps its draft while

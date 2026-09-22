@@ -317,6 +317,10 @@ type Compat = { exact: IndexedBase[]; lineage: IndexedBase[] }
  * that set loads and does part of its job. The conditioning differs, so it is a
  * discount and a caution, not a match. Everything else has no entry, which means
  * nothing indexed can be applied to it at all.
+ *
+ * A Wan model is known by its size, and the index knows Wan only as `wan`, so
+ * every size reads that one base. Whether a given file suits the size is
+ * `fitFor`'s question, which the add-on rack asks of every file it offers.
  */
 const COMPAT: Partial<Record<LoraArch, Compat>> = {
   pony: { exact: ['pony'], lineage: ['illustrious', 'sdxl'] },
@@ -324,6 +328,9 @@ const COMPAT: Partial<Record<LoraArch, Compat>> = {
   sdxl: { exact: ['sdxl'], lineage: ['pony', 'illustrious'] },
   flux1d: { exact: ['flux1d'], lineage: [] },
   wan: { exact: ['wan'], lineage: [] },
+  'wan-14b': { exact: ['wan'], lineage: [] },
+  'wan-5b': { exact: ['wan'], lineage: [] },
+  'wan-1.3b': { exact: ['wan'], lineage: [] },
 }
 
 /** Weight on a lineage crossing. Half the effect is the honest guess; 0.75 is the score discount. */

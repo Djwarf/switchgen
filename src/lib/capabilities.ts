@@ -55,30 +55,46 @@ const NONE: ServerCapabilities = {
 let cache: Promise<ServerCapabilities> | null = null
 
 /**
- * Cached for the page's lifetime: the answer changes when a binary is
+ * How long a failed probe stands before the next caller asks again. Long
+ * enough that the components mounting together on one page share a single
+ * answer, short enough that a server which was restarting is found once it
+ * is back.
+ */
+const RETRY_FAILED_MS = 10_000
+
+/**
+ * An answer is cached for the page's lifetime: it changes when a binary is
  * installed, which is not something that happens while a tab is open. A
+ * failure is not an answer, so it is held only briefly: the server may have
+ * been restarting, and a page that asked once at the wrong moment would
+ * otherwise hide deleting, joining and fetching until it was reloaded. A
  * non-JSON body means Vite's SPA fallback answered for an unmounted
  * middleware, which is reported as "did not answer" rather than as a parse
  * error, because that is what it means.
  */
 export function serverCapabilities(): Promise<ServerCapabilities> {
-  if (!cache) {
-    cache = fetch('/api/capabilities', { headers: { Accept: 'application/json' } })
-      .then(async r => {
-        const type = r.headers.get('content-type') ?? ''
-        if (!r.ok || !type.includes('json')) throw new Error(`capabilities: ${r.status} ${type}`)
-        const data = (await r.json()) as Partial<ServerCapabilities>
-        return {
-          ...NONE,
-          ...data,
-          tools: { ...NONE.tools, ...(data.tools ?? {}) },
-          roots: data.roots ?? {},
-          reason: null,
-        }
-      })
-      .catch(() => NONE)
-  }
-  return cache
+  if (cache) return cache
+  const probe: Promise<ServerCapabilities> = fetch('/api/capabilities', { headers: { Accept: 'application/json' } })
+    .then(async r => {
+      const type = r.headers.get('content-type') ?? ''
+      if (!r.ok || !type.includes('json')) throw new Error(`capabilities: ${r.status} ${type}`)
+      const data = (await r.json()) as Partial<ServerCapabilities>
+      return {
+        ...NONE,
+        ...data,
+        tools: { ...NONE.tools, ...(data.tools ?? {}) },
+        roots: data.roots ?? {},
+        reason: null,
+      }
+    })
+    .catch(() => {
+      setTimeout(() => {
+        if (cache === probe) cache = null
+      }, RETRY_FAILED_MS)
+      return NONE
+    })
+  cache = probe
+  return probe
 }
 
 /** The same answer for a component. Null until it arrives. */

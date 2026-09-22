@@ -193,16 +193,6 @@ export function optionsFor(info: Record<string, any>, node: string, field: strin
   return Array.isArray(spec) ? (spec as string[]) : []
 }
 
-/** True when the file is still on disk. Missing files 404; HEAD is enough. */
-export async function headFile(f: FileRef): Promise<boolean> {
-  try {
-    const r = await fetch(fileUrl(f), { method: 'HEAD' })
-    return r.ok
-  } catch {
-    return false
-  }
-}
-
 const SAFE_NAME = /[^a-zA-Z0-9._-]+/g
 
 /**
@@ -236,7 +226,19 @@ export async function uploadImage(file: File | Blob, name?: string): Promise<str
 // Output classification
 // ---------------------------------------------------------------------------
 
-const VIDEO_EXT = /\.(webm|mp4|mkv|gif|webp|avi|mov)$/i
+/**
+ * A filename that can only be a clip. GIF and WebP are left out on purpose:
+ * either can be a still, so a desk that refuses clips as a source picture
+ * must not refuse one of those on its name alone.
+ */
+export const VIDEO_EXT = /\.(webm|mp4|mkv|avi|mov)$/i
+
+/**
+ * What `collectFiles` counts as moving pictures by name alone. Wider than
+ * {@link VIDEO_EXT}, and left so: it classifies a run's own outputs, where it
+ * is one of three signals, not a picture someone is about to load as a source.
+ */
+const MOVING_EXT = /\.(webm|mp4|mkv|gif|webp|avi|mov)$/i
 
 /**
  * Turn one node's `ui` output dict into typed files.
@@ -259,7 +261,7 @@ export function collectFiles(output: Record<string, any> | undefined | null): Ou
         key !== 'images' ||
         anyAnimated ||
         animated[i] === true ||
-        VIDEO_EXT.test(String(f.filename))
+        MOVING_EXT.test(String(f.filename))
       out.push({
         filename: String(f.filename),
         subfolder: String(f.subfolder ?? ''),
@@ -632,21 +634,34 @@ function handleBinary(buf: ArrayBuffer) {
 }
 
 /**
- * Settle one prompt from its /history record. True when the record was final
- * and the prompt has been settled from it; false when there is no record yet,
- * or none at all.
+ * Settle one prompt this tab is following from its /history record, without
+ * waiting for a socket event that may never come.
+ *
+ * True when the record was final and the prompt has been settled from it: its
+ * watchers get `done` with every file the record lists, or the error, and a
+ * `run()` waiting on it resolves or rejects exactly as it would have on the
+ * event. False when there is no final record yet, none at all, or nothing here
+ * is following the prompt. Safe to call on a prompt that has already settled.
+ *
+ * `run()` already does this on its own when the server says a job has ended,
+ * so a desk only needs it to settle sooner, for example on its own poll.
  */
-async function reconcileOne(id: string): Promise<boolean> {
+export async function settleFromHistory(id: string): Promise<boolean> {
+  const before = prompts.get(id)
+  if (!before) return false
+  if (before.terminal) return true
   const run = await fetchPastRun(id).catch(() => null)
   if (!run) return false
+  // The event may have landed, or the prompt been let go, while the record
+  // was on its way.
+  const st = prompts.get(id)
+  if (!st) return false
+  if (st.terminal) return true
   if (run.status === 'success') {
     // A success record lists every output, so it replaces whatever the
     // socket managed to deliver before it dropped.
-    const st = prompts.get(id)
-    if (st) {
-      st.files = run.files
-      st.gap = false
-    }
+    st.files = run.files
+    st.gap = false
     void settle(id, { ok: true })
     return true
   }
@@ -668,7 +683,7 @@ async function reconcileOne(id: string): Promise<boolean> {
  */
 async function reconcileWatched(): Promise<void> {
   const open = [...prompts.entries()].filter(([, s]) => !s.terminal && s.listeners.size > 0)
-  for (const [id] of open) await reconcileOne(id)
+  for (const [id] of open) await settleFromHistory(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +885,7 @@ async function checkForLoss(): Promise<void> {
         continue
       }
       if (server) {
-        if (await reconcileOne(id)) continue
+        if (await settleFromHistory(id)) continue
         if (!current()) continue
         f.misses = 0
         f.terminalWaits += 1
@@ -1014,7 +1029,7 @@ async function settleIfDequeued(promptId: string): Promise<void> {
     return // could not ask; the lost-job watch in run() still has it
   }
   if (server === null) void settle(promptId, STOPPED)
-  else if (server.status !== 'pending' && server.status !== 'in_progress') void reconcileOne(promptId)
+  else if (server.status !== 'pending' && server.status !== 'in_progress') void settleFromHistory(promptId)
 }
 
 /** The server's own view of the queue. */
@@ -1103,8 +1118,11 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
   }
 }
 
-/** One past run by prompt id, or null when it is not in history. */
-async function fetchPastRun(promptId: string): Promise<PastRun | null> {
+/**
+ * One past run by prompt id, or null when it is not in history. Throws when
+ * ComfyUI could not be asked, which is not the same as having no record.
+ */
+export async function fetchPastRun(promptId: string): Promise<PastRun | null> {
   const page = await getJson<Record<string, any>>(`/history/${encodeURIComponent(promptId)}`)
   const raw = page?.[promptId]
   return raw ? readPastRun(promptId, raw) : null

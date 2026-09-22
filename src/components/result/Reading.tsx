@@ -31,8 +31,21 @@ import {
 import { Kicker, Link } from '../type'
 import { Meter } from '../loras/bits'
 
-/** The bases the add-on index knows. An architecture outside it gets no ranking, not a wrong one. */
-const INDEXED: ReadonlySet<string> = new Set(['pony', 'illustrious', 'sdxl', 'flux1d', 'sd15', 'wan'])
+/**
+ * The base the add-on index files each architecture under. An architecture
+ * outside it gets no ranking, not a wrong one. The index knows Wan only as
+ * `wan`, so every Wan size reads that one base.
+ */
+const INDEXED: Readonly<Partial<Record<LoraArch, IndexedBase>>> = {
+  pony: 'pony',
+  illustrious: 'illustrious',
+  sdxl: 'sdxl',
+  flux1d: 'flux1d',
+  wan: 'wan',
+  'wan-14b': 'wan',
+  'wan-5b': 'wan',
+  'wan-1.3b': 'wan',
+}
 
 const RATING_WORD: Record<ImageRating, string> = {
   general: 'general, nothing suggestive',
@@ -109,38 +122,55 @@ export function Reading(props: ReadingProps) {
 
   const text = compact ? 'text-caption' : 'text-small'
 
+  // The tagger is missing and fetching it would fix that: there is an
+  // interpreter to run it and the server says what to fetch. This is offered
+  // whether or not the detectors are there, because with only them a reading
+  // finds faces and hands and no tags. A download that stopped part way is
+  // mended the same way: the server lists the unfinished file as missing.
+  const offer = !caps.tagger && caps.python && caps.install ? caps.install : null
+  const fetchLine = offer
+    ? (() => {
+        const wanted = offer.files.filter((f) => offer.missing.includes(f.filename))
+        const bytes = (wanted.length ? wanted : offer.files).reduce((n, f) => n + f.sizeBytes, 0)
+        const unfinished = offer.missing.includes('model.onnx') && (caps.taggerBytes ?? 0) > 0
+        return (
+          <div className={caps.detect ? `${text} mt-1` : text}>
+            {installing ? (
+              <>
+                <p className="italic text-grey-700">Fetching the tagger, {size(installing.done)} of {size(installing.total || bytes)}.</p>
+                <Meter pct={installing.pct} label="Fetching the tagger" />
+              </>
+            ) : (
+              <p className="text-grey-700">
+                {unfinished ? "The tagger's download did not finish." : 'The tagger is not installed.'}{' '}
+                <Link onClick={install}>{unfinished ? 'Fetch it again' : 'Fetch it'}</Link>, {size(bytes)} from
+                HuggingFace.
+                {caps.detect
+                  ? ' Until then a reading finds the faces and hands but not what is in the picture.'
+                  : ' It reads pictures on the CPU and does not touch the card.'}
+              </p>
+            )}
+            {installError ? <p className="mt-1 text-ink-error">{installError}</p> : null}
+          </div>
+        )
+      })()
+    : null
+
   // Nothing installed. Say what is missing and, when it can be fetched, offer it.
   if (!caps.tagger && !caps.detect) {
-    if (!caps.python) {
-      return <p className={`${text} italic text-grey-500`}>{caps.reason ?? 'No image reading is installed on the server.'}</p>
-    }
-    if (caps.install) {
-      const bytes = caps.install.files.reduce((n, f) => n + f.sizeBytes, 0)
-      return (
-        <div className={text}>
-          {installing ? (
-            <>
-              <p className="italic text-grey-700">Fetching the tagger, {size(installing.done)} of {size(installing.total || bytes)}.</p>
-              <Meter pct={installing.pct} label="Fetching the tagger" />
-            </>
-          ) : (
-            <p className="text-grey-700">
-              The tagger is not installed. <Link onClick={install}>Fetch it</Link>, {size(bytes)} from
-              HuggingFace. It reads pictures on the CPU and does not touch the card.
-            </p>
-          )}
-          {installError ? <p className="mt-1 text-ink-error">{installError}</p> : null}
-        </div>
-      )
-    }
-    return <p className={`${text} italic text-grey-500`}>{caps.reason ?? 'No image reading is installed on the server.'}</p>
+    return fetchLine ?? <p className={`${text} italic text-grey-500`}>{caps.reason ?? 'No image reading is installed on the server.'}</p>
   }
 
   // One picture's reading lives and dies with that picture. Keyed, so a read
   // still in flight when the picture changes lands in an instance that is no
   // longer shown, never under the next picture. It still reaches the cache,
   // and the onRead of the picture it was asked for.
-  return <PictureReading key={cacheKey} {...props} source={source} text={text} />
+  return (
+    <>
+      <PictureReading key={cacheKey} {...props} source={source} text={text} />
+      {fetchLine}
+    </>
+  )
 }
 
 function PictureReading({
@@ -164,7 +194,8 @@ function PictureReading({
   const read = () => {
     setBusy(true)
     setError(null)
-    const bases = arch && INDEXED.has(arch) ? [arch as IndexedBase] : undefined
+    const base = arch ? INDEXED[arch] : undefined
+    const bases = base ? [base] : undefined
     void inspectImage(source, { bases, limit: 4 })
       .then((r) => {
         readings.set(cacheKey, r)
