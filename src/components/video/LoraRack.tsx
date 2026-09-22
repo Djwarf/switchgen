@@ -1,0 +1,158 @@
+/**
+ * The add-on rack on the Video desk.
+ *
+ * The Pictures desk decides a stack from measurements and offers the rest;
+ * nothing on a clip has been measured that way, so this rack is the reader's
+ * alone: the same rows and the same picker as the picture rack, at the
+ * author's strengths, and every figure it prints says which author.
+ *
+ * On a two-half family a pair of files is one row. See lib/videoLoras.ts.
+ */
+import { useMemo, useState } from 'react'
+import {
+  addToStack,
+  fitFor,
+  moveInStack,
+  patchStack,
+  removeFromStack,
+  size,
+  targetFor,
+  type LoraInfo,
+  type LoraLibrary,
+  type LoraStack,
+} from '../../lib/loras'
+import { canTakeVideoLoras } from '../../lib/refine'
+import { pairedHalf, partnerOf } from '../../lib/videoLoras'
+import type { FamilyDef } from '../../lib/workflows'
+import { Caution, Head, Note, Quiet } from '../advanced/bits'
+import { Picker } from '../loras/Picker'
+import { Row as LoraRow } from '../loras/Row'
+
+export function LoraRack({
+  def,
+  model,
+  lib,
+  stack,
+  onStack,
+  onLibraryReload,
+}: {
+  def: FamilyDef
+  model: string
+  lib: LoraLibrary
+  stack: LoraStack
+  onStack: (next: LoraStack) => void
+  onLibraryReload?: () => void
+}) {
+  const [picking, setPicking] = useState(false)
+  const target = useMemo(() => targetFor(def, model), [def, model])
+  const inStack = useMemo(() => new Set(stack.map((e) => e.file)), [stack])
+  const carries = canTakeVideoLoras(def)
+  const enabled = stack.filter((e) => e.enabled).length
+  const alreadyLoads = useMemo(
+    () => Object.values(def.graph).filter((n) => n.class_type === 'LoraLoaderModelOnly').length,
+    [def],
+  )
+  const bytes = useMemo(
+    () =>
+      stack.reduce((sum, e) => {
+        if (!e.enabled) return sum
+        const info = lib.byFile.get(e.file)
+        const partner = def.dualModel ? partnerOf(e.file) : null
+        const twin = partner ? lib.byFile.get(partner) : undefined
+        return sum + (info?.bytes ?? 0) + (twin?.installed ? twin.bytes : 0)
+      }, 0),
+    [stack, lib, def.dualModel],
+  )
+
+  if (!carries) {
+    return (
+      <section className="mt-4 border-t border-grey-300 pt-3">
+        <Head title="Add-ons" />
+        <Note>{def.label} loads its model in a shape this desk cannot chain an add-on into, so none are offered.</Note>
+      </section>
+    )
+  }
+
+  return (
+    <section className="mt-4 border-t border-grey-300 pt-3">
+      <Head
+        title="Add-ons"
+        figure={stack.length ? `${enabled} of ${stack.length} on` : 'none'}
+        note={
+          def.dualModel
+            ? 'This family runs in two halves. A pair of files with the same stem, one HIGH and one LOW, is one row here and goes one to each half.'
+            : 'At the author’s strengths. Nothing on a clip has been measured the way the picture stacks were.'
+        }
+      />
+
+      {alreadyLoads ? (
+        <Caution>
+          {def.label} already loads {alreadyLoads === 1 ? 'an add-on' : `${alreadyLoads} add-ons`} of its own. Anything
+          added here goes in front of them and costs memory on top; the model's card below says what this
+          machine survived.
+        </Caution>
+      ) : null}
+
+      {stack.length ? (
+        <ul className="mt-2 border-t border-grey-300">
+          {stack.map((entry, i) => {
+            const info = lib.byFile.get(entry.file)
+            const half = def.dualModel ? pairedHalf(entry.file) : null
+            const partner = half ? partnerOf(entry.file) : null
+            const twin = partner ? lib.byFile.get(partner) : undefined
+            return (
+              <li key={entry.file} className="list-none">
+                <LoraRow
+                  entry={entry}
+                  info={info}
+                  fit={info ? fitFor(info, target) : { level: 'untested', why: 'This file is no longer in the add-ons folder.' }}
+                  index={i}
+                  count={stack.length}
+                  expert
+                  clipPatched={false}
+                  onPatch={(patch) => onStack(patchStack(stack, entry.file, patch))}
+                  onMove={(to) => onStack(moveInStack(stack, i, to))}
+                  onRemove={() => onStack(removeFromStack(stack, entry.file))}
+                />
+                {half ? (
+                  <p className="mb-2 text-caption italic text-grey-500">
+                    {twin?.installed
+                      ? `The ${half.half.toUpperCase()} half. Its ${half.half === 'high' ? 'LOW' : 'HIGH'} partner is installed and goes to the other half at the same strength.`
+                      : `The ${half.half.toUpperCase()} half only. No partner file is installed, so this goes to both halves at the same strength, which nobody has measured.`}
+                  </p>
+                ) : def.dualModel ? (
+                  <p className="mb-2 text-caption italic text-grey-500">
+                    Not a HIGH/LOW pair, so it goes to both halves at the same strength. Not measured.
+                  </p>
+                ) : null}
+              </li>
+            )
+          })}
+        </ul>
+      ) : (
+        <Note>No add-ons. The model is making this on its own.</Note>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Quiet onClick={() => setPicking((v) => !v)} pressed={picking}>
+          {picking ? 'Close' : 'Browse all add-ons'}
+        </Quiet>
+        {stack.length ? <Quiet onClick={() => onStack([])}>Remove all</Quiet> : null}
+        {bytes ? <span className="text-caption tabular-nums text-grey-500">{size(bytes)} of extra files to load</span> : null}
+      </div>
+
+      {picking ? (
+        <div className="mt-3 border border-grey-300 p-3">
+          <Picker
+            lib={lib}
+            target={target}
+            inStack={inStack}
+            onAdd={(info: LoraInfo) => onStack(addToStack(stack, info))}
+            onFetched={() => onLibraryReload?.()}
+            onClose={() => setPicking(false)}
+          />
+        </div>
+      ) : null}
+    </section>
+  )
+}

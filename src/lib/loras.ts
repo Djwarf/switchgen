@@ -114,6 +114,8 @@ export type LoraArch =
   | 'anima'
   | 'krea2'
   | 'wan'
+  | 'hunyuan'
+  | 'ltxv'
   | 'unknown'
 
 export const ARCH_LABEL: Record<LoraArch, string> = {
@@ -129,6 +131,8 @@ export const ARCH_LABEL: Record<LoraArch, string> = {
   anima: 'Anima',
   krea2: 'Krea 2',
   wan: 'Wan 2.2',
+  hunyuan: 'HunyuanVideo',
+  ltxv: 'LTX-Video',
   unknown: 'no verified base',
 }
 
@@ -1600,6 +1604,8 @@ export function archFor(def: FamilyDef | null, model: string): LoraArch {
   if (/flux/.test(name)) return 'flux1d'
   if (/anima|miaomiao|obsession/.test(name)) return 'anima'
   if (/krea/.test(name)) return 'krea2'
+  if (/hunyuan/.test(name)) return 'hunyuan'
+  if (/ltxv?[-_]/.test(name)) return 'ltxv'
   if (/wan/.test(name)) return 'wan'
 
   const id = (def?.id ?? '').toLowerCase()
@@ -1612,6 +1618,8 @@ export function archFor(def: FamilyDef | null, model: string): LoraArch {
   if (id.includes('klein') || id.includes('flux2')) return 'flux2'
   if (id.includes('anima')) return 'anima'
   if (id.includes('krea')) return 'krea2'
+  if (id.includes('hunyuan')) return 'hunyuan'
+  if (id.includes('ltxv')) return 'ltxv'
   if (id.startsWith('wan')) return 'wan'
   if (id.includes('sdxl')) return 'sdxl'
   return 'unknown'

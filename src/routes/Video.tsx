@@ -26,6 +26,11 @@
  * can never stop somebody else's picture.
  */
 
+import { OfferList } from '../components/result/ResultActions'
+import { videoOffersFor } from '../components/result/videoOffers'
+import { LoraRack } from '../components/video/LoraRack'
+import { EMPTY_LIBRARY, loadLoraLibrary, loadStack, missingTriggers, resolveStack, saveStack, targetFor, type LoraLibrary, type LoraStack } from '../lib/loras'
+import { chainVideoStack, collapsePairs } from '../lib/videoLoras'
 import { CataloguePanel } from '../components/advanced/CataloguePanel'
 import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
@@ -602,6 +607,8 @@ export type VideoJob = {
   error: string | null
   /** The classified failure, with ComfyUI's node and per-input detail when it gave them. */
   fault: Fault | null
+  /** The add-ons chained into the graph, for the record. */
+  loras?: HistoryEntry['loras']
   files: OutputFile[]
   entryId: string | null
   composition: Composition
@@ -686,6 +693,8 @@ type StartOptions = {
   graph: ApiWorkflow
   familyLabel: string
   modelLabel: string
+  /** The add-ons chained into the graph, for the record. */
+  loras?: HistoryEntry['loras']
 }
 
 function startJob(opts: StartOptions): string {
@@ -706,6 +715,7 @@ function startJob(opts: StartOptions): string {
     finishedAt: null,
     error: null,
     fault: null,
+    loras: opts.loras,
     files: [],
     entryId: null,
     composition: opts.composition,
@@ -761,6 +771,7 @@ function startJob(opts: StartOptions): string {
               familyLabel: current.familyLabel,
               modelLabel: current.modelLabel,
               at: finishedAt,
+              loras: current.loras,
             }),
           )
           entryId = entry.id
@@ -1422,17 +1433,67 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
   // --- running -------------------------------------------------------------
 
+  // --- add-ons -------------------------------------------------------------
+  //
+  // The rack is per family and persisted the way the picture rack is. Both
+  // are read through refs by buildGraph, which is deliberately stable: the
+  // press reads the store, not the render, so a clip queued from `Make
+  // another` in the same tick sees the same rack the reader sees.
+  const [lib, setLib] = useState<LoraLibrary>(EMPTY_LIBRARY)
+  const [stack, setStack] = useState<LoraStack>([])
+  const [stackFor, setStackFor] = useState<string | null>(null)
+  const libRef = useRef(lib)
+  const stackRef = useRef(stack)
+  const takeLib = useCallback((l: LoraLibrary) => {
+    libRef.current = l
+    setLib(l)
+  }, [])
+  useEffect(() => {
+    void loadLoraLibrary().then(takeLib, () => {})
+  }, [takeLib])
+  // A different family is a different rack. Adjusted during render, as React
+  // asks for state that follows a prop, so the old family's rack is never
+  // painted under the new family's name.
+  if (family && stackFor !== family.def.id) {
+    const loaded = loadStack(family.def.id)
+    setStackFor(family.def.id)
+    setStack(loaded)
+    stackRef.current = loaded
+  }
+  const updateStack = useCallback(
+    (next: LoraStack, familyId = family?.def.id ?? '') => {
+      setStack(next)
+      stackRef.current = next
+      if (familyId) saveStack(familyId, next)
+    },
+    [family],
+  )
+
+  /** The add-ons that will actually be chained: installed, fitting, on, pairs expanded. */
+  const resolvedLoras = useCallback((fam: VideoFamily) => {
+    const l = libRef.current
+    const target = targetFor(fam.def, fam.model)
+    const resolved = resolveStack(stackRef.current, l, target)
+    const installed = new Set(l.all.filter((i) => i.installed).map((i) => i.file))
+    return { target, specs: resolved.specs, installed }
+  }, [])
+
   const buildGraph = useCallback(
     (fam: VideoFamily, c: Composition, seed: number): ApiWorkflow | null => {
       const shaped = c.mode === 'i2v' ? deriveImageToVideo(fam.def) : fam.def
       if (!shaped) return null
+      const { target, specs, installed } = resolvedLoras(fam)
+      const chained = specs.length ? chainVideoStack(shaped, specs, installed) : null
       const params = toParams({ ...c, seed }, { negative: defaultsFor(fam.def, fam.model).negative })
       if (c.mode !== 'i2v') delete params.image
-      const graph = instantiate(shaped, params)
+      // An add-on without its trigger words runs at a fraction of itself.
+      const words = missingTriggers(stackRef.current, libRef.current, params.positive, target)
+      if (words.length) params.positive = params.positive.trim() ? `${params.positive}, ${words.join(', ')}` : words.join(', ')
+      const graph = instantiate(chained ?? shaped, params)
       applyShift(graph, c.shift)
       return graph
     },
-    [],
+    [resolvedLoras],
   )
 
   const blockedReason = useMemo(() => reasonFor(family, composition), [family, composition])
@@ -1465,18 +1526,20 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         })
         return
       }
+      const chainedSpecs = resolvedLoras(fam).specs
       startJob({
         composition: snapshot,
         graph,
         familyLabel: fam.def.label,
         modelLabel: modelLabelOf(fam),
+        loras: chainedSpecs.length ? chainedSpecs.map((s) => ({ name: s.name, strength: s.strength })) : undefined,
       })
     }
 
     store.patch({ seed: first })
     setViewing(null)
     setNotice(null)
-  }, [cat, uploading, buildGraph])
+  }, [cat, uploading, buildGraph, resolvedLoras])
 
   /**
    * Put a record back on the desk. `Use these settings` restores everything and
@@ -1495,12 +1558,21 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         availableSamplers: cat?.samplers,
         availableSchedulers: cat?.schedulers,
       })
+      // The record carries the add-ons it was made with; put them back on the
+      // rack, a pair folded to one row. Saved under the record's family, which
+      // is the one the store now points at.
+      updateStack(
+        entry.loras?.length
+          ? collapsePairs(entry.loras).map((l) => ({ file: l.name, strength: l.strength, enabled: true }))
+          : [],
+        entry.familyId,
+      )
       setViewing(null)
       setReuseNotice(applied.clobbered || applied.notes.length ? { applied, no: entry.no } : null)
       if (run) make()
       else promptRef.current?.focus()
     },
-    [cat, make],
+    [cat, make, updateStack],
   )
 
   // Ctrl/⌘+Enter runs, from inside the prompt too — the one deliberate
@@ -1841,6 +1913,15 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                   ]}
                 />
               </ExpertField>
+
+              <LoraRack
+                def={family.def}
+                model={family.model}
+                lib={lib}
+                stack={stack}
+                onStack={(next) => updateStack(next)}
+                onLibraryReload={() => void loadLoraLibrary().then(takeLib, () => {})}
+              />
 
               <button
                 type="button"
@@ -2393,35 +2474,43 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                   {shown.file.filename} · silent · no audio track
                 </p>
 
-                <div className="mt-2 flex flex-wrap gap-3 text-caption">
-                  <button
-                    className="text-burgundy-900 underline"
-                    onClick={() =>
-                      void saveAs(fileUrl(shown.file), downloadName(shown.file, shown.entry)).catch((err: Error) =>
-                        setNotice({ kind: 'error', title: 'We could not save that clip', body: err.message }),
-                      )
-                    }
-                  >
-                    Save the clip
-                  </button>
-                  <button
-                    className="text-burgundy-900 underline"
-                    onClick={() => {
-                      void continueFrom(shown.file, shown.frames, shown.fps, setSource, setNotice)
+                <div className="mt-3">
+                  <p className="mb-2 text-caption leading-snug text-grey-700">
+                    <span className="mr-2 text-overline font-semibold uppercase tracking-[0.18em] text-grey-700">What next</span>
+                    Nothing on a clip has been measured the way the picture passes were, so no detail pass is
+                    offered here. These carry the work forward.
+                  </p>
+                  <OfferList
+                    offers={videoOffersFor(shown.entry)}
+                    held={false}
+                    onAction={(id) => {
+                      if (id === 'save') {
+                        void saveAs(fileUrl(shown.file), downloadName(shown.file, shown.entry)).catch((err: Error) =>
+                          setNotice({ kind: 'error', title: 'We could not save that clip', body: err.message }),
+                        )
+                      } else if (id === 'continue') {
+                        void continueFrom(shown.file, shown.frames, shown.fps, setSource, setNotice)
+                      } else if (id === 'settings' && shown.entry) {
+                        reuse(shown.entry, false)
+                      } else if (id === 'again' && shown.entry) {
+                        reuse(shown.entry, true)
+                      } else if (id === 'toPictures') {
+                        void continueFrom(
+                          shown.file,
+                          shown.frames,
+                          shown.fps,
+                          (s) => {
+                            if (!s) return
+                            deskStore('images').patch({ source: s, mode: 'i2i' })
+                            if (onNavigate) onNavigate('#/pictures')
+                            else window.location.hash = '#/pictures'
+                          },
+                          setNotice,
+                          false,
+                        )
+                      }
                     }}
-                  >
-                    Continue from the last frame
-                  </button>
-                  {shown.entry ? (
-                    <button className="text-burgundy-900 underline" onClick={() => reuse(shown.entry as HistoryEntry, false)}>
-                      Use these settings
-                    </button>
-                  ) : null}
-                  {shown.entry ? (
-                    <button className="text-burgundy-900 underline" onClick={() => reuse(shown.entry as HistoryEntry, true)}>
-                      Make another
-                    </button>
-                  ) : null}
+                  />
                 </div>
               </figcaption>
             </figure>
@@ -2534,6 +2623,8 @@ async function continueFrom(
   fps: number,
   setSource: (s: SourceRef | null) => void,
   notify: (n: { kind: 'error'; title: string; body: string } | null) => void,
+  /** Switch this desk to a start frame. False when the frame is bound elsewhere. */
+  andMode = true,
 ): Promise<void> {
   try {
     const video = document.createElement('video')
@@ -2568,7 +2659,7 @@ async function continueFrom(
       bytes: blob.size,
       fromFrame: frames > 0 ? frames - 1 : undefined,
     })
-    store.patch({ mode: 'i2v' })
+    if (andMode) store.patch({ mode: 'i2v' })
     notify(null)
   } catch (err) {
     notify({

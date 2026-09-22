@@ -86,7 +86,18 @@ const costLabel = (n: number) => `${Number(n.toFixed(2))}x`
 // What comes back
 // ---------------------------------------------------------------------------
 
-export type ResultActionId = 'refine' | 'hand' | 'face' | 'hires' | 'again' | 'source'
+export type ResultActionId =
+  | 'refine'
+  | 'hand'
+  | 'face'
+  | 'hires'
+  | 'again'
+  | 'source'
+  // a clip's own rows, see videoOffers.ts
+  | 'continue'
+  | 'settings'
+  | 'toPictures'
+  | 'save'
 
 export type ResultOffer = {
   id: ResultActionId

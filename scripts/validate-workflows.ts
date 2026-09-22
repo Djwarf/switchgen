@@ -20,6 +20,7 @@
  * than as anything a reader could act on. A validator that checks only the
  * base graphs certifies the least interesting third of what actually runs.
  */
+import { withVideoLoras } from '../src/lib/refine.ts'
 import { inventoryFrom, missingFilesFor } from '../src/lib/availability.ts'
 import { FAMILIES, IMG2IMG, defaultsFor, instantiate, type Params } from '../src/lib/workflows'
 import type { FamilyDef } from '../src/lib/registry'
@@ -648,7 +649,60 @@ for (const def of FAMILIES) {
 
 console.log(`\n${ok} ok, ${fail} failed, ${skip} skipped (base graphs)`)
 console.log(`${i2iOk} ok, ${i2iFail} failed, ${i2iSkip} skipped (image-to-image variants)`)
+// ---------------------------------------------------------------------------
+// Add-on chains on video families.
+//
+// withVideoLoras() chains one loader on a one-model family and one chain per
+// half on the Wan 2.2 14B pairs, wired in front of any add-on the family
+// already carries. Every runnable video family is chained with one installed
+// Wan add-on and the result checked node by node, plus the two things the
+// derivation promises: the right number of loaders appeared, and every
+// sampler still resolves to a loader through the chain.
+// ---------------------------------------------------------------------------
+
+let vOk = 0, vFail = 0, vSkip = 0
+const videoLora = loras.find(l => /wan/i.test(l)) ?? loras[0]
+for (const def of FAMILIES) {
+  if (def.mode !== 'video') continue
+  if (!runnable(def)) { vSkip++; continue }
+  if (!videoLora) { console.log(`SKIP  ${def.label}: add-on chain: no add-on installed to chain`); vSkip++; continue }
+  const before = Object.values(def.graph).filter(n => n.class_type === 'LoraLoaderModelOnly').length
+  const derived = withVideoLoras(def, [{ name: videoLora, strength: 0.8 }])
+  if (!derived) { console.log(`SKIP  ${def.label}: add-on chain: the family cannot carry one`); vSkip++; continue }
+  const model = def.models.find(m => installed.has(m)) ?? def.models[0]
+  const d = defaultsFor(def, model)
+  const wf = instantiate(derived, {
+    ...baseParamsFor(def, model),
+    length: d.length || undefined,
+    fps: d.fps || undefined,
+  })
+  const errs = checkGraph(wf)
+  const after = Object.values(wf).filter(n => n.class_type === 'LoraLoaderModelOnly').length
+  const want = before + (def.dualModel ? 2 : 1)
+  if (after !== want) errs.push(`expected ${want} LoraLoaderModelOnly nodes after chaining, found ${after}`)
+  for (const [id, n] of Object.entries(wf)) {
+    if (!/Sampler|Guider|Scheduler/.test(n.class_type) || !('model' in n.inputs)) continue
+    let cur = n.inputs.model as unknown
+    let hops = 0
+    while (Array.isArray(cur) && hops++ < 12) {
+      const up = wf[cur[0] as string]
+      if (!up) { errs.push(`node ${id}: model chain reaches missing node ${cur[0]}`); break }
+      if (/^(CheckpointLoaderSimple|UNETLoader|UnetLoaderGGUF)$/.test(up.class_type)) break
+      cur = up.inputs.model
+    }
+  }
+  if (errs.length) {
+    console.log(`FAIL  ${def.label}: add-on chain (${videoLora})`)
+    for (const e of errs) console.log(`        ${e}`)
+    vFail++
+  } else {
+    console.log(`OK    ${def.label}: add-on chain, ${want} loader${want === 1 ? '' : 's'} (${Object.keys(wf).length} nodes)`)
+    vOk++
+  }
+}
+
 console.log(`${qOk} ok, ${qFail} failed, ${qSkip} skipped (quality derivations)`)
 console.log(`${cOk} ok, ${cFail} failed, ${cSkip} skipped (continuation derivations)`)
+console.log(`${vOk} ok, ${vFail} failed, ${vSkip} skipped (video add-on chains)`)
 fail += i2iFail + qFail + cFail
 process.exit(fail ? 1 : 0)

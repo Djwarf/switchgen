@@ -1015,6 +1015,123 @@ export function withLoras(def: FamilyDef | DerivedDef, loras: LoraSpec[]): Deriv
   }
 }
 
+// ---------------------------------------------------------------------------
+// Add-ons on a clip
+// ---------------------------------------------------------------------------
+
+export type VideoLoraSpec = LoraSpec & {
+  /** Which half of a two-model family takes it. Absent or 'both' means both. */
+  half?: 'high' | 'low' | 'both'
+}
+
+export type VideoLoraSlots =
+  | { kind: 'single'; loader: string }
+  | { kind: 'dual'; high: string; low: string }
+
+/** Follow `.model` links upstream from a sampler to the loader that feeds it. */
+function upstreamLoader(graph: Graph, from: unknown): string | null {
+  if (!isRef(from)) return null
+  let id = from[0]
+  for (let hops = 0; hops < 8; hops += 1) {
+    const n = graph[id]
+    if (!n) return null
+    if (MODEL_LOADER.test(n.class_type)) return id
+    const m = n.inputs.model
+    if (!isRef(m)) return null
+    id = m[0]
+  }
+  return null
+}
+
+/**
+ * Where a chain can go in a video family's graph.
+ *
+ * One loader: the same place withLoras() uses. Two loaders, the Wan 2.2 14B
+ * shape: the half whose sampler adds the noise (add_noise enable, start step
+ * 0) is the high-noise half; the other is the low. Read off the samplers
+ * rather than the filenames, with the filenames as the fallback.
+ */
+export function videoLoraSlots(def: FamilyDef | DerivedDef): VideoLoraSlots | null {
+  const loaders = findModelLoaders(def.graph)
+  if (!def.dualModel && loaders.length === 1) return { kind: 'single', loader: loaders[0] }
+  if (!def.dualModel || loaders.length !== 2) return null
+  let high: string | null = null
+  let low: string | null = null
+  for (const n of Object.values(def.graph)) {
+    if (n.class_type !== 'KSamplerAdvanced') continue
+    const loader = upstreamLoader(def.graph, n.inputs.model)
+    if (!loader) continue
+    const first = n.inputs.add_noise === 'enable' || Number(n.inputs.start_at_step) === 0
+    if (first) high = loader
+    else low = loader
+  }
+  const byName = (re: RegExp) =>
+    loaders.find(id => re.test(String(def.graph[id].inputs.unet_name ?? def.graph[id].inputs.ckpt_name ?? ''))) ?? null
+  high = high ?? byName(/high/i)
+  low = low ?? byName(/low/i)
+  if (!high || !low || high === low) return null
+  return { kind: 'dual', high, low }
+}
+
+/** Cheap check for the UI: can this family take a chain at all. */
+export function canTakeVideoLoras(def: FamilyDef | DerivedDef): boolean {
+  return videoLoraSlots(def) !== null
+}
+
+/**
+ * Insert add-on chains into a video family's graph.
+ *
+ * A one-model family is withLoras() exactly. A two-model family gets one
+ * chain per half, `__lora_high_N` and `__lora_low_N`, each wired between its
+ * loader and whatever consumed the loader before, so a family that already
+ * carries an add-on of its own (the Wan 2.2 I2V pair) keeps it: the reader's
+ * add-ons go first and the family's own after. A spec marked for one half
+ * goes to that half only; anything else goes to both.
+ */
+export function withVideoLoras(def: FamilyDef | DerivedDef, specs: VideoLoraSpec[]): DerivedDef | null {
+  const slots = videoLoraSlots(def)
+  if (!slots) return null
+  if (slots.kind === 'single') return withLoras(def, specs)
+
+  const graph = cloneGraph(def.graph)
+  const base = priorDerivation(def)
+  const usable = specs.filter(l => l.name && l.strength !== 0)
+  if (!usable.length) return { ...def, graph, bindings: { ...def.bindings }, derived: base }
+
+  const added: string[] = []
+  const chain = (loaderId: string, half: 'high' | 'low', list: VideoLoraSpec[]) => {
+    let model: Ref = [loaderId, 0]
+    const mine: string[] = []
+    for (const [i, lora] of list.entries()) {
+      const id = uniqueId(graph, `__lora_${half}_${i + 1}`)
+      graph[id] = {
+        class_type: 'LoraLoaderModelOnly',
+        inputs: { model, lora_name: lora.name, strength_model: lora.strength },
+      }
+      model = [id, 0]
+      mine.push(id)
+    }
+    if (mine.length) rewire(graph, [loaderId, 0], model, new Set(mine))
+    added.push(...mine)
+  }
+  chain(slots.high, 'high', usable.filter(l => l.half !== 'low'))
+  chain(slots.low, 'low', usable.filter(l => l.half !== 'high'))
+
+  const derived = base
+  if (!derived.kinds.includes('loras')) derived.kinds.push('loras')
+  derived.loraNodes = added
+  derived.note = `${added.length} add-on loader${added.length === 1 ? '' : 's'} across the high and low halves.`
+
+  return {
+    ...def,
+    id: `${def.id}__lora${added.length}`,
+    label: def.label,
+    graph,
+    bindings: { ...def.bindings },
+    derived,
+  }
+}
+
 /** Rewrite one LoRA's strengths in a built graph, without re deriving it. */
 export function setLoraStrength(
   wf: ApiWorkflow,

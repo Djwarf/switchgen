@@ -147,6 +147,19 @@ export function ResultActions({
   )
 }
 
+/** The printed list on its own, for a desk with rows of its own to print. */
+export function OfferList({
+  offers,
+  held,
+  onAction,
+}: {
+  offers: ResultOffer[]
+  held: boolean
+  onAction: (id: ResultActionId, offer: ResultOffer) => void
+}) {
+  return <Rows offers={offers} held={held} onAction={onAction} />
+}
+
 function Rows({
   offers,
   held,

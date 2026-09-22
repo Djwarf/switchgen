@@ -2315,7 +2315,7 @@ export function Pictures() {
                     setMode('i2i')
                     return
                   }
-                  rerun(current, id)
+                  if (id === 'face' || id === 'hand' || id === 'hires') rerun(current, id)
                 }}
               />
             )}
