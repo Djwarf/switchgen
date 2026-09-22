@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "validate": "tsx scripts/validate-workflows.ts",
     "index-loras": "tsx scripts/index-loras.ts",
-    "start": "bin/switchgen start"
+    "start": "bin/switchgen start",
+    "test": "vitest run"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
@@ -26,7 +27,8 @@
     "oxlint": "^1.81.0",
     "tsx": "^4.23.15",
     "typescript": "~6.0.2",
-    "vite": "^8.3.0"
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
   },
   "engines": {
     "node": ">=22"
