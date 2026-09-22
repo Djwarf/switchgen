@@ -56,6 +56,8 @@ export type ComposeDeskProps = {
   /** Add-ons the wording matched. Offered, never applied without a decision. */
   onAcceptAddOn?: (file: string) => void
   onDeclineAddOn?: (file: string) => void
+  /** Take an added add-on off again. Without it, an added one cannot be removed here. */
+  onRemoveAddOn?: (file: string) => void
 
   /** What decide() returned for those three answers, plus this machine. */
   recipe: Recipe
@@ -115,6 +117,7 @@ export function ComposeDesk({
   onAnatomy,
   onAcceptAddOn,
   onDeclineAddOn,
+  onRemoveAddOn,
   recipe,
   source = null,
   needsSource = false,
@@ -201,11 +204,13 @@ export function ComposeDesk({
           </div>
         )}
 
-        {recipe.ok && recipe.offers.length > 0 && onAcceptAddOn && onDeclineAddOn && (
+        {recipe.ok && onAcceptAddOn && onDeclineAddOn && (
           <AddOnOffers
             offers={recipe.offers}
+            applied={recipe.loras.filter((l) => !l.measured)}
             onAccept={onAcceptAddOn}
             onDecline={onDeclineAddOn}
+            onRemove={onRemoveAddOn}
           />
         )}
 

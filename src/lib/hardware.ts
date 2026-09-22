@@ -52,12 +52,22 @@ export type Footprint = {
   unknown: string[]
 }
 
+/**
+ * Every weight input a loader node can carry, numbered or not.
+ *
+ * DualCLIPLoader and TripleCLIPLoader name their encoders clip_name1, clip_name2
+ * and clip_name3. A fixed list of the unnumbered keys left both of Hunyuan
+ * Video's encoders out of its footprint, about 8.7 GB, so the verdict read 'ok'
+ * on a machine that could not hold it. sidecarsOf in workflows.ts made the same
+ * mistake and reads the inputs by pattern for the same reason.
+ */
+const WEIGHT_INPUT = /^(ckpt|unet|clip|vae|lora)_name\d*$/
+
 function footprintOf(def: FamilyDef, sizes: Map<string, ModelFile>): Footprint {
   const names = new Set<string>()
   for (const node of Object.values(def.graph)) {
-    for (const k of ['ckpt_name', 'unet_name', 'clip_name', 'vae_name', 'lora_name'] as const) {
-      const v = node.inputs[k]
-      if (typeof v === 'string') names.add(v)
+    for (const [k, v] of Object.entries(node.inputs)) {
+      if (WEIGHT_INPUT.test(k) && typeof v === 'string') names.add(v)
     }
   }
   const files: { name: string; size: number }[] = []
@@ -107,11 +117,14 @@ export function feasibility(def: FamilyDef, sizes: Map<string, ModelFile>, hw: H
     level = 'blocked'
     reason = `Needs about ${gb(fp.needBytes)} but this machine has only ${gb(hw.ram.total)} of RAM in total. It cannot run here.`
   } else if (fp.needBytes > hw.ram.free) {
+    // "When last checked", not "right now": a desk holds on to one reading
+    // while the reader works, and free memory moves under it. The sentence
+    // claims only the reading it was given.
     level = 'risky'
-    reason = `Needs about ${gb(fp.needBytes)} but only ${gb(hw.ram.free)} is free right now. Close other applications first, or generation may be killed partway.`
+    reason = `Needs about ${gb(fp.needBytes)} but only ${gb(hw.ram.free)} was free when memory was last checked. Close other applications first, or generation may be killed partway.`
   } else if (fp.needBytes > hw.ram.free * 0.85) {
     level = 'tight'
-    reason = `Tight fit: about ${gb(fp.needBytes)} against ${gb(hw.ram.free)} free.`
+    reason = `Tight fit: about ${gb(fp.needBytes)} against ${gb(hw.ram.free)} free when memory was last checked.`
   }
 
   if (offloads && level === 'ok') {

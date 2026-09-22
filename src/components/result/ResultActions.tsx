@@ -56,6 +56,8 @@ export type ResultActionsProps = {
   def: FamilyDef | DerivedDef | null
   /** False removes the image to image row. See OfferOptions.canSource. */
   canSource?: boolean
+  /** False withholds the rows that re-render the picture from its record. See OfferOptions.rebuild. */
+  rebuild?: boolean
   /** What the detectors found, when the picture has been read. See OfferOptions.facts. */
   facts?: ImageFacts | null
   /** The press is working. Every row is held, and the reason is printed once. */
@@ -69,6 +71,7 @@ export function ResultActions({
   picture,
   def,
   canSource = true,
+  rebuild = true,
   facts = null,
   busy = false,
   blocked = null,
@@ -89,9 +92,10 @@ export function ResultActions({
       size: width && height ? { width, height } : null,
       canSource,
       facts,
+      rebuild,
     }
     return offersFor(def, opts)
-  }, [url, def, width, height, canSource, facts])
+  }, [url, def, width, height, canSource, facts, rebuild])
 
   if (!picture || !offers.length) return null
 

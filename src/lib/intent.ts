@@ -382,6 +382,25 @@ function profileFor(model: string, def?: FamilyDef): ModelProfile | null {
 }
 
 /**
+ * How well a weight file serves a look, 0 to 10, from the same table the
+ * ranking reads. The region bench uses it to choose a stand-in when the model
+ * that made a picture cannot redraw part of it: the stand-in should at least
+ * be good at the kind of picture it is patching.
+ */
+export function lookScore(model: string, def: FamilyDef, intent: Intent): number {
+  return profileFor(model, def)?.style[intent] ?? 0
+}
+
+/** The look a weight file is strongest at, by the same table. Ties go to the earlier look. */
+export function strongestLook(model: string, def: FamilyDef): Intent {
+  const style = profileFor(model, def)?.style
+  if (!style) return 'photoreal'
+  let best: Intent = 'photoreal'
+  for (const opt of INTENTS) if (style[opt.id] > style[best]) best = opt.id
+  return best
+}
+
+/**
  * A neutral profile for an installed file nobody has rated yet. It scores
  * mid on everything and says so, which keeps a new model visible in the list
  * without pretending anybody has tested it.

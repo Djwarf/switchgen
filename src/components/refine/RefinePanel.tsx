@@ -42,6 +42,16 @@ export type RefineSettings = {
   newSeed: boolean
 }
 
+/**
+ * Add-ons offered for one region: plain rows, so this folder knows nothing
+ * about the add-on library. `picked` holds the ids that are ticked.
+ */
+export type RegionAddOns = {
+  options: readonly { id: string; label: string; strength: number; why: string }[]
+  picked: readonly string[]
+  onToggle: (id: string) => void
+}
+
 export const REFINE_SETTINGS: RefineSettings = {
   denoise: REFINE_DENOISE.default,
   padding: REFINE_DEFAULTS.padding,
@@ -132,6 +142,7 @@ export function RefinePanel({
   busy,
   progress,
   blocked,
+  addOns,
   onRun,
   onStop,
 }: {
@@ -147,6 +158,8 @@ export function RefinePanel({
   progress: number | null
   /** Set when the pass cannot run at all, with the reason to print. */
   blocked: string | null
+  /** Region add-ons to offer, unticked. Omit it, or pass none, and nothing is printed. */
+  addOns?: RegionAddOns
   onRun: () => void
   onStop?: () => void
 }) {
@@ -203,6 +216,9 @@ export function RefinePanel({
           </p>
         ) : null}
       </Field>
+
+      {/* ---- add-ons for this region ------------------------------------- */}
+      {addOns && addOns.options.length ? <AddOnPicks addOns={addOns} busy={busy} /> : null}
 
       {/* ---- strength ----------------------------------------------------- */}
       <Field
@@ -423,6 +439,54 @@ export function RefinePanel({
         by hand here.
       </p>
     </div>
+  )
+}
+
+/**
+ * The region add-ons, folded away and unticked.
+ *
+ * These are made for close framing, which is the crop this pass renders, so
+ * this is where they belong. But they are not free: every one ticked is
+ * another file loaded on top of the model, and a slider at full strength
+ * reshapes whatever it is aimed at. So none is on until it is ticked, and each
+ * row says what it does, the word it adds to the prompt, and whose strength it
+ * is.
+ */
+function AddOnPicks({ addOns, busy }: { addOns: RegionAddOns; busy: boolean }) {
+  const on = addOns.options.filter(o => addOns.picked.includes(o.id)).length
+  return (
+    <Field label="Add-ons for this region" hint={on ? `${on} on` : 'none on'}>
+      <details>
+        <summary className="cursor-pointer text-caption text-grey-700">
+          {addOns.options.length} fit the model drawing this. None is used until you tick it.
+        </summary>
+        <ul className="mt-1 border-t border-grey-300">
+          {addOns.options.map(o => {
+            const id = `sg-refine-addon-${o.id}`
+            return (
+              <li key={o.id} className="border-b border-grey-300 py-1.5">
+                <label htmlFor={id} className="flex cursor-pointer items-baseline gap-2">
+                  <input
+                    id={id}
+                    type="checkbox"
+                    checked={addOns.picked.includes(o.id)}
+                    disabled={busy}
+                    onChange={() => addOns.onToggle(o.id)}
+                  />
+                  <span className="min-w-0 flex-1 text-caption text-ink">{o.label}</span>
+                  <span className="shrink-0 text-caption tabular-nums text-grey-700">
+                    {o.strength.toFixed(2)}
+                  </span>
+                </label>
+                <span className="mt-0.5 block pl-5 text-caption italic leading-snug text-grey-500">
+                  {o.why}
+                </span>
+              </li>
+            )
+          })}
+        </ul>
+      </details>
+    </Field>
   )
 }
 

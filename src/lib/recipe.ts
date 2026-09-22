@@ -531,6 +531,8 @@ export function decide(input: RecipeInput): Recipe {
   const missingLoras: Plan['missingLoras'] = []
   let stack: LoraStack = []
   let sharpness: Plan['sharpness'] = null
+  /** The sentence quoting the figure, withdrawn in step 7 if the reader adds to the set. */
+  let figureNote: RecipeNote | null = null
 
   if (wanted && carriesAnatomy(baseDef, model)) {
     const entries: { file: string; strength: number; enabled: boolean }[] = []
@@ -570,7 +572,7 @@ export function decide(input: RecipeInput): Recipe {
         measured: true,
         why:
           spec.name === MICRO_DETAILS
-            ? `The only measured restorer: ${pct(MEASURED.microDetailsAlone.ratio)} base sharpness on its own at ${MEASURED.microDetailsAlone.strength}.`
+            ? `The only measured restorer: ${pct(MEASURED.microDetailsAlone.ratio)} as sharp as no add-ons, on its own at ${MEASURED.microDetailsAlone.strength}.`
             : spec.name === ANATOMY_HELPER
               ? `Capped at 0.4. It degrades monotonically above that: ${pct(0.718)} at 0.5 and ${pct(0.437)} at 0.8.`
               : 'Part of the measured stack for this level.',
@@ -584,17 +586,16 @@ export function decide(input: RecipeInput): Recipe {
         verdict: wanted.verdict,
         onMeasuredModel: model === MEASURED_ON,
       }
-      notes.push(
-        note(
-          'anatomy',
-          `This stack measured ${pct(wanted.ratio)} base sharpness. ${wanted.verdict}`,
-          true,
-        ),
+      figureNote = note(
+        'anatomy',
+        `These add-ons measured ${pct(wanted.ratio)} as sharp as the same picture with none of them. ${wanted.verdict}`,
+        true,
       )
+      notes.push(figureNote)
       if (model !== MEASURED_ON) notes.push(note('anatomy', MEASURED.transferNote, true))
       if (anatomy === 'emphasised') {
         warnings.push(
-          `Emphasised measured ${pct(MEASURED.stacks.emphasised.ratio)} against base, below the ${pct(MEASURED.stacks.natural.ratio)} that Natural measured. Three anatomy LoRAs cost more sharpness than micro details repays. More is not better here.`,
+          `"Also explicit anatomy" measured ${pct(MEASURED.stacks.emphasised.ratio)} as sharp as no add-ons, below the ${pct(MEASURED.stacks.natural.ratio)} of "Sharper faces and hands". Three body add-ons cost more sharpness than the detail add-on pays back. More is not better here.`,
         )
       }
     } else if (loras.length) {
@@ -653,9 +654,8 @@ export function decide(input: RecipeInput): Recipe {
   // training vocabulary and returns picks with their triggers.
   //
   // It is additive and capped: the measured anatomy stack stays exactly as it
-  // was, so the figure printed on screen still describes what runs. Anything
-  // the prompt suggests on top is marked measured:false, because no run
-  // measured it.
+  // was. Anything the prompt suggests on top is marked measured:false,
+  // because no run measured it, and accepting one withdraws the figure below.
   let promptPicks: { file: string; strength: number; why: string }[] = []
   try {
     // The LIBRARY, not a list of filenames. infoFor() returns null for a bare
@@ -737,6 +737,16 @@ export function decide(input: RecipeInput): Recipe {
       `${appliedPicks.length === 1 ? '' : 's'} matched to your wording: ` +
       `${appliedPicks.map(p => labelOf(lib, p.file)).join(', ')}. ` +
       `Matched from training vocabulary, not measured.`))
+  }
+  // The figure describes the measured set and nothing else. Once the reader
+  // adds to it, the chain that runs is one nobody measured, so the number is
+  // withdrawn rather than left standing over a stack it does not describe.
+  if (appliedPicks.length && sharpness) {
+    sharpness = null
+    if (figureNote) notes.splice(notes.indexOf(figureNote), 1)
+    notes.push(
+      note('anatomy', 'You added add-ons on top of the measured set, so no sharpness figure applies to what will actually run.'),
+    )
   }
 
   // 6b. The chain. Only now is every add-on known: the measured stack, the
@@ -857,20 +867,94 @@ function heldForRefine(lib: LoraLibrary, target: LoraTarget, inStack: Set<string
     if (!info.installed) continue
     if (inStack.has(info.file)) continue
     if (fitFor(info, target).level === 'mismatch') continue
+    // The word the prompt actually gets, which is the caption index's when it
+    // has a confident one and the catalogue's otherwise: the same choice
+    // triggersFor makes when the add-on is chained.
+    const word = triggersFor([{ file: info.file, strength: 1, enabled: true }], lib)[0] ?? ''
     out.push({
       file: info.file,
       label: info.label,
       strength: info.recommended,
       measured: false,
-      why: authorNote(info),
+      why: authorNote(info, word),
     })
   }
   return out.sort((a, b) => a.label.localeCompare(b.label))
 }
 
-function authorNote(info: LoraInfo): string {
-  const trigger = info.trigger.trim() ? ` Needs the trigger ${info.trigger}.` : ''
-  return `${info.does}${trigger} Strength ${info.recommended} is the author's recommendation, not a measurement taken here.`
+function authorNote(info: LoraInfo, word: string): string {
+  const added = word.trim() ? ` Its word, ${word.trim()}, is added to the prompt for you.` : ''
+  return `${info.does}${added} Strength ${info.recommended} is the author's recommendation, not a measurement taken here.`
+}
+
+/**
+ * The region add-ons that fit a weight file, for the refine bench to offer.
+ *
+ * The same list decide() holds back as `refineLoras`, worked out for whichever
+ * model draws the region rather than the one the desk picked: the bench often
+ * draws with a different one, and an add-on made for another kind of model
+ * loads without error and changes nothing. Offered, never applied unasked.
+ */
+export function regionAddOns(
+  lib: LoraLibrary,
+  def: FamilyDef,
+  model: string,
+  exclude: Iterable<string> = [],
+): RecipeLora[] {
+  return heldForRefine(lib, targetFor(def, model), new Set(exclude))
+}
+
+/** Every file a measured set names. decide() reads their prompt words from the catalogue. */
+const MEASURED_FILES = new Set<string>(
+  [...NATURAL_STACK.entries, ...EMPHASISED_STACK.entries].map(([file]) => file),
+)
+
+/**
+ * The positive prompt the desk sends for these words on this file with this
+ * add-on chain: the prefix the file was trained with, the words, then the word
+ * each add-on answers to when the words do not already carry it.
+ *
+ * For rebuilding a finished picture's prompt from its record. The record files
+ * the reader's words and the chain, not the prompt that was sent, and a pass
+ * queued from the bare words draws a different picture at the same seed: on
+ * Pony a picture without its score tags looks like plain SDXL, and an add-on
+ * without its word loads and does little. A hand edited prompt is the one
+ * thing this cannot rebuild, because nothing on the record keeps it.
+ *
+ * The words follow whichever builder made the original. decide() takes the
+ * measured sets' words from the catalogue and every other add-on's from its
+ * own training captions; the edit desk takes all of them from the catalogue.
+ * A record recovered from ComfyUI's history files the whole sent prompt as its
+ * words, so a prefix the words already open with is not added a second time.
+ */
+export function positiveFor(input: {
+  def: FamilyDef
+  model: string
+  prompt: string
+  loras: readonly { name: string; strength: number }[]
+  lib: LoraLibrary
+  /** Words already worked out for add-ons chained on top, added after the rest. */
+  extra?: readonly string[]
+}): string {
+  const words = input.prompt.trim()
+  const lower = words.toLowerCase()
+  const target = targetFor(input.def, input.model)
+  const fromCatalogue = (name: string) => input.def.mode === 'edit' || MEASURED_FILES.has(name)
+  const stack = input.loras
+    .filter(l => fromCatalogue(l.name))
+    .map(l => ({ file: l.name, strength: l.strength, enabled: true }))
+  const captioned = input.loras
+    .filter(l => !fromCatalogue(l.name) && l.strength !== 0)
+    .flatMap(l => {
+      const t = indexedTrigger(l.name)
+      return t ? [t] : []
+    })
+  const triggers = [...triggersFor(stack, input.lib, target), ...captioned, ...(input.extra ?? [])]
+    .filter((t, n, a) => a.indexOf(t) === n)
+    .filter(t => !lower.includes(t.toLowerCase()))
+  const prefix = prefixFor(input.def, input.model).tokens
+  const opened = prefix.length > 0 && lower.startsWith(prefix.join(', ').toLowerCase())
+  return [...(opened ? [] : prefix), words, ...triggers].filter(Boolean).join(', ')
 }
 
 // ---------------------------------------------------------------------------
@@ -900,24 +984,46 @@ export function explain(recipe: Recipe): string {
     return out.join(' ')
   }
 
-  const pickedFor =
-    recipe.anatomy === 'off'
-      ? `${recipe.label} for ${lookWord(recipe.look)} work.`
-      : `${recipe.label} for ${lookWord(recipe.look)} work, because it carries explicit anatomy in its training data and takes the anatomy LoRAs.`
-  out.push(pickedFor)
+  // The look picks the model; the detail setting never does (see decide(),
+  // step 4). So the first sentence names the look and nothing else. It used to
+  // add "because it carries explicit anatomy and takes the anatomy add-ons"
+  // whenever the setting was on, which was false for every model that cannot.
+  out.push(`${recipe.label} for ${lookWord(recipe.look)} work.`)
 
-  if (recipe.loras.length && recipe.sharpness) {
+  // The measured helpers and the reader's own add-ons are different claims and
+  // are counted apart: only the first rests on a measured run.
+  const helpers = recipe.loras.filter(l => l.measured)
+  const chosen = recipe.loras.filter(l => !l.measured)
+  const wanted = wantedFor(recipe.anatomy)
+  const whole = !!wanted && helpers.length === wanted.entries.length
+  const counted = `${helpers.length} helper${helpers.length === 1 ? '' : 's'} for this detail setting`
+
+  if (helpers.length && recipe.sharpness) {
     const where = recipe.sharpness.onMeasuredModel ? '' : ' That figure was measured on Pony V6, so treat it as a starting point here.'
     out.push(
-      `${recipe.loras.length} LoRAs at the measured strengths: the stack came out at ${pct(recipe.sharpness.ratio)} base sharpness.${where}`,
+      `${counted}, at the measured strengths. Together they came out ${pct(recipe.sharpness.ratio)} as sharp as the same picture without them.${where}`,
     )
     if (recipe.anatomy === 'emphasised') {
-      out.push('Natural measured 1.14x on the same test, so emphasised buys anatomy weight at the cost of sharpness.')
+      out.push(
+        `"Sharper faces and hands" measured ${pct(MEASURED.stacks.natural.ratio)} on the same test, so the explicit set trades sharpness for anatomy.`,
+      )
     }
-  } else if (recipe.loras.length) {
-    out.push(`${recipe.loras.length} anatomy LoRAs applied. Part of the measured stack is missing, so no sharpness figure applies.`)
+  } else if (helpers.length && whole) {
+    out.push(`${counted}, at the measured strengths. You added more on top, so no sharpness figure applies to what will run.`)
+  } else if (helpers.length) {
+    out.push(`${counted}. Part of the measured set is missing, so no sharpness figure applies.`)
   } else if (recipe.anatomy !== 'off') {
-    out.push('No anatomy LoRAs could be applied here. The warnings say why.')
+    out.push(
+      carriesAnatomy(recipe.base, recipe.model)
+        ? `None of the helpers for this detail setting could be applied here.${recipe.warnings.length ? ' The notes below say why.' : ''}`
+        : `The helpers for this detail setting do not attach to ${recipe.label}, so none are applied.`,
+    )
+  }
+
+  if (chosen.length) {
+    out.push(
+      `Also on because you added ${chosen.length === 1 ? 'it' : 'them'}: ${chosen.map(l => l.label).join(', ')}. Not measured here.`,
+    )
   }
 
   out.push('Faces, hands, a masked region and a larger render are offered once the picture exists.')

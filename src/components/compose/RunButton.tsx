@@ -8,6 +8,18 @@
  * are lifted from the desk as it stood, unchanged, because neither was the
  * problem.
  *
+ * The keyboard holds too. Enter or Space starts the same 600ms wipe and
+ * letting go cancels it, and a key's auto-repeat is ignored. It used to stop on
+ * the first keydown, and the button keeps focus as it turns from "Make the
+ * picture" into "Hold to stop", so a second Enter, or one Enter held a moment
+ * too long, stopped the job the first had just started.
+ *
+ * A screen reader activates a button with a bare click and no key or pointer
+ * events at all, so it could not stop a job. A click with no pointer behind it
+ * arms the stop instead, and a second one within a few seconds confirms it:
+ * still two deliberate acts, and a mouse click still does nothing without the
+ * hold.
+ *
  * The receipt is the one number this component prints: how long the last run
  * took, measured by the desk's own clock. It is shown for a few seconds in
  * place of the label and then the label comes back.
@@ -17,7 +29,11 @@ import {
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react'
+
+/** How long an armed stop waits for its confirming press. */
+const ARMED_MS = 3000
 
 const THIN = ' '
 
@@ -65,6 +81,7 @@ export function RunButton({
   reduced?: boolean
 }) {
   const [holding, setHolding] = useState(false)
+  const [armed, setArmed] = useState(false)
   const [receipt, setReceipt] = useState<string | null>(null)
   const timer = useRef<number | null>(null)
   const seen = useRef<number | null>(null)
@@ -81,10 +98,20 @@ export function RunButton({
     if (timer.current) window.clearTimeout(timer.current)
   }, [])
 
+  // An armed stop lapses on its own.
+  useEffect(() => {
+    if (!armed) return
+    const t = window.setTimeout(() => setArmed(false), ARMED_MS)
+    return () => window.clearTimeout(t)
+  }, [armed])
+
   const beginHold = () => {
-    if (!onStop) return
+    // One hold at a time: a key held down while the pointer is also down must
+    // not start a second timer and stop twice.
+    if (!onStop || timer.current) return
     setHolding(true)
     timer.current = window.setTimeout(() => {
+      timer.current = null
       setHolding(false)
       onStop()
     }, 600)
@@ -96,26 +123,45 @@ export function RunButton({
     timer.current = null
   }
 
+  const isActivation = (e: ReactKeyboardEvent) => e.key === 'Enter' || e.key === ' '
+
   if (running) {
     return (
       <div>
         <button
           type="button"
-          aria-label="Hold to stop this job"
+          aria-label={armed ? 'Press again to stop this job' : 'Hold to stop this job'}
           onPointerDown={beginHold}
           onPointerUp={endHold}
           onPointerLeave={endHold}
           onPointerCancel={endHold}
           onKeyDown={(e: ReactKeyboardEvent) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              onStop?.()
+            if (!isActivation(e)) return
+            // Default prevented either way, so the key never turns into a click.
+            e.preventDefault()
+            if (e.repeat) return
+            beginHold()
+          }}
+          onKeyUp={(e: ReactKeyboardEvent) => {
+            if (!isActivation(e)) return
+            e.preventDefault()
+            endHold()
+          }}
+          onClick={(e: ReactMouseEvent) => {
+            // A pointer click has a detail of one or more and is hold only.
+            // Zero is a click with no pointer behind it: assistive technology.
+            if (e.detail !== 0 || !onStop) return
+            if (armed) {
+              setArmed(false)
+              onStop()
+            } else {
+              setArmed(true)
             }
           }}
           className="press sg-hold relative overflow-hidden"
           style={{ backgroundColor: 'var(--color-newsprint)', color: 'var(--color-burgundy-900)' }}
         >
-          <span className="relative">Hold to stop</span>
+          <span className="relative">{armed ? 'Press again to stop' : 'Hold to stop'}</span>
           <span
             aria-hidden
             className="absolute inset-0 grid place-items-center bg-burgundy-900 text-newsprint"
@@ -124,9 +170,12 @@ export function RunButton({
               transition: reduced ? 'none' : 'clip-path 600ms linear',
             }}
           >
-            Hold to stop
+            {armed ? 'Press again to stop' : 'Hold to stop'}
           </span>
         </button>
+        <p aria-live="polite" className="sr-only">
+          {armed ? 'Stop armed. Press the button again within three seconds to stop the job.' : ''}
+        </p>
         <p className="mt-1.5 text-caption italic text-grey-700 tabular-nums">
           {job?.total && job.total > 1 ? `Picture ${job.index} of ${job.total} · ` : ''}
           {job?.stage ?? 'Working'}
@@ -140,7 +189,16 @@ export function RunButton({
 
   return (
     <div>
-      <button type="button" className="press" disabled={disabled} onClick={onRun}>
+      <button
+        type="button"
+        className="press"
+        disabled={disabled}
+        onClick={() => {
+          // A stop armed for the last job is not carried into this one.
+          setArmed(false)
+          onRun()
+        }}
+      >
         {receipt ? (
           <span className="tabular-nums">{receipt}</span>
         ) : (

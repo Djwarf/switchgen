@@ -54,10 +54,10 @@ import { Caution, Chips, Head, Kicker, Quiet, clamp, times } from './bits'
 import { clampRect, defaultBrush, useMaskEditor, type MaskTool } from './mask'
 import { MaskCanvas } from './MaskCanvas'
 import { Compare } from './Compare'
-import { RefinePanel, REFINE_SETTINGS, type RefineSettings } from './RefinePanel'
+import { RefinePanel, REFINE_SETTINGS, type RefineSettings, type RegionAddOns } from './RefinePanel'
 
 export { Compare } from './Compare'
-export { RefinePanel, REFINE_SETTINGS, type RefineSettings } from './RefinePanel'
+export { RefinePanel, REFINE_SETTINGS, type RefineSettings, type RegionAddOns } from './RefinePanel'
 export { useMaskEditor, toMaskBlob, type MaskStroke, type MaskTool } from './mask'
 
 /** Everything the desk needs to queue one refine pass. */
@@ -114,6 +114,13 @@ export type RegionRefineProps = {
     /** Why the picture's own model is not the one drawing. */
     note?: string | null
   }
+  /**
+   * Add-ons made for close framing that fit the model drawing the region,
+   * offered unticked. Plain rows, like `model`, so this folder still knows
+   * nothing about the add-on library. The desk chains the ticked ones and
+   * names them on the record; nothing is applied without a tick.
+   */
+  addOns?: RegionAddOns
   onRun: (req: RefineRequest) => void
   onStop?: () => void
 }
@@ -135,6 +142,7 @@ export function RegionRefine({
   progress = null,
   blocked = null,
   model,
+  addOns,
   onRun,
   onStop,
 }: RegionRefineProps) {
@@ -345,6 +353,7 @@ export function RegionRefine({
             busy={busy}
             progress={progress}
             blocked={blocked}
+            addOns={addOns}
             onRun={() => void start()}
             onStop={onStop}
           />

@@ -140,6 +140,16 @@ export type OfferOptions = {
    * one fact that tells a reader whether the pass has anything to do.
    */
   facts?: ImageFacts | null
+  /**
+   * Whether the desk can rebuild the graph that made this picture. False
+   * withholds the four rows that re-render it from its record: the face, the
+   * hands, the larger render and "make another". A region pass cannot be
+   * rebuilt from what its record says, and rebuilding it anyway redrew the
+   * whole original frame and threw the refine away, under a row promising
+   * that only the faces would move. The refine and source rows work on the
+   * file itself and stay.
+   */
+  rebuild?: boolean
 }
 
 /** "The detector found 2 hands, the larger 3.1% of the frame." or that it found none. */
@@ -176,6 +186,7 @@ export function offersFor(
 ): ResultOffer[] {
   const out: ResultOffer[] = []
   const caps = def ? capabilitiesOf(def) : null
+  const rebuild = opts.rebuild !== false
 
   if (def && caps?.refine) {
     out.push({
@@ -189,7 +200,7 @@ export function offersFor(
     })
   }
 
-  if (def && caps?.handDetail) {
+  if (def && rebuild && caps?.handDetail) {
     out.push({
       id: 'hand',
       label: 'Fix the hands',
@@ -202,7 +213,7 @@ export function offersFor(
     })
   }
 
-  if (def && caps?.faceDetail) {
+  if (def && rebuild && caps?.faceDetail) {
     out.push({
       id: 'face',
       label: 'Fix the face',
@@ -215,7 +226,7 @@ export function offersFor(
     })
   }
 
-  if (def && caps?.hires) {
+  if (def && rebuild && caps?.hires) {
     const big = opts.size ? hiresSize(opts.size) : null
     out.push({
       id: 'hires',
@@ -229,15 +240,17 @@ export function offersFor(
     })
   }
 
-  out.push({
-    id: 'again',
-    label: 'Make another like this',
-    what: 'The same recipe, a new seed. Nothing to fill in again.',
-    measured: null,
-    cost: 1,
-    costNote: 'One ordinary generation.',
-    group: 'carry',
-  })
+  if (rebuild) {
+    out.push({
+      id: 'again',
+      label: 'Make another like this',
+      what: 'The same recipe, a new seed. Nothing to fill in again.',
+      measured: null,
+      cost: 1,
+      costNote: 'One ordinary generation.',
+      group: 'carry',
+    })
+  }
 
   if (opts.canSource !== false) {
     out.push({

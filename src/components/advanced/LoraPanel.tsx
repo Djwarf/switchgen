@@ -53,6 +53,7 @@ export function LoraPanel({
   overridden,
   onStack,
   onRestore,
+  onDropAddOn,
   onLibraryReload,
   measuredOn,
 }: {
@@ -64,6 +65,8 @@ export function LoraPanel({
   overridden: boolean
   onStack: (next: LoraStack) => void
   onRestore: () => void
+  /** Withdraw an add-on the reader added on the main screen, rather than override it. */
+  onDropAddOn?: (file: string) => void
   /** A file landed on disk. The desk re reads /api/models. */
   onLibraryReload?: () => void
   measuredOn: string
@@ -72,6 +75,11 @@ export function LoraPanel({
   const stack = settled.stack
   const decided = useMemo(() => decidedStack(plan), [plan])
   const inStack = useMemo(() => new Set(stack.map((e) => e.file)), [stack])
+  /** Rows the reader added on the main screen: the recipe's unmeasured entries. */
+  const added = useMemo(
+    () => new Set(plan.loras.filter((l) => !l.measured).map((l) => l.file)),
+    [plan],
+  )
 
   // The checkpoint families bundle their own text encoder, so LoraLoader
   // patches MODEL and CLIP together. The separate encoder families patch only
@@ -138,7 +146,7 @@ export function LoraPanel({
       {overridden ? (
         <Note>
           The stack is no longer the measured one, so no sharpness figure applies to what will
-          actually run. The per LoRA readings on each row still do.
+          actually run. The per add-on readings on each row still do.
         </Note>
       ) : null}
 
@@ -154,7 +162,7 @@ export function LoraPanel({
                 fit={
                   info
                     ? fitFor(info, target)
-                    : { level: 'untested', why: 'This file is no longer in the LoRA folder.' }
+                    : { level: 'untested', why: 'This file is no longer in the add-ons folder.' }
                 }
                 index={i}
                 count={stack.length}
@@ -162,7 +170,13 @@ export function LoraPanel({
                 clipPatched={clipPatched}
                 onPatch={(patch) => onStack(patchStack(stack, entry.file, patch))}
                 onMove={(to) => onStack(moveInStack(stack, i, to))}
-                onRemove={() => onStack(removeFromStack(stack, entry.file))}
+                onRemove={() =>
+                  // An add the reader made is withdrawn at its source, so it
+                  // stays off. Anything else is a hand edit of the stack.
+                  !overridden && onDropAddOn && added.has(entry.file)
+                    ? onDropAddOn(entry.file)
+                    : onStack(removeFromStack(stack, entry.file))
+                }
               />
             )
           })}
@@ -243,9 +257,9 @@ export function LoraPanel({
           </summary>
           <Note>
             These were made from close-up photographs, so they do almost nothing across a whole
-              figure. They are offered on the finished picture instead, where you can paint over the
-              exact area and see whether it needs one. Adding one here applies it to the whole
-              picture, which is allowed and rarely what it was made for.
+              figure. They are offered on the region bench instead, unticked, where you can paint
+              over the exact area and see whether it needs one. Adding one here applies it to the
+              whole picture, which is allowed and rarely what it was made for.
           </Note>
           <ul className="mt-1 border-t border-grey-300">
             {plan.refineLoras.map((l) => {

@@ -71,6 +71,7 @@ import {
   familyOwning
 } from '../lib/workflows'
 import {
+  feasibility,
   modelFiles,
   probeHardware,
   type Hardware,
@@ -116,6 +117,8 @@ import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitF
 import {
   LOOKS,
   decide,
+  positiveFor,
+  regionAddOns,
   suggestAnatomy,
   type AnatomyLevel,
   type Look,
@@ -143,7 +146,7 @@ import {
   type Passes,
 } from '../components/advanced'
 import { ResultActions } from '../components/result'
-import { INTENTS, intentReport, type Intent } from '../lib/intent'
+import { INTENTS, intentReport, lookScore, strongestLook, type Intent } from '../lib/intent'
 
 // ---------------------------------------------------------------------------
 // Vocabulary
@@ -293,6 +296,11 @@ type Catalogue = {
   installed: string[]
   /** Real file sizes, so the intent ranking can weigh a model against the RAM. */
   sizes: Map<string, ModelFile>
+}
+
+/** The same weight file of the same family. */
+function sameStyle(a: Style | null, b: Style | null): boolean {
+  return !!a && !!b && a.def.id === b.def.id && a.model === b.model
 }
 
 function readPerModel(def: FamilyDef, model: string) {
@@ -752,6 +760,60 @@ function showResult(entry: HistoryEntry) {
 
 const store = deskStore(DESK)
 
+/**
+ * What the desk was set to when the reader last walked away from it.
+ *
+ * The look, the detail setting, the pinned model and everything set by hand
+ * behind More are component state, and App mounts one room at a time, so a
+ * glance at the archive used to put every one of them back to its default
+ * while the prompt, which lives in the desk store, came back intact. "Use
+ * these settings" was the worst of it: the pin and the hand set values are
+ * taken once and the request they came from is cleared, so a visit to another
+ * room dropped them and the next press made a different picture from the one
+ * the reader had loaded, with nothing on screen to say so.
+ *
+ * Memory only, never localStorage. An override is a statement about this
+ * session's picture (see useOverrides), so a reload still starts clean; a walk
+ * to another room and back does not.
+ */
+type Held = {
+  look: Intent
+  anatomy: AnatomyLevel
+  anatomySaid: boolean
+  pinned: string | null
+  overrides: Overrides
+  seed0: number
+  correction: string | null
+}
+
+let held: Held | null = null
+
+/**
+ * Whether the desk can rebuild the graph that made this picture.
+ *
+ * The face, hand, larger render and "make another" rows all re-render the
+ * picture from its record. A region pass is filed as image to image of the
+ * ORIGINAL picture with the region prompt and no pixel budget, and nothing on
+ * the record says which region or what mask: rebuilt, it redraws the whole
+ * original frame at the region's strength and throws the refine away. Plain
+ * image to image always files its budget, so a missing one marks a region
+ * pass, or a record recovered from ComfyUI that does not say how it was sized,
+ * which cannot be rebuilt faithfully either.
+ */
+function rebuildable(entry: HistoryEntry): boolean {
+  return !(entry.mode === 'i2i' && entry.megapixels == null)
+}
+
+/**
+ * The trained prefix to file on a record, when the prompt sent really opened
+ * with it and the reader's own words did not already carry it.
+ */
+function prefixFiled(prefix: string | null, positive: string, words: string): string | null {
+  if (!prefix) return null
+  if (!positive.startsWith(prefix)) return null
+  return words.trim().startsWith(prefix.trim()) ? null : prefix
+}
+
 function useComposition(): Composition {
   return useSyncExternalStore(store.subscribe, store.get, store.get)
 }
@@ -811,6 +873,12 @@ type RefineSource = {
    * Both new routes in - the archive and an uploaded file - break that.
    */
   madeBy: string | null
+  /**
+   * The family and weight file behind `madeBy`, when known. The bench draws
+   * with the picture's own model when it can, and when it cannot, the reason
+   * it gives has to be about that model rather than whatever the desk is on.
+   */
+  maker: { familyId: string; model: string } | null
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +900,8 @@ function editRecipe(input: {
   source: string | null
   seed: number
   cat: Catalogue
+  /** Free memory as last read, which is fresher than the catalogue's. */
+  hardware: Hardware | null
   lib: LoraLibrary
   addOns?: { accepted?: readonly string[]; declined?: readonly string[] }
 }): Recipe {
@@ -880,7 +950,7 @@ function editRecipe(input: {
   ).filter((t) => !prompt.toLowerCase().includes(t.toLowerCase()))
   const report = intentReport(
     { intent: input.look as Intent, explicit: input.anatomy !== 'off', mode: 'edit' },
-    { installed: cat.installed, sizes: cat.sizes, hardware: cat.hardware },
+    { installed: cat.installed, sizes: cat.sizes, hardware: input.hardware },
   )
 
   const positiveBase = style.positivePrefix ? `${style.positivePrefix}${prompt}` : prompt
@@ -901,12 +971,12 @@ function editRecipe(input: {
   if (input.source) params.image = input.source
 
   const capabilities = capabilitiesOf(planDef)
-  if (style.verdict && style.verdict.level !== 'ok') warnings.push(style.verdict.reason)
-  if (input.anatomy !== 'off') {
-    warnings.push(
-      `${style.label} follows instructions; it is not an SDXL booru base. The anatomy LoRAs have nothing to attach to here, so the anatomy setting changes nothing about this edit.`,
-    )
-  }
+  // The catalogue's verdict was taken when the page loaded. Judge the fit
+  // against the latest reading instead, so the warning is about now.
+  const verdict = input.hardware ? feasibility(def, cat.sizes, input.hardware) : style.verdict
+  if (verdict && verdict.level !== 'ok') warnings.push(verdict.reason)
+  // No word about the detail setting. This desk does not show it, so a
+  // warning about a control the reader cannot see here would only confuse.
 
   const notes: RecipeNote[] = [
     {
@@ -1032,7 +1102,7 @@ export function Pictures() {
 
   const [cat, setCat] = useState<Catalogue | null>(null)
   const [catError, setCatError] = useState<string | null>(null)
-  const [correction, setCorrection] = useState<string | null>(null)
+  const [correction, setCorrection] = useState<string | null>(() => held?.correction ?? null)
   const [sourceError, setSourceError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -1053,21 +1123,28 @@ export function Pictures() {
    * lives on the full picker behind More, and the state is wide enough to hold
    * it.
    */
-  const [look, setLook] = useState<Intent>('photoreal')
-  const [anatomy, setAnatomy] = useState<AnatomyLevel>(() => suggestAnatomy(store.get().prompt))
+  const [look, setLook] = useState<Intent>(() => held?.look ?? 'photoreal')
+  const [anatomy, setAnatomy] = useState<AnatomyLevel>(
+    () => held?.anatomy ?? suggestAnatomy(store.get().prompt),
+  )
   /** True once the reader has said what they want. Until then the prompt hints. */
-  const [anatomySaid, setAnatomySaid] = useState(false)
+  const [anatomySaid, setAnatomySaid] = useState(() => held?.anatomySaid ?? false)
 
   // --- everything else, mounted only while More is open -------------------
-  const ov = useOverrides()
-  const [pinned, setPinned] = useState<string | null>(null)
+  const ov = useOverrides(held?.overrides)
+  const [pinned, setPinned] = useState<string | null>(() => held?.pinned ?? null)
   const [lib, setLib] = useState<LoraLibrary>(EMPTY_LIBRARY)
   /**
    * Held rather than rolled inside decide(), so the seed on the sampling panel
    * does not change under the reader on every keystroke. A new one is drawn at
    * the press, unless they locked it.
    */
-  const [seed0, setSeed0] = useState(() => randomSeed())
+  const [seed0, setSeed0] = useState(() => held?.seed0 ?? randomSeed())
+
+  // Kept for the next visit. See `held`.
+  useEffect(() => {
+    held = { look, anatomy, anatomySaid, pinned, overrides: ov.value, seed0, correction }
+  }, [look, anatomy, anatomySaid, pinned, ov.value, seed0, correction])
 
   const [refining, setRefining] = useState(false)
   const [refineSource, setRefineSource] = useState<RefineSource | null>(null)
@@ -1078,15 +1155,18 @@ export function Pictures() {
   /** True between queueing a refine and its result landing on the plate. */
   const awaitingRefine = useRef(false)
   /**
-   * The picture on screen when a region pass was queued.
+   * The press job the region pass was queued as.
    *
-   * The result is 'the first picture that is not this one'. This used to be
-   * compared against refineSource.entryId, which works for an archive record
-   * (the bench opens on it, so it IS the current picture) but not for an
-   * uploaded one, which has no entry id at all: the guard then matched
-   * nothing and the composer's last picture was adopted as the refined result.
+   * The result is the picture THAT job produced, and nothing else. It used to
+   * be 'the first picture that is not the one on screen when the pass was
+   * queued', which held only while the pass succeeded: a rejected or stopped
+   * pass left the flag up, the composer stays usable beside the bench, and the
+   * next ordinary picture was then shown as the refined result, compared
+   * against the source and offered as the next region to work on.
    */
-  const refineBaseline = useRef<string | null>(null)
+  const refineJob = useRef<string | null>(null)
+  /** The region add-ons the reader ticked on the bench, by filename. None until they do. */
+  const [refinePicked, setRefinePicked] = useState<string[]>([])
 
   const fileInput = useRef<HTMLInputElement | null>(null)
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
@@ -1125,6 +1205,39 @@ export function Pictures() {
   }, [catError, load])
 
   useEffect(() => watchConnection((s) => setOffline(s === 'closed')), [])
+
+  // --- free memory, read afresh -------------------------------------------
+  /**
+   * The catalogue is read once per page load, and the page is an installed app
+   * that stays open for hours. Its memory reading went stale with it, and the
+   * ranking and the warnings compared the weights against how much was free
+   * when the tab was opened. So free memory is read again on every visit to
+   * the desk, whenever the page comes back into view, and after every job,
+   * which is when the most memory changes hands.
+   */
+  const [freshHardware, setFreshHardware] = useState<Hardware | null>(null)
+  const [hardwareAsk, setHardwareAsk] = useState(0)
+  const jobEnded = state.job?.finishedAt ?? null
+  useEffect(() => {
+    let alive = true
+    probeHardware().then(
+      (hw) => {
+        if (alive) setFreshHardware(hw)
+      },
+      () => {},
+    )
+    return () => {
+      alive = false
+    }
+  }, [hardwareAsk, jobEnded])
+  useEffect(() => {
+    const onShow = () => {
+      if (document.visibilityState === 'visible') setHardwareAsk((n) => n + 1)
+    }
+    document.addEventListener('visibilitychange', onShow)
+    return () => document.removeEventListener('visibilitychange', onShow)
+  }, [])
+  const hardware = freshHardware ?? cat?.hardware ?? null
 
   // The LoRA catalogue, read once. Until it lands the recipe resolves nothing
   // and says so in print rather than pretending the stack was applied.
@@ -1262,6 +1375,7 @@ export function Pictures() {
         source: sourceName || null,
         seed: seed0,
         cat,
+        hardware,
         lib,
         addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
       })
@@ -1271,7 +1385,7 @@ export function Pictures() {
       look: look as Look,
       anatomy,
       sourceImage: usingSource ? sourceName : undefined,
-      hardware: cat.hardware,
+      hardware,
       sizes: cat.sizes,
       installed: pinned ? [pinned] : cat.installed,
       loras: lib,
@@ -1282,7 +1396,7 @@ export function Pictures() {
       addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
     })
   }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, lib, seed0, editStyle,
-      c.addOnsAccepted, c.addOnsDeclined])
+      c.addOnsAccepted, c.addOnsDeclined, hardware])
 
   const plan = recipe.ok ? recipe : null
 
@@ -1312,6 +1426,35 @@ export function Pictures() {
     },
     [editStyle],
   )
+
+  // --- the reader's add-on decisions --------------------------------------
+  /**
+   * Take an added add-on off again.
+   *
+   * An accepted add-on is carried on the reader's say-so even after the
+   * wording drifts away from it, and it leaves the offers as it joins the
+   * chain, so while it was on the main screen had no way to take it off.
+   * Removing it in More only set a stack override, which "Go back to the
+   * picks" or a walk to another room undid while the decision stayed filed.
+   * This withdraws the decision itself. It is not a "no": the add-on can be
+   * offered again when the wording asks for it.
+   */
+  const dropAddOn = useCallback((file: string) => {
+    const now = store.get()
+    store.patch({ addOnsAccepted: now.addOnsAccepted.filter((f) => f !== file) })
+  }, [])
+
+  /**
+   * The prompt, written from the field.
+   *
+   * An emptied prompt is the start of a new composition, so the add-on
+   * decisions made for the old one go with it. They used to outlive every
+   * prompt and every reload, and one accepted add-on then rode along on every
+   * picture that followed.
+   */
+  const writePrompt = useCallback((prompt: string) => {
+    store.patch(prompt.trim() ? { prompt } : { prompt, addOnsAccepted: [], addOnsDeclined: [] })
+  }, [])
 
   // --- the source picture -------------------------------------------------
   const clearSource = useCallback(() => {
@@ -1354,8 +1497,13 @@ export function Pictures() {
   }, [])
 
   const takeRecord = useCallback((entry: HistoryEntry) => {
-    const previous = store.get().source
+    const now = store.get()
+    const previous = now.source
     if (previous?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previous.previewUrl)
+    // A picture taken on "From words" switches the desk to working from it,
+    // the way a dropped or pasted file does. Left on t2i, the well showed the
+    // picture and the button said "Make the change" while the run drew from
+    // the words alone and the record filed no source.
     store.patch({
       source: {
         name: '',
@@ -1366,6 +1514,7 @@ export function Pictures() {
         width: entry.width ?? undefined,
         height: entry.height ?? undefined,
       },
+      mode: now.mode === 't2i' ? 'i2i' : now.mode,
     })
   }, [])
 
@@ -1436,6 +1585,13 @@ export function Pictures() {
   const start = useCallback(() => {
     if (!plan || !settled || busy(press)) return
     const base = store.get()
+    // The button's own refusals, checked again here, because Ctrl+Enter reaches
+    // this without the button: the prompt field lets the key through when the
+    // desk is blocked, and the page-wide handler then called this regardless,
+    // rendering from the words alone with no picture attached, or queueing the
+    // edit graph against its placeholder file.
+    if (!base.prompt.trim()) return
+    if (needsSource(base.mode) && (!base.source?.name || uploading)) return
     const first = settled.seedLocked ? settled.params.seed : randomSeed()
     const plans: RunPlan[] = []
 
@@ -1450,9 +1606,11 @@ export function Pictures() {
         familyId: plan.familyId,
         model: plan.model,
         prompt: plan.prompt,
-        // The prefix and the trigger tokens are already inside params.positive,
-        // so filing one here would prepend it a second time on reuse.
-        positivePrefix: null,
+        // The prefix is filed when the prompt sent really opened with it, so
+        // the record says what ran. Nothing that rebuilds a picture from its
+        // record prepends it blindly: rerun() rebuilds the whole prompt with
+        // positiveFor(), which knows the words may already carry it.
+        positivePrefix: prefixFiled(style?.positivePrefix ?? null, params.positive, plan.prompt),
         negative: params.negative,
         source: needsSource(c.mode) ? base.source : null,
         width: params.width,
@@ -1491,7 +1649,7 @@ export function Pictures() {
 
     setSeed0(first)
     startRuns(plans)
-  }, [plan, settled, c.mode])
+  }, [plan, settled, c.mode, uploading, style])
 
   // Ctrl/⌘+Enter runs, and is the one shortcut that works inside the prompt.
   useEffect(() => {
@@ -1550,14 +1708,20 @@ export function Pictures() {
    *
    * The result surface asks this graph what it can carry, so handing it the
    * bare family would offer a picture made through image to image the wrong
-   * passes. Image to image first, LoRA chain second, exactly as decide() builds
-   * it, so what is offered is what can really be derived.
+   * passes. Image to image first, then the passes the picture already had,
+   * then the add-on chain, in the order settle() builds them, so what is
+   * offered is what can really be derived and a pass queued from it redraws
+   * the same picture. Without the passes, "Fix the hands" on a picture made
+   * with "Render it bigger" came back smaller and single pass.
    */
   const defOf = useCallback((entry: HistoryEntry): FamilyDef | DerivedDef | null => {
     const base = BY_ID[entry.familyId]
     if (!base) return null
     let def: FamilyDef | DerivedDef = base
     if (entry.mode === 'i2i') def = IMG2IMG[base.id] ?? deriveImg2Img(base) ?? base
+    if (entry.passes?.hires) def = deriveHiresFix(def) ?? def
+    if (entry.passes?.face) def = deriveAutoDetail(def, 'face') ?? def
+    if (entry.passes?.hand) def = deriveAutoDetail(def, 'hand') ?? def
     if (entry.loras?.length) {
       def = withLoras(def, entry.loras.map((l) => ({ name: l.name, strength: l.strength }))) ?? def
     }
@@ -1616,6 +1780,7 @@ export function Pictures() {
   const rerun = useCallback(
     (entry: HistoryEntry, kind: 'face' | 'hand' | 'hires' | null) => {
       if (busy(press)) return
+      if (!rebuildable(entry)) return
       const base = BY_ID[entry.familyId]
       if (!base) return
       const fresh = kind === null
@@ -1643,15 +1808,28 @@ export function Pictures() {
       const params = toParams(composition, {
         negative: defaultsFor(base, composition.model).negative ?? '',
       })
+      // The prompt as the desk sent it, not the bare words the record files.
+      // Queued from the words alone, the pass drew a different picture at the
+      // same seed: no trained prefix, and add-ons loaded without the words
+      // they answer to.
+      params.positive = positiveFor({
+        def: base,
+        model: composition.model,
+        prompt: composition.prompt,
+        loras: entry.loras ?? [],
+        lib,
+      })
       const graph = instantiate(def, params)
       if ('derived' in def) {
         writeExtras(graph, def, { hiresSteps: hiresStepsFor(params.steps) })
       }
 
+      // The passes it already had are in the graph again (see defOf), so the
+      // record says so as well as naming the one just asked for.
       const passes: Passes = {
-        face: kind === 'face',
-        hand: kind === 'hand',
-        hires: kind === 'hires',
+        face: !!entry.passes?.face || kind === 'face',
+        hand: !!entry.passes?.hand || kind === 'hand',
+        hires: !!entry.passes?.hires || kind === 'hires',
       }
       startRuns([
         {
@@ -1669,73 +1847,188 @@ export function Pictures() {
         },
       ])
     },
-    [cat, defOf],
+    [cat, defOf, lib],
   )
 
   // --- region refine ------------------------------------------------------
 
-  /**
-   * Which style draws the region.
-   *
-   * Normally the one the recipe chose. But the edit family, which is the
-   * "change a picture" the reader relies on, cannot carry a refine pass at all:
-   * its conditioning carries reference latents a detached crop would misread,
-   * so deriveRefine returns null for it. Refusing to refine an edited picture
-   * would leave exactly the pictures with the worst anatomy unfixable, so the
-   * bench falls back to a picture style and says so in print.
-   */
   /** Every model that can actually draw a region, not just the first one found. */
   const refineOptions = useMemo(
     () => pictureStyles.filter((s) => deriveRefine(s.def) !== null),
     [pictureStyles],
   )
 
-  /** The reader's own pick, as `familyId::model`. Null means "follow the recipe". */
+  /** The reader's own pick, as `familyId::model`. Null means "the suggested one". */
   const [refinePick, setRefinePick] = useState<string | null>(null)
 
-  /** What the bench draws with when nothing is picked: the recipe's model, else the first that can. */
-  const refineDefault = useMemo(
-    () => (style && deriveRefine(style.def) ? style : (refineOptions[0] ?? null)),
-    [style, refineOptions],
-  )
+  const deskRefines = !!style && deriveRefine(style.def) !== null
+
+  /** The model that made the picture on the bench, when it is installed and can draw a region. */
+  const refineMaker = useMemo(() => {
+    const m = refineSource?.maker
+    if (!m) return null
+    return refineOptions.find((s) => s.def.id === m.familyId && s.model === m.model) ?? null
+  }, [refineSource, refineOptions])
+
+  /**
+   * Which style draws the region when the reader has not picked one.
+   *
+   * The model that made the picture comes first: it drew everything around the
+   * region, so its patch matches. When it cannot redraw a region, or is not
+   * installed, the stand-in is the capable model best at the kind of picture
+   * that model makes, read off the same style table the ranking uses. This
+   * used to be the desk's current model, else whichever capable model sorted
+   * first by name, which put an anime model on photoreal pictures while the
+   * note blamed the picture's maker. With no maker known (an upload), the
+   * desk's model draws when it can, else the one best at the desk's look.
+   */
+  /** The kind of picture a stand-in should be good at: what the maker does best, else the desk's look. */
+  const refineAim: Intent = useMemo(() => {
+    const m = refineSource?.maker
+    const makerDef = m ? BY_ID[m.familyId] : undefined
+    return m && makerDef ? strongestLook(m.model, makerDef) : look
+  }, [refineSource, look])
+
+  const refineDefault = useMemo(() => {
+    if (refineMaker) return refineMaker
+    const m = refineSource?.maker
+    const makerDef = m ? BY_ID[m.familyId] : undefined
+    if (!makerDef && deskRefines) return style
+    if (!refineOptions.length) return null
+    const makerArch = m && makerDef ? archFor(makerDef, m.model) : null
+    let best = refineOptions[0]
+    let bestScore = -1
+    for (const o of refineOptions) {
+      // The look decides; the same kind of weights only breaks a tie.
+      const score =
+        lookScore(o.model, o.def, refineAim) * 2 + (makerArch && archFor(o.def, o.model) === makerArch ? 1 : 0)
+      if (score > bestScore) {
+        best = o
+        bestScore = score
+      }
+    }
+    return best
+  }, [refineMaker, refineSource, refineOptions, deskRefines, style, refineAim])
 
   const refineStyle = useMemo(() => {
-    // A pick the reader made outranks both the recipe and the fallback, and it
-    // is checked against the current list so a stale pick cannot strand the
-    // bench on a model that is no longer installed.
+    // A pick the reader made outranks the suggestion, and it is checked
+    // against the current list so a stale pick cannot strand the bench on a
+    // model that is no longer installed.
     if (refinePick) {
       const chosen = refineOptions.find((s) => `${s.def.id}::${s.model}` === refinePick)
       if (chosen) return chosen
     }
-    if (style && deriveRefine(style.def)) return style
-    return refineOptions[0] ?? null
-  }, [style, refineOptions, refinePick])
+    return refineDefault
+  }, [refineOptions, refinePick, refineDefault])
 
-  const canRefine = !!refineStyle
-
-  /** True when the region will be drawn by something other than the recipe's model. */
-  const refineBorrows =
-    !!refineStyle && !!style && (refineStyle.def.id !== style.def.id || refineStyle.model !== style.model)
+  const canRefine = refineOptions.length > 0
 
   /**
-   * The refine graph, LoRAs and all. Null means: do not offer the pass.
-   *
-   * The stack is held back when the region is drawn by a borrowed style: it was
-   * resolved against a different architecture, and an SDXL LoRA on a Qwen base
-   * loads without error and changes nothing.
+   * True when the region is drawn by the model the desk is set to. Only then
+   * do the desk's add-ons go with it: they were resolved against that model,
+   * and an add-on for one kind of model loads on another without error and
+   * changes nothing.
    */
-  const refineDef: DerivedDef | null = useMemo(() => {
+  const drawsWithDesk = sameStyle(refineStyle, style)
+
+  /** The desk's add-ons that ride along on the region pass. */
+  const deskSpecs: LoraSpec[] = useMemo(
+    () => (drawsWithDesk ? (settled?.specs ?? []) : []),
+    [drawsWithDesk, settled],
+  )
+
+  /**
+   * Region add-ons that fit the model drawing the region, offered on the
+   * bench, unticked. They were all stacked onto every region pass unasked:
+   * every installed one, sliders at full strength included, twenty six files
+   * on a face touch up, none of them named on screen or in the record.
+   */
+  const regionOffers = useMemo(
+    () =>
+      refineStyle
+        ? regionAddOns(lib, refineStyle.def, refineStyle.model, deskSpecs.map((s) => s.name))
+        : [],
+    [lib, refineStyle, deskSpecs],
+  )
+  const regionPicked = useMemo(
+    () => regionOffers.filter((o) => refinePicked.includes(o.file)),
+    [regionOffers, refinePicked],
+  )
+
+  /**
+   * The refine graph, add-ons and all, with the chain it actually carries.
+   * Null means: do not offer the pass.
+   */
+  const refineChain: { def: DerivedDef; specs: LoraSpec[] } | null = useMemo(() => {
     if (!refineStyle) return null
     const derived = deriveRefine(refineStyle.def)
     if (!derived) return null
-    if (refineBorrows) return derived
     const specs: LoraSpec[] = [
-      ...(settled?.specs ?? []),
-      ...(plan?.refineLoras ?? []).map((l) => ({ name: l.file, strength: l.strength })),
+      ...deskSpecs,
+      ...regionPicked.map((l) => ({ name: l.file, strength: l.strength })),
     ]
-    if (!specs.length) return derived
-    return withLoras(derived, specs) ?? derived
-  }, [refineStyle, refineBorrows, settled, plan])
+    if (!specs.length) return { def: derived, specs: [] }
+    const chained = withLoras(derived, specs)
+    // A graph that cannot take add-ons runs without them, and the record and
+    // the bench say none were sent.
+    return chained ? { def: chained, specs } : { def: derived, specs: [] }
+  }, [refineStyle, deskSpecs, regionPicked])
+  const refineDef = refineChain?.def ?? null
+
+  /** The reader-facing name of an add-on file. */
+  const addOnLabel = useCallback((file: string) => lib.byFile.get(file)?.label ?? file, [lib])
+
+  /**
+   * Why this model is drawing the region, said about the right model.
+   *
+   * "<maker> cannot redraw a region" is printed only when the maker is known
+   * and its family really cannot, which the bench used to say about any
+   * picture whenever the DESK's model could not, including pictures made by a
+   * model that could.
+   */
+  const refineWhy: string | null = useMemo(() => {
+    if (!refineStyle) return null
+    const madeBy = refineSource?.madeBy ?? null
+    const m = refineSource?.maker
+    const makerDef = m ? BY_ID[m.familyId] : undefined
+    const picked = !!refinePick && !sameStyle(refineStyle, refineDefault)
+    if (picked) return `You chose ${refineStyle.label} to draw the area.`
+    if (sameStyle(refineStyle, refineMaker)) {
+      return `The area is redrawn by ${refineStyle.label}, the model that made this picture.`
+    }
+    if (m && makerDef) {
+      const who = madeBy ?? 'The model that made this picture'
+      const stand = `the area is drawn by ${refineStyle.label}, rated best for ${refineAim} work of the models here that can`
+      return deriveRefine(makerDef)
+        ? `${who} is not available here, so ${stand}.`
+        : `${who} cannot redraw a region, so ${stand}.`
+    }
+    if (drawsWithDesk) return `The area is drawn by ${refineStyle.label}, the model the desk is set to.`
+    if (style && !deskRefines) {
+      return `${style.label}, the model the desk is set to, cannot redraw a region, so the area is drawn by ${refineStyle.label}, rated best for ${refineAim} work of the models here that can.`
+    }
+    return `The area is drawn by ${refineStyle.label}.`
+  }, [refineStyle, refineSource, refinePick, refineDefault, refineMaker, drawsWithDesk, style, deskRefines, refineAim])
+
+  /** What goes with the region pass, said by name. */
+  const refineCarries: string = useMemo(() => {
+    const sent = refineChain?.specs ?? []
+    const fromDesk = sent.filter((sp) => deskSpecs.some((d) => d.name === sp.name))
+    const parts: string[] = []
+    if (fromDesk.length) {
+      parts.push(`Your add-ons from the desk go with it: ${fromDesk.map((sp) => addOnLabel(sp.name)).join(', ')}.`)
+    } else if (!drawsWithDesk && settled?.specs.length && style) {
+      parts.push(`Your add-ons on the desk are left out, because they were chosen for ${style.label}.`)
+    }
+    if (regionPicked.length && sent.length) {
+      parts.push(`Also on for this area: ${regionPicked.map((l) => l.label).join(', ')}.`)
+    }
+    if (!sent.length && (deskSpecs.length || regionPicked.length)) {
+      parts.push(`${refineStyle?.label ?? 'This model'} cannot take add-ons, so none are sent.`)
+    }
+    if (!parts.length) parts.push('No add-ons go with it.')
+    return parts.join(' ')
+  }, [refineChain, deskSpecs, drawsWithDesk, settled, style, regionPicked, refineStyle, addOnLabel])
 
   /**
    * Open the refine surface on a finished picture.
@@ -1749,6 +2042,7 @@ export function Pictures() {
   const openRefine = useCallback(async (entry: HistoryEntry) => {
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
+    setRefinePicked([])
     setRefining(true)
     setRefineSource(null)
     setRefineResult(null)
@@ -1773,6 +2067,7 @@ export function Pictures() {
         entryId: entry.id,
         prompt: entry.prompt,
         madeBy: entry.modelLabel || null,
+        maker: entry.model ? { familyId: entry.familyId, model: entry.model } : null,
       })
     } catch (err) {
       if (refineToken.current !== token) return
@@ -1798,6 +2093,7 @@ export function Pictures() {
     if (!src.name) return
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
+    setRefinePicked([])
     setRefining(true)
     setRefineSource(null)
     setRefineResult(null)
@@ -1828,6 +2124,8 @@ export function Pictures() {
         (src.width && src.height ? { width: src.width, height: src.height } : null)
       if (!measured) throw new Error('the size could not be read')
       if (refineToken.current !== token) return
+      // A picture taken from the archive still has its record, and so a maker.
+      const made = src.fromEntryId ? allRecords().find((r) => r.id === src.fromEntryId) : undefined
       setRefineSource({
         name: src.name,
         url,
@@ -1837,7 +2135,8 @@ export function Pictures() {
         // upload, which genuinely has no record behind it.
         entryId: src.fromEntryId ?? '',
         prompt: store.get().prompt,
-        madeBy: null,
+        madeBy: made?.modelLabel || null,
+        maker: made?.model ? { familyId: made.familyId, model: made.model } : null,
       })
     } catch (err) {
       if (refineToken.current !== token) return
@@ -1866,7 +2165,9 @@ export function Pictures() {
     setOpeningRefine(false)
     // The "Drawn by" choice belongs to the picture it was made for. Left set,
     // it silently outranked the recipe for every region pass that followed.
+    // The ticked region add-ons are the same kind of choice.
     setRefinePick(null)
+    setRefinePicked([])
   }, [])
 
   /**
@@ -1878,13 +2179,37 @@ export function Pictures() {
    */
   const runRefine = useCallback(
     async (req: RefineRequest) => {
-      if (!refineDef || !refineSource || !refineStyle || busy(press)) return
+      if (!refineChain || !refineSource || !refineStyle || busy(press)) return
+      const token = refineToken.current
       setRefineFault(null)
       try {
         const mask = await uploadImage(req.mask, req.maskName)
         const base = store.get()
         const rd = defaultsFor(refineStyle.def, refineStyle.model)
         const seed = req.seed ?? settled?.params.seed ?? seed0
+        // The region prompt as it is sent: the drawing model's trained prefix,
+        // the region's words, and the word each add-on in the chain answers
+        // to. The graph used to be handed the bare region words over the top
+        // of all that, so the record claimed a prefix the pass never saw and
+        // the add-ons ran without their words.
+        const sent = refineChain.specs
+        const fromDesk = sent.filter((sp) => deskSpecs.some((d) => d.name === sp.name))
+        const target = targetFor(refineStyle.def, refineStyle.model)
+        const regionWords = triggersFor(
+          regionPicked
+            .filter((l) => sent.some((sp) => sp.name === l.file))
+            .map((l) => ({ file: l.file, strength: l.strength, enabled: true })),
+          lib,
+          target,
+        )
+        const positive = positiveFor({
+          def: refineStyle.def,
+          model: refineStyle.model,
+          prompt: req.prompt,
+          loras: fromDesk,
+          lib,
+          extra: regionWords,
+        })
         const composition: Composition = {
           ...base,
           // Filed as image-to-image, which is what it is: a partial denoise of
@@ -1898,7 +2223,7 @@ export function Pictures() {
           sampler: rd.sampler,
           scheduler: rd.scheduler,
           negative: rd.negative ?? null,
-          positivePrefix: refineStyle.positivePrefix,
+          positivePrefix: prefixFiled(refineStyle.positivePrefix, positive, req.prompt),
           shift: refineStyle.shift,
           clipSkip: refineStyle.clipSkip,
           prompt: req.prompt,
@@ -1916,8 +2241,8 @@ export function Pictures() {
           length: null,
           fps: null,
         }
-        const params = toParams(composition, { negative: rd.negative ?? houseNegative })
-        const graph = instantiateRefine(refineDef, params, {
+        const params = { ...toParams(composition, { negative: rd.negative ?? houseNegative }), positive }
+        const graph = instantiateRefine(refineChain.def, params, {
           image: refineSource.name,
           mask,
           crop: req.plan.crop,
@@ -1925,16 +2250,10 @@ export function Pictures() {
           denoise: req.denoise,
           grow: req.grow,
           feather: req.feather,
-          prompt: req.prompt,
+          prompt: positive,
           seed,
         })
-        // `press` is the live module singleton, read the same way busy(press)
-        // reads it above. `state` is the render-scoped snapshot and runRefine's
-        // dependency list does not include it, so closing over it would freeze
-        // the baseline at the render where refineSource last changed,
-        // reintroducing the very bug this line exists to fix.
-        refineBaseline.current = press.current?.id ?? null
-        awaitingRefine.current = true
+        const before = press.job?.id ?? null
         startRuns([
           {
             graph,
@@ -1947,23 +2266,40 @@ export function Pictures() {
             // A refine pass carries no detail passes of its own; it IS the
             // detail pass.
             passes: NO_PASSES,
-            loras: refineBorrows ? [] : (settled?.specs ?? []),
+            // Exactly the chain the graph carries, so the record names every
+            // add-on that touched the region.
+            loras: sent,
           },
         ])
+        // drive() announces the new job before its first await, so the live
+        // singleton already holds it. startRuns refuses while another run is
+        // going (one may have started during the mask upload), and then the
+        // job there is not ours and nothing is followed. Nor is a pass whose
+        // bench was closed or moved to another picture during the upload.
+        const queued = press.job
+        if (queued && queued.id !== before && refineToken.current === token) {
+          refineJob.current = queued.id
+          awaitingRefine.current = true
+        }
       } catch (err) {
         setRefineFault(err instanceof Error ? err.message : 'The refine pass could not be queued.')
       }
     },
-    [refineDef, refineSource, refineStyle, refineBorrows, settled, seed0, houseNegative],
+    [refineChain, refineSource, refineStyle, deskSpecs, regionPicked, lib, settled, seed0, houseNegative],
   )
 
-  // The result is whatever the press produced for the pass we queued, and only
-  // that: the composer still works while the bench is open, so an ordinary
-  // picture made in the meantime must not be presented as the refined one.
+  // The result is the picture the queued pass produced, and only that: the
+  // composer still works while the bench is open, so an ordinary picture made
+  // in the meantime must not be presented as the refined one. A pass that is
+  // rejected, stopped or lost stops the wait, or the next ordinary picture
+  // would land here in its place.
   useEffect(() => {
     if (!awaitingRefine.current) return
+    const job = state.job
+    if (!job || job.id !== refineJob.current) return
+    if (job.status === 'error' || job.status === 'cancelled') awaitingRefine.current = false
     const cur = state.current
-    if (!cur || cur.id === refineBaseline.current) return
+    if (!cur || job.status !== 'done' || !awaitingRefine.current) return
     awaitingRefine.current = false
     setRefineResult(cur)
   }, [state])
@@ -2005,6 +2341,7 @@ export function Pictures() {
         pinnedModel={pinned}
         onPinModel={setPinned}
         onCatalogueChange={() => load(true)}
+        onDropAddOn={dropAddOn}
         faultNode={state.fault?.node ?? null}
         onClose={() => settings.patch({ expert: false })}
       />
@@ -2079,7 +2416,7 @@ export function Pictures() {
         {c.mode === 'edit' ? (
           <EditDesk
             prompt={c.prompt}
-            onPrompt={(prompt) => store.patch({ prompt })}
+            onPrompt={writePrompt}
             promptRef={promptRef}
             recipe={recipe}
             source={c.source}
@@ -2109,6 +2446,7 @@ export function Pictures() {
                 addOnsAccepted: c.addOnsAccepted.filter((f) => f !== file),
               })
             }
+            onRemoveAddOn={dropAddOn}
             onEditRegion={
               c.source && c.source.name && canRefine
                 ? () => void openRefineFromSource(c.source!)
@@ -2121,7 +2459,7 @@ export function Pictures() {
             prompt={c.prompt}
             look={look as Look}
             anatomy={anatomy}
-            onPrompt={(prompt) => store.patch({ prompt })}
+            onPrompt={writePrompt}
             onLook={setLook}
             onAnatomy={(next) => {
               setAnatomySaid(true)
@@ -2139,8 +2477,13 @@ export function Pictures() {
                 addOnsAccepted: c.addOnsAccepted.filter((f) => f !== file),
               })
             }
+            onRemoveAddOn={dropAddOn}
             recipe={recipe}
-            source={c.source}
+            // A picture left in the store after choosing "From words" is not
+            // used by the run, so it is not shown either: the well, the "The
+            // change" label and the "Make the change" button all follow what
+            // the run will actually do. Switching back brings it back.
+            source={needsSource(c.mode) ? c.source : null}
             needsSource={c.mode === 'i2i'}
             // Reachable now that the mode control is on the page rather than buried
             // in More: a reader can ask to work from a picture before handing one
@@ -2202,9 +2545,8 @@ export function Pictures() {
             {refineStyle && (
               <p className="mb-3 text-caption leading-snug text-grey-700">
                 <Kicker className="block">Drawn by {refineStyle.label}</Kicker>
-                {refineBorrows
-                  ? `${refineSource?.madeBy ?? 'The model this desk is set to'} cannot redraw a region, so the area is drawn by ${refineStyle.label} at its own settings. The rest of the picture is untouched, and your add-ons are held back because they were chosen for a different model.`
-                  : 'The area is redrawn by the same model, at its own settings, with your add-ons applied.'}
+                {refineWhy} It works at its own settings and the rest of the picture is untouched.{' '}
+                {refineCarries}
               </p>
             )}
             {refineResult && (
@@ -2223,7 +2565,7 @@ export function Pictures() {
                 // there is a real choice; a one-model machine sees no picker.
                 options: [
                   ...(refineOptions.length > 1 && refineDefault
-                    ? [{ id: '', label: `Follow the desk: ${refineDefault.label}`, group: '' }]
+                    ? [{ id: '', label: `Suggested: ${refineDefault.label}`, group: '' }]
                     : []),
                   ...refineOptions.map((o) => ({
                     id: `${o.def.id}::${o.model}`,
@@ -2236,11 +2578,23 @@ export function Pictures() {
                     ? refinePick
                     : '',
                 onChange: (id: string) => setRefinePick(id || null),
-                note: refineBorrows
-                  ? refineSource?.madeBy
-                    ? `This picture was made with ${refineSource.madeBy}, which cannot redraw a region. This one will.`
-                    : 'The model this desk is set to cannot redraw a region. This one will.'
-                  : null,
+                // Said under the picker only when the picture's own model is
+                // not the one drawing, which is the case the reader asks about.
+                note:
+                  refineSource?.maker && !refinePick && !sameStyle(refineStyle, refineMaker)
+                    ? refineWhy
+                    : null,
+              }}
+              addOns={{
+                options: regionOffers.map((o) => ({
+                  id: o.file,
+                  label: o.label,
+                  strength: o.strength,
+                  why: o.why,
+                })),
+                picked: refinePicked,
+                onToggle: (id: string) =>
+                  setRefinePicked((was) => (was.includes(id) ? was.filter((f) => f !== id) : [...was, id])),
               }}
               source={refineSource}
               parentPrompt={refineSource?.prompt ?? ''}
@@ -2269,7 +2623,8 @@ export function Pictures() {
               adopted={adopted}
               examples={c.prompt.trim() ? [] : EXAMPLES}
               onExample={(ex) => {
-                store.patch({ prompt: ex.prompt })
+                // A new composition, so the add-on decisions for the old one go.
+                store.patch({ prompt: ex.prompt, addOnsAccepted: [], addOnsDeclined: [] })
                 setLook(ex.look)
                 promptRef.current?.focus()
               }}
@@ -2303,6 +2658,7 @@ export function Pictures() {
                   height: current.height ?? undefined,
                 }}
                 def={resultDef}
+                rebuild={rebuildable(current)}
                 canSource={canI2I}
                 facts={facts.get(current.id) ?? null}
                 busy={running}
@@ -2399,6 +2755,7 @@ function EditDesk({
   onMoreOpenChange,
   onAcceptAddOn,
   onDeclineAddOn,
+  onRemoveAddOn,
   onEditRegion,
   sourceReading,
 }: {
@@ -2414,6 +2771,8 @@ function EditDesk({
   /** Add-ons that fit the instruction model. Offered, never applied without a decision. */
   onAcceptAddOn?: (file: string) => void
   onDeclineAddOn?: (file: string) => void
+  /** Take an added add-on off again. */
+  onRemoveAddOn?: (file: string) => void
   /** Open the region bench on the attached picture. Omit it and nothing is printed. */
   onEditRegion?: () => void
   /** A reading of the attached picture, printed under the well. */
@@ -2478,8 +2837,14 @@ function EditDesk({
           {source && sourceReading ? <div className="mt-2">{sourceReading}</div> : null}
         </div>
 
-        {recipe.ok && recipe.offers.length > 0 && onAcceptAddOn && onDeclineAddOn && (
-          <AddOnOffers offers={recipe.offers} onAccept={onAcceptAddOn} onDecline={onDeclineAddOn} />
+        {recipe.ok && onAcceptAddOn && onDeclineAddOn && (
+          <AddOnOffers
+            offers={recipe.offers}
+            applied={recipe.loras.filter((l) => !l.measured)}
+            onAccept={onAcceptAddOn}
+            onDecline={onDeclineAddOn}
+            onRemove={onRemoveAddOn}
+          />
         )}
 
         <div>

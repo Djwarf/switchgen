@@ -135,6 +135,7 @@ export function AdvancedPanel({
   onPinModel,
   faultNode = null,
   onCatalogueChange,
+  onDropAddOn,
   onClose,
 }: {
   recipe: Recipe
@@ -153,6 +154,12 @@ export function AdvancedPanel({
   faultNode?: string | null
   /** A family's files landed; the desk should re-read what is installed. */
   onCatalogueChange?: () => void
+  /**
+   * Withdraw an add-on the reader added on the main screen. Removing one here
+   * used to set only a stack override, which "Go back to the picks" undid
+   * while the add stayed on file, so the add-on came straight back.
+   */
+  onDropAddOn?: (file: string) => void
   /** Back to the three questions. */
   onClose: () => void
 }) {
@@ -245,6 +252,7 @@ export function AdvancedPanel({
             overridden={loraOverridden}
             onStack={(next: LoraStack) => set('loras', next)}
             onRestore={() => clear('loras')}
+            onDropAddOn={onDropAddOn}
             onLibraryReload={onLibraryReload}
             measuredOn={MEASURED_ON}
           />
