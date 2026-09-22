@@ -40,6 +40,7 @@ import { useCallback, useMemo, useState } from 'react'
 import { EMPTY_LIBRARY, type LoraLibrary, type LoraStack } from '../../lib/loras'
 import { MEASURED, MEASURED_ON, type Recipe } from '../../lib/recipe'
 import { Caution, Fault, Head, Kicker, Link, Note, Source } from './bits'
+import { CataloguePanel } from './CataloguePanel'
 import { LoraPanel } from './LoraPanel'
 import { ModelPanel } from './ModelPanel'
 import {
@@ -56,6 +57,7 @@ import { PassPanel } from './PassPanel'
 import { SamplingPanel } from './SamplingPanel'
 import { WorkflowPeek } from './WorkflowPeek'
 
+export { CataloguePanel } from './CataloguePanel'
 export { LoraPanel } from './LoraPanel'
 export { ModelPanel } from './ModelPanel'
 export { PassPanel } from './PassPanel'
@@ -132,6 +134,7 @@ export function AdvancedPanel({
   pinnedModel = null,
   onPinModel,
   faultNode = null,
+  onCatalogueChange,
   onClose,
 }: {
   recipe: Recipe
@@ -148,6 +151,8 @@ export function AdvancedPanel({
   /** Pin a file and decide again with it, or null to drop the pin. */
   onPinModel?: (model: string | null) => void
   faultNode?: string | null
+  /** A family's files landed; the desk should re-read what is installed. */
+  onCatalogueChange?: () => void
   /** Back to the three questions. */
   onClose: () => void
 }) {
@@ -229,6 +234,8 @@ export function AdvancedPanel({
             onPin={(m) => onPinModel?.(m)}
             measured={MEASURED_ON}
           />
+
+          {onCatalogueChange ? <CataloguePanel modes={['image', 'edit']} onInstalled={onCatalogueChange} /> : null}
 
           <LoraPanel
             plan={plan}

@@ -26,6 +26,7 @@
  * can never stop somebody else's picture.
  */
 
+import { CataloguePanel } from '../components/advanced/CataloguePanel'
 import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
 import { measureImage as measure } from '../lib/images'
@@ -411,6 +412,11 @@ let cataloguePromise: Promise<Catalogue> | null = null
  * Read once per page load, not once per visit to the desk. A failed read is
  * forgotten, so the retry is a real retry and not the same rejected promise.
  */
+/** Forget the cached catalogue, so the next read sees files that just landed. */
+export function resetCatalogue(): void {
+  cataloguePromise = null
+}
+
 function catalogue(): Promise<Catalogue> {
   if (!cataloguePromise) {
     cataloguePromise = loadCatalogue().catch((err: unknown) => {
@@ -1862,6 +1868,16 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                   The card has {gb(cat.vramFree)} free right now.
                 </p>
               ) : null}
+
+              <div className="mt-4 border-t border-grey-300 pt-3">
+                <CataloguePanel
+                  modes={['video']}
+                  onInstalled={() => {
+                    resetCatalogue()
+                    setAttempt((a) => a + 1)
+                  }}
+                />
+              </div>
             </div>
           ) : null}
         </aside>

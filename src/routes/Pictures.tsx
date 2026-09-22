@@ -2004,6 +2004,7 @@ export function Pictures() {
         schedulers={cat?.schedulers ?? []}
         pinnedModel={pinned}
         onPinModel={setPinned}
+        onCatalogueChange={() => load(true)}
         faultNode={state.fault?.node ?? null}
         onClose={() => settings.patch({ expert: false })}
       />
