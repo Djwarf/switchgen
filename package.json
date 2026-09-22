@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "validate": "tsx scripts/validate-workflows.ts"
+    "validate": "tsx scripts/validate-workflows.ts",
+    "index-loras": "tsx scripts/index-loras.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

@@ -1,14 +1,25 @@
 /**
  * The Pictures desk.
  *
- * One room, three intents: from words (text to image), from a picture
- * (image to image) and change a picture (instruction editing). The intent is a
- * tab, not a hidden mode, and each one reconfigures the rail rather than
- * revealing a different screen.
+ * The default screen asks for three things: a prompt, a look, and how much
+ * anatomy. Everything else is DECIDED, by lib/recipe.ts, from measurements:
+ * which family, which weight file, which LoRAs at which strengths, the prompt
+ * prefix that file was trained with, the sampler and the size. What was chosen
+ * and why is printed in prose under the button, not offered as forty controls
+ * above it.
  *
- * Simple mode shows five controls and runs the registry's verified recipe.
- * Expert mode fills the left margin with the same values, already carrying
- * whatever simple mode chose, so the margin doubles as the explanation.
+ * Nothing was removed to get there. Three destinations hold what used to sit on
+ * this screen:
+ *
+ *   components/compose   the three answers, the button, the prose, the footnote
+ *   components/advanced  every model, every LoRA, every strength, the sampler,
+ *                        the size, the seed, the passes and the workflow JSON,
+ *                        mounted only while More is open
+ *   components/result    the quality passes, offered on the finished picture
+ *                        where the reader can see whether they are needed
+ *
+ * This file is what remains: the catalogue, the job engine, the plate, the
+ * refine bench, the archive picker, and the wiring between them.
  *
  * The job engine lives at module scope, below the imports. A desk that keeps
  * its progress while you read the archive is the difference between a tool and
@@ -22,7 +33,6 @@ import {
   useState,
   useSyncExternalStore,
   type DragEvent as ReactDragEvent,
-  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type RefObject,
 } from 'react'
@@ -45,14 +55,15 @@ import {
   BY_ID,
   IMG2IMG,
   defaultsFor,
+  deriveImg2Img,
   instantiate,
   modelsOf,
   sidecarsOf,
   type FamilyDef,
+  type Params,
 } from '../lib/workflows'
 import {
   feasibility,
-  gb,
   modelFiles,
   probeHardware,
   type Hardware,
@@ -68,9 +79,8 @@ import {
   type HistoryEntry,
 } from '../lib/history'
 import {
-  MODE_LABEL,
   adoptValue,
-  applyDefaults,
+  compositionFromEntry,
   deskStore,
   needsSource,
   randomSeed,
@@ -78,8 +88,6 @@ import {
   settings,
   toParams,
   type Composition,
-  type CompositionParams,
-  type FamilyDefaults,
   type Mode,
   type SourceRef,
 } from '../lib/session'
@@ -88,79 +96,51 @@ import {
   deriveAutoDetail,
   deriveHiresFix,
   deriveRefine,
-  hiresSize,
   hiresStepsFor,
   instantiateRefine,
   withLoras,
   writeExtras,
-  type Capabilities,
   type DerivedDef,
   type LoraSpec,
 } from '../lib/refine'
-import { resolveStack } from '../lib/loras'
-import { LoraRack, useLoraRack } from '../components/loras'
+import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary } from '../lib/loras'
+import {
+  LOOKS,
+  decide,
+  suggestAnatomy,
+  type AnatomyLevel,
+  type Look,
+  type PassOffer,
+  type Recipe,
+  type RecipeNote,
+} from '../lib/recipe'
 import { RegionRefine, type RefineRequest } from '../components/refine'
 import {
-  INTENTS,
-  anatomyNote,
-  briefFrom,
-  intentReport,
-  mismatchHint,
-  promptStyleNote,
-  type Brief,
-  type Intent,
-  type IntentReport,
-  type Recommendation,
-} from '../lib/intent'
+  ComposeDesk,
+  Hairline,
+  MoreFootnote,
+  PromptField,
+  RunButton,
+  SourceWell,
+  Choice,
+} from '../components/compose'
+import {
+  AdvancedPanel,
+  NO_PASSES,
+  buildGraph,
+  settle,
+  useOverrides,
+  type Overrides,
+  type Passes,
+} from '../components/advanced'
+import { ResultActions } from '../components/result'
+import { INTENTS, intentReport, type Intent } from '../lib/intent'
 
 // ---------------------------------------------------------------------------
 // Vocabulary
 // ---------------------------------------------------------------------------
 
 const DESK = 'images' as const
-const DESK_MODES: Mode[] = ['t2i', 'i2i', 'edit']
-
-type Stop = { key: string; label: string; denoise: number; help: string }
-
-/** "How much to change", in the order a person thinks about it. */
-const STOPS: Stop[] = [
-  {
-    key: 'touch',
-    label: 'Touch up',
-    denoise: 0.25,
-    help: 'Keeps your picture. Changes the surface and the detail.',
-  },
-  {
-    key: 'rework',
-    label: 'Rework',
-    denoise: 0.45,
-    help: 'Keeps the composition and the colours.',
-  },
-  {
-    key: 'reimagine',
-    label: 'Reimagine',
-    denoise: 0.65,
-    help: 'Keeps the rough layout only.',
-  },
-  {
-    key: 'over',
-    label: 'Start over',
-    denoise: 0.85,
-    help: 'Uses your picture as a loose hint.',
-  },
-]
-const DEFAULT_DENOISE = 0.65
-
-/** Output budget for image-to-image, where the source dictates the shape. */
-const MEGAPIXELS = [0.6, 1.0, 1.4, 2.0]
-
-type ShapeSpec = { key: string; label: string; ratio: number }
-const SHAPES: ShapeSpec[] = [
-  { key: 'portrait', label: 'Portrait', ratio: 2 / 3 },
-  { key: 'square', label: 'Square', ratio: 1 },
-  { key: 'landscape', label: 'Landscape', ratio: 3 / 2 },
-  { key: 'wide', label: 'Wide', ratio: 16 / 9 },
-]
 
 /**
  * Plain names for the weight files. A reader chooses a style, not a quant.
@@ -190,22 +170,11 @@ const STAGES: [RegExp, string][] = [
   [/^SaveImage$/, 'Writing the file'],
 ]
 
-const EXAMPLES: { prompt: string; familyId: string; shape: string }[] = [
-  {
-    prompt: 'A rain-slicked tram stop at dusk, neon in the puddles',
-    familyId: 'krea2',
-    shape: 'square',
-  },
-  {
-    prompt: 'A portrait of a woman in a red coat, low winter sun',
-    familyId: 'sdxl-illustrious',
-    shape: 'portrait',
-  },
-  {
-    prompt: 'Steam rising off wet asphalt at first light',
-    familyId: 'z-image',
-    shape: 'wide',
-  },
+/** Openers for an empty plate. Each one sets the prompt and the look, nothing else. */
+const EXAMPLES: { prompt: string; look: Look }[] = [
+  { prompt: 'A rain-slicked tram stop at dusk, neon in the puddles', look: 'photoreal' },
+  { prompt: 'A portrait of a woman in a red coat, low winter sun', look: 'photoreal' },
+  { prompt: 'Steam rising off wet asphalt at first light', look: 'illustration' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -223,11 +192,6 @@ function seconds(ms: number): string {
   return `${m} min ${s}${THIN}s`
 }
 
-function bytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(0)} KB`
-  return `${(n / 1024 ** 2).toFixed(1)} MB`
-}
 
 const DATE = new Intl.DateTimeFormat('en-GB', {
   day: 'numeric',
@@ -264,13 +228,7 @@ function timingNote(records: readonly HistoryEntry[], model: string): string | n
 }
 
 /** A fragment from elsewhere, made into a sentence. */
-function sentence(text: string): string {
-  const t = text.trim().replace(/[.\s]+$/, '')
-  return t ? `${t.charAt(0).toUpperCase()}${t.slice(1)}.` : ''
-}
 
-const round2 = (n: number) => Math.round(n * 100) / 100
-const snap16 = (n: number) => Math.max(16, Math.round(n / 16) * 16)
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 function titleFromFilename(file: string): string {
@@ -443,6 +401,7 @@ function catalogue(reload = false): Promise<Catalogue> {
 // ---------------------------------------------------------------------------
 // The job engine — module scope, so a job outlives a route change
 // ---------------------------------------------------------------------------
+
 
 type DeskJob = {
   id: string
@@ -926,19 +885,6 @@ function Kicker({ children, className = '' }: { children: ReactNode; className?:
   )
 }
 
-function Label({ children, hint }: { children: ReactNode; hint?: string }) {
-  return (
-    <span className="mb-1.5 block text-overline font-semibold uppercase tracking-[0.18em] text-grey-700">
-      {children}
-      {hint && (
-        <span className="ml-2 normal-case tracking-normal text-caption italic text-grey-500">
-          {hint}
-        </span>
-      )}
-    </span>
-  )
-}
-
 /** An editorial link: burgundy, underlined, no button chrome. */
 function Link({
   onClick,
@@ -967,61 +913,6 @@ function Link({
 // Shapes
 // ---------------------------------------------------------------------------
 
-type Shape = ShapeSpec & { width: number; height: number; maker: boolean }
-
-/**
- * Four proportional rectangles, sized against the family's own pixel budget.
- * The bucket nearest the family's default ratio carries the maker's exact
- * numbers, so "Portrait" on Illustrious really is 832 × 1216.
- */
-function shapesFor(style: Style | null): Shape[] {
-  const d = style ? defaultsFor(style.def, style.model) : null
-  const dw = d?.width || 1024
-  const dh = d?.height || 1024
-  const area = dw * dh
-  const ratio = dw / dh
-  const maxSide = style?.maxSide ?? null
-
-  let nearest = 0
-  let best = Infinity
-  SHAPES.forEach((s, i) => {
-    const gap = Math.abs(Math.log(s.ratio) - Math.log(ratio))
-    if (gap < best) {
-      best = gap
-      nearest = i
-    }
-  })
-
-  return SHAPES.map((s, i) => {
-    if (i === nearest) return { ...s, width: dw, height: dh, maker: true }
-    let w = snap16(Math.sqrt(area * s.ratio))
-    let h = snap16(Math.sqrt(area / s.ratio))
-    if (maxSide && Math.max(w, h) > maxSide) {
-      const k = maxSide / Math.max(w, h)
-      w = snap16(w * k)
-      h = snap16(h * k)
-    }
-    return { ...s, width: w, height: h, maker: false }
-  })
-}
-
-// ---------------------------------------------------------------------------
-// Quality passes
-//
-// Three derivations from lib/refine.ts that ride on the ordinary render. Order
-// matters and is not arbitrary:
-//
-//   hires first, because it changes the frame the picture is drawn in,
-//   then the detailers, which work on the finished pixels of that frame,
-//   then the LoRAs, which patch the model every one of those passes samples on.
-//
-// Each derivation returns null when the family cannot carry it, and the fall
-// back here is the graph as it was. The toggles are gated on capabilitiesOf()
-// so a null is never reached from the UI, but a silent fall back beats a crash
-// if a registry change ever makes one of them impossible.
-// ---------------------------------------------------------------------------
-
-type Passes = { face: boolean; hand: boolean; hires: boolean }
 
 /**
  * A finished picture, copied into ComfyUI's input folder and measured, ready
@@ -1039,101 +930,166 @@ type RefineSource = {
   prompt: string
 }
 
-const NO_PASSES: Passes = { face: false, hand: false, hires: false }
-
-function withPasses(def: FamilyDef, passes: Passes, loras: LoraSpec[]): FamilyDef {
-  let out: FamilyDef | DerivedDef = def
-  if (passes.hires) out = deriveHiresFix(out) ?? out
-  if (passes.face) out = deriveAutoDetail(out, 'face') ?? out
-  if (passes.hand) out = deriveAutoDetail(out, 'hand') ?? out
-  if (loras.length) out = withLoras(out, loras) ?? out
-  return out
-}
-
-/**
- * What the passes cost, as a multiple of one plain generation.
- *
- * A detailer runs once per detection, and nobody knows how many faces are in a
- * picture before it is drawn, so the figure assumes one of each. Two people in
- * frame is two face passes. The copy says "at least" for that reason.
- */
-function passCost(passes: Passes): number {
-  let cost = 1
-  if (passes.hires) cost += 1.35
-  if (passes.face) cost += 1
-  if (passes.hand) cost += 1
-  return cost
-}
-
 // ---------------------------------------------------------------------------
-// Two settings the bindings cannot carry
-//
-// Shift and clip skip have no binding in registry.ts and instantiate() writes
-// neither, so both expert rows used to be collected, dropped on the floor, and
-// then filed in the archive as though they had been applied. They are written
-// here by class_type instead, on the instantiated graph, because registry.ts
-// is generated and must not be hand edited. Video.tsx does the shift half the
-// same way, for the same reason.
+// The edit family's plan
 // ---------------------------------------------------------------------------
 
-/** ModelSampling* shift, written by class_type rather than by a binding. */
-function applyShift(wf: ApiWorkflow, shift: number | null | undefined): void {
-  if (shift === null || shift === undefined || !Number.isFinite(shift)) return
-  for (const node of Object.values(wf)) {
-    if (node.class_type.startsWith('ModelSampling') && typeof node.inputs.shift === 'number') {
-      node.inputs.shift = shift
-    }
+/**
+ * decide() ranks image families against a look. Instruction editing is not a
+ * look: exactly one installed model follows an instruction, and picking it is
+ * not a decision anybody needs help with. So the edit desk is handed the same
+ * `Plan` shape, filled from the registry, and every panel behind More reads it
+ * exactly as it reads a decided one.
+ */
+function editRecipe(input: {
+  style: Style
+  prompt: string
+  look: Look
+  anatomy: AnatomyLevel
+  source: string | null
+  seed: number
+  cat: Catalogue
+}): Recipe {
+  const { style, cat } = input
+  const prompt = input.prompt.trim()
+  const def = style.def
+  const d = defaultsFor(def, style.model)
+  const report = intentReport(
+    { intent: input.look as Intent, explicit: input.anatomy !== 'off', mode: 'edit' },
+    { installed: cat.installed, sizes: cat.sizes, hardware: cat.hardware },
+  )
+
+  const params: Params = {
+    model: style.model,
+    positive: style.positivePrefix ? `${style.positivePrefix}${prompt}` : prompt,
+    negative: d.negative ?? '',
+    seed: input.seed,
+    steps: d.steps,
+    cfg: d.cfg,
+    width: d.width,
+    height: d.height,
+    sampler: d.sampler,
+    scheduler: d.scheduler,
+  }
+  if (style.clipSkip != null) params.clipSkip = style.clipSkip
+  if (style.shift != null) params.shift = style.shift
+  if (input.source) params.image = input.source
+
+  const capabilities = capabilitiesOf(def)
+  const warnings: string[] = []
+  if (style.verdict && style.verdict.level !== 'ok') warnings.push(style.verdict.reason)
+  if (input.anatomy !== 'off') {
+    warnings.push(
+      `${style.label} follows instructions; it is not an SDXL booru base. The anatomy LoRAs have nothing to attach to here, so the anatomy setting changes nothing about this edit.`,
+    )
+  }
+
+  const notes: RecipeNote[] = [
+    {
+      kind: 'model',
+      text: `${style.label} is the only installed model that follows an instruction, so changing a picture always uses it.`,
+      measured: false,
+    },
+    {
+      kind: 'source',
+      text: 'Your picture is the frame. Size, shape and composition come from it, not from a size control.',
+      measured: false,
+    },
+    {
+      kind: 'passes',
+      text: 'Faces, hands, a masked region and a larger render are offered on the finished picture, not before it.',
+      measured: false,
+    },
+  ]
+  if (style.note) notes.push({ kind: 'model', text: style.note, measured: false })
+
+  const offer = (available: boolean, why: string): PassOffer => ({ available, auto: false, why })
+
+  return {
+    ok: true,
+    look: input.look,
+    anatomy: input.anatomy,
+    prompt,
+    familyId: def.id,
+    model: style.model,
+    label: style.label,
+    familyLabel: style.group,
+    base: def,
+    def,
+    params,
+    loras: [],
+    sharpness: null,
+    missingLoras: [],
+    refineLoras: [],
+    passes: {
+      face: offer(
+        capabilities.faceDetail,
+        'Re renders every detected face at 768 and pastes it back.',
+      ),
+      hand: offer(
+        capabilities.handDetail,
+        'Re renders every detected hand with more freedom than a face. Not measured here.',
+      ),
+      refine: offer(
+        capabilities.refine,
+        'Draw a mask over a region and it is cropped, upscaled and rendered alone.',
+      ),
+      hires: offer(capabilities.hires, 'Renders the same picture larger, at low denoise.'),
+    },
+    capabilities,
+    notes,
+    warnings,
+    report,
   }
 }
 
-/**
- * CLIPSetLastLayer, likewise.
- *
- * ComfyUI counts from the end, so the value is negative: -1 is the last layer,
- * -2 the one before it, which is what the Illustrious and Pony checkpoints
- * were trained against. Anything else would be written straight through, so it
- * is clamped to the range the node accepts.
- */
-function applyClipSkip(wf: ApiWorkflow, clipSkip: number | null | undefined): void {
-  if (clipSkip === null || clipSkip === undefined || !Number.isFinite(clipSkip)) return
-  const layer = clamp(Math.round(clipSkip), -24, -1)
-  for (const node of Object.values(wf)) {
-    if (
-      node.class_type === 'CLIPSetLastLayer' &&
-      typeof node.inputs.stop_at_clip_layer === 'number'
-    ) {
-      node.inputs.stop_at_clip_layer = layer
-    }
+/** Waiting for the model list, in the shape the desk already knows how to print. */
+function waitingRecipe(prompt: string, look: Look, anatomy: AnatomyLevel, why: string): Recipe {
+  return {
+    ok: false,
+    look,
+    anatomy,
+    prompt,
+    reason: why,
+    report: intentReport({ intent: look as Intent, explicit: anatomy !== 'off', mode: 'image' }, {}),
+    notes: [],
+    warnings: [],
   }
 }
 
-/**
- * The graph exactly as it will be queued.
- *
- * One function, called by the run button and by "Show the workflow" alike, so
- * the JSON on screen cannot drift from the JSON that goes to the server. The
- * second pass runs fewer steps than the first; see hiresStepsFor.
- */
-function buildQueued(
-  def: FamilyDef | DerivedDef,
-  params: CompositionParams,
-  hires: boolean,
-): ApiWorkflow {
-  const wf = instantiate(def, params)
-  if (hires && 'derived' in def) {
-    writeExtras(wf, def as DerivedDef, { hiresSteps: hiresStepsFor(params.steps) })
-  }
-  applyShift(wf, params.shift)
-  applyClipSkip(wf, params.clipSkip)
-  return wf
-}
+/** The three modes, as a choice, printed only inside the advanced panel. */
+const MODE_CHOICES: readonly { id: Mode; label: string; blurb: string }[] = [
+  { id: 't2i', label: 'From words', blurb: 'A picture from the prompt alone.' },
+  {
+    id: 'i2i',
+    label: 'From a picture',
+    blurb: 'Redraw a picture you hand it. Dropping or pasting one on the page does this without coming here.',
+  },
+  {
+    id: 'edit',
+    label: 'Change a picture',
+    blurb: 'Say what to change and the edit model follows the instruction.',
+  },
+]
+
+/** Overrides a caption figure can be adopted into. */
+const ADOPTABLE = new Set<string>([
+  'width',
+  'height',
+  'steps',
+  'cfg',
+  'sampler',
+  'scheduler',
+  'seed',
+  'denoise',
+  'megapixels',
+  'shift',
+  'clipSkip',
+])
 
 // ---------------------------------------------------------------------------
 // The desk
 // ---------------------------------------------------------------------------
-
-/** Which picture style the reader was on before they went to edit a picture. */
-let lastPictureStyle: { familyId: string; model: string } | null = null
 
 export function Pictures() {
   const c = useComposition()
@@ -1150,17 +1106,37 @@ export function Pictures() {
   const [dragging, setDragging] = useState(false)
   const [picking, setPicking] = useState(false)
   const [adopted, setAdopted] = useState<string | null>(null)
-  const [focusField, setFocusField] = useState<string | null>(null)
   const [offline, setOffline] = useState(() => connectionState() === 'closed')
   const [ahead, setAhead] = useState(0)
   const [retryIn, setRetryIn] = useState(5)
 
-  // Quality passes, the region refine surface and the reader's override of the
-  // brief the prompt implies. None of these belong in Composition: session.ts
-  // is another agent's file and a desk-local preference does not need filing.
-  const [passes, setPasses] = useState<Passes>(NO_PASSES)
-  const [intentPick, setIntentPick] = useState<Intent | null>(null)
-  const [explicitPick, setExplicitPick] = useState<boolean | null>(null)
+  // --- the three answers --------------------------------------------------
+  /**
+   * Held as `Intent`, not as `Look`.
+   *
+   * The look picker offers three, which is the right number for a screen with
+   * three answers on it. intent.ts ranks against four: cartoon is a real
+   * routing dimension, western toon styling against Japanese cel shading, and
+   * dropping it would delete a capability rather than move one. So the fourth
+   * lives on the full picker behind More, and the state is wide enough to hold
+   * it.
+   */
+  const [look, setLook] = useState<Intent>('photoreal')
+  const [anatomy, setAnatomy] = useState<AnatomyLevel>(() => suggestAnatomy(store.get().prompt))
+  /** True once the reader has said what they want. Until then the prompt hints. */
+  const [anatomySaid, setAnatomySaid] = useState(false)
+
+  // --- everything else, mounted only while More is open -------------------
+  const ov = useOverrides()
+  const [pinned, setPinned] = useState<string | null>(null)
+  const [lib, setLib] = useState<LoraLibrary>(EMPTY_LIBRARY)
+  /**
+   * Held rather than rolled inside decide(), so the seed on the sampling panel
+   * does not change under the reader on every keystroke. A new one is drawn at
+   * the press, unless they locked it.
+   */
+  const [seed0, setSeed0] = useState(() => randomSeed())
+
   const [refining, setRefining] = useState(false)
   const [refineSource, setRefineSource] = useState<RefineSource | null>(null)
   const [refineResult, setRefineResult] = useState<HistoryEntry | null>(null)
@@ -1190,7 +1166,7 @@ export function Pictures() {
     load()
   }, [load])
 
-  // The desk recovers on its own when ComfyUI comes back — no reload.
+  // The desk recovers on its own when ComfyUI comes back. No reload.
   useEffect(() => {
     if (!catError) return
     let left = 5
@@ -1207,6 +1183,21 @@ export function Pictures() {
   }, [catError, load])
 
   useEffect(() => watchConnection((s) => setOffline(s === 'closed')), [])
+
+  // The LoRA catalogue, read once. Until it lands the recipe resolves nothing
+  // and says so in print rather than pretending the stack was applied.
+  useEffect(() => {
+    let alive = true
+    loadLoraLibrary().then(
+      (next) => {
+        if (alive) setLib(next)
+      },
+      () => {},
+    )
+    return () => {
+      alive = false
+    }
+  }, [])
 
   // --- what is in front of us in the single queue -------------------------
   useEffect(() => {
@@ -1233,346 +1224,183 @@ export function Pictures() {
   const styles = useMemo(() => cat?.styles ?? [], [cat])
   const pictureStyles = useMemo(() => styles.filter((s) => s.def.mode === 'image'), [styles])
   const editStyle = useMemo(() => styles.find((s) => s.def.mode === 'edit') ?? null, [styles])
+
+  // An intent nothing installed can serve is corrected out loud.
+  useEffect(() => {
+    if (!cat || !cat.styles.length) return
+    if (c.mode === 'edit' && !editStyle) store.patch({ mode: 't2i' })
+  }, [cat, c.mode, editStyle])
+
+  /**
+   * A record reused from the Archive, taken up as a pin and a set of overrides.
+   *
+   * "Use these settings" writes a whole composition into this desk's draft:
+   * the model, the steps, the CFG, the sampler, the seed, the size. The recipe
+   * decides all of that now, so without this the values would be written and
+   * then silently ignored, which is the worst of the three possible behaviours.
+   *
+   * `touched` is exactly the set reuseIntoDesk marks, so it is read once,
+   * turned into a pinned model and the matching overrides, cleared, and said
+   * out loud. Nothing here happens quietly: the notice names the model that was
+   * pinned and the panel prints how many values were set by hand.
+   */
+  const reuseTaken = useRef(false)
+  useEffect(() => {
+    if (!c.touched.length) {
+      reuseTaken.current = false
+      return
+    }
+    if (reuseTaken.current) return
+    reuseTaken.current = true
+
+    const next: Overrides = {}
+    for (const f of c.touched) {
+      if (f === 'steps') next.steps = c.steps
+      else if (f === 'cfg') next.cfg = c.cfg
+      else if (f === 'sampler') next.sampler = c.sampler
+      else if (f === 'scheduler') next.scheduler = c.scheduler
+      else if (f === 'negative' && c.negative != null) next.negative = c.negative
+      else if (f === 'width') next.width = c.width
+      else if (f === 'height') next.height = c.height
+      else if (f === 'seed') {
+        next.seed = c.seed
+        next.seedLocked = c.seedLocked
+      } else if (f === 'denoise' && c.denoise != null) next.denoise = c.denoise
+      else if (f === 'megapixels' && c.megapixels != null) next.megapixels = c.megapixels
+      else if (f === 'shift' && c.shift != null) next.shift = c.shift
+      else if (f === 'clipSkip' && c.clipSkip != null) next.clipSkip = c.clipSkip
+    }
+
+    ov.set(next)
+    if (c.model) setPinned(c.model)
+    store.patch({ touched: [] })
+    setCorrection(
+      `Settings loaded from a finished picture. ${
+        c.model ? `${PLAIN_NAMES[c.model] ?? titleFromFilename(c.model)} is pinned and ` : ''
+      }${Object.keys(next).length} values are set by hand. Open More to see them, or put them back there.`,
+    )
+    // Read once, on the composition that arrived. Re-running this on every
+    // keystroke would fight the reader.
+
+  }, [c.touched])
+
+  // The prompt proposes an anatomy level until the reader states one. It never
+  // proposes `emphasised`: that stack measured below base, so it is a choice
+  // somebody makes, not one made for them.
+  useEffect(() => {
+    if (anatomySaid) return
+    const want = suggestAnatomy(c.prompt)
+    setAnatomy((was) => (was === want ? was : want))
+  }, [c.prompt, anatomySaid])
+
+  // --- the recipe ---------------------------------------------------------
+  const sourceName = c.source?.name ?? ''
+  const usingSource = needsSource(c.mode) && !!sourceName
+
+  const recipe: Recipe = useMemo(() => {
+    if (!cat) {
+      return waitingRecipe(c.prompt, look as Look, anatomy, 'Reading the model list from ComfyUI.')
+    }
+    if (c.mode === 'edit') {
+      if (!editStyle) {
+        return waitingRecipe(
+          c.prompt,
+          look as Look,
+          anatomy,
+          'No instruction editing model is installed, so a picture cannot be changed by describing the change.',
+        )
+      }
+      return editRecipe({
+        style: editStyle,
+        prompt: c.prompt,
+        look: look as Look,
+        anatomy,
+        source: sourceName || null,
+        seed: seed0,
+        cat,
+      })
+    }
+    return decide({
+      prompt: c.prompt,
+      look: look as Look,
+      anatomy,
+      sourceImage: usingSource ? sourceName : undefined,
+      hardware: cat.hardware,
+      sizes: cat.sizes,
+      installed: pinned ? [pinned] : cat.installed,
+      loras: lib,
+      seed: seed0,
+    })
+  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, lib, seed0, editStyle])
+
+  const plan = recipe.ok ? recipe : null
+
+  /** The recipe with whatever the reader took back by hand folded onto it. */
+  const settled = useMemo(() => (plan ? settle(plan, ov.value, lib) : null), [plan, ov.value, lib])
+
+  /** The catalogue row for the chosen file, for the plate's dagger and the bench. */
   const style = useMemo(
-    () => styles.find((s) => s.model === c.model && s.def.id === c.familyId) ?? null,
-    [styles, c.model, c.familyId],
+    () => (plan ? (styles.find((s) => s.def.id === plan.familyId && s.model === plan.model) ?? null) : null),
+    [styles, plan],
   )
 
-  const applyStyle = useCallback((next: Style) => {
-    const d = defaultsFor(next.def, next.model)
-    const current = store.get()
-    const fd: FamilyDefaults = {
-      familyId: next.def.id,
-      model: next.model,
-      steps: d.steps || current.steps,
-      cfg: typeof d.cfg === 'number' ? d.cfg : current.cfg,
-      width: d.width || current.width,
-      height: d.height || current.height,
-      sampler: d.sampler || current.sampler,
-      scheduler: d.scheduler || current.scheduler,
-      negative: d.negative || undefined,
-      clipSkip: next.clipSkip ?? undefined,
-      positivePrefix: next.positivePrefix ?? undefined,
-    }
-    const applied = applyDefaults(current, fd)
-    const touched = new Set(applied.touched)
-    store.set({
-      ...applied,
-      shift: touched.has('shift') ? applied.shift : next.shift,
-      megapixels: touched.has('megapixels')
-        ? applied.megapixels
-        : round2(((d.width || 1024) * (d.height || 1024)) / 1e6),
-    })
-  }, [])
+  const houseNegative = style ? (defaultsFor(style.def, style.model).negative ?? '') : ''
+  const timing = useMemo(() => timingNote(records, plan?.model ?? ''), [records, plan])
 
-  // Settle on a style that exists. A draft naming an uninstalled file is a
-  // correction, not a silent swap.
-  useEffect(() => {
-    if (!cat || !cat.styles.length) return
-    const known = cat.styles.some((s) => s.model === c.model && s.def.id === c.familyId)
-    if (known) return
-    const want = c.mode === 'edit' ? editStyle : (pictureStyles[0] ?? editStyle)
-    if (!want) return
-    if (c.model) {
-      setCorrection(
-        `${PLAIN_NAMES[c.model] ?? titleFromFilename(c.model)} is not installed any more. We loaded ${want.label} instead. Your prompt and settings are untouched.`,
-      )
-    }
-    applyStyle(want)
-    // Deliberately keyed on the catalogue alone: this runs when the model list
-    // lands, not every time the reader changes style.
-
-  }, [cat])
-
-  // An intent the installed style cannot serve is corrected out loud, never by
-  // quietly running something else.
-  useEffect(() => {
-    if (!cat || !cat.styles.length) return
-    if (c.mode === 'i2i' && c.familyId && !IMG2IMG[c.familyId]) store.patch({ mode: 't2i' })
-    if (c.mode === 'edit' && !editStyle) store.patch({ mode: 't2i' })
-  }, [cat, c.mode, c.familyId, editStyle])
-
-  // --- capability ---------------------------------------------------------
-  const canI2I = !!(c.familyId && IMG2IMG[c.familyId])
-  /**
-   * Whether the *tab* can be offered, which is a different question while the
-   * reader is on the edit family: leaving edit restores their picture style,
-   * and that is the style the tab would run.
-   */
-  const tabI2I =
-    c.mode === 'edit'
-      ? !!pictureStyles.find(
-          (s) =>
-            s.def.id === (lastPictureStyle?.familyId ?? pictureStyles[0]?.def.id) &&
-            IMG2IMG[s.def.id],
-        )
-      : canI2I
-  const i2iAlternative = useMemo(
-    () => pictureStyles.find((s) => IMG2IMG[s.def.id]) ?? null,
+  const canI2I = useMemo(
+    () => pictureStyles.some((s) => IMG2IMG[s.def.id] ?? deriveImg2Img(s.def)),
     [pictureStyles],
   )
-
-  const activeDef: FamilyDef | null = useMemo(() => {
-    if (!c.familyId) return null
-    if (c.mode === 'i2i') return IMG2IMG[c.familyId] ?? null
-    return BY_ID[c.familyId] ?? null
-  }, [c.familyId, c.mode])
-
-  const hasNegative = !!activeDef?.bindings.negative
-  const hasScheduler = !!activeDef?.bindings.scheduler
-  const hasSize = !!activeDef?.bindings.width
-  // Both rows are gated on a node that can actually receive the value, and on
-  // the input existing on it: ModelSamplingDiscrete is a ModelSampling* node
-  // with no shift at all. The test is the same one applyShift and applyClipSkip
-  // use, so the control, the graph and the archive record cannot disagree.
-  const hasShift = !!activeDef && Object.values(activeDef.graph).some(
-    (n) => n.class_type.startsWith('ModelSampling') && typeof n.inputs.shift === 'number',
-  )
-  const hasClipSkip = !!activeDef && Object.values(activeDef.graph).some(
-    (n) => n.class_type === 'CLIPSetLastLayer' && typeof n.inputs.stop_at_clip_layer === 'number',
-  )
-
-  const shapes = useMemo(() => shapesFor(style), [style])
-  const houseNegative = style ? (defaultsFor(style.def, style.model).negative ?? '') : ''
-
-  // --- quality passes, LoRAs and the brief --------------------------------
-
-  /** The plain text-to-image graph, which is what a refine crop is drawn with. */
-  const baseDef: FamilyDef | null = useMemo(
-    () => (c.familyId ? (BY_ID[c.familyId] ?? null) : null),
-    [c.familyId],
-  )
-
-  /** What the graph in front of us can actually carry. Never guessed. */
-  const caps: Capabilities | null = useMemo(
-    () => (activeDef ? capabilitiesOf(activeDef) : null),
-    [activeDef],
-  )
-  /**
-   * Which style draws the region.
-   *
-   * Normally the one in the picker. But the edit family, which is the "change a
-   * picture" the user relies on, cannot carry a refine pass at all: its
-   * conditioning carries reference latents that a detached crop would misread,
-   * so deriveRefine returns null for it. Refusing to refine an edited picture
-   * would leave exactly the pictures with the worst anatomy unfixable, so the
-   * bench falls back to the picture style the reader was last on and says so in
-   * print. Rendering a region with a different checkpoint from the frame around
-   * it is ordinary inpainting practice; doing it without saying so is not.
-   */
-  const refineStyle = useMemo(() => {
-    if (style && deriveRefine(style.def)) return style
-    const back = pictureStyles.find(
-      (s) => s.def.id === lastPictureStyle?.familyId && s.model === lastPictureStyle?.model,
-    )
-    if (back && deriveRefine(back.def)) return back
-    return pictureStyles.find((s) => deriveRefine(s.def) !== null) ?? null
-  }, [style, pictureStyles])
-
-  const canRefine = !!refineStyle
-
-  /** True when the region will be drawn by something other than the picker's style. */
-  const refineBorrows =
-    !!refineStyle && !!style && (refineStyle.def.id !== style.def.id || refineStyle.model !== style.model)
-
-  // A pass the style cannot carry must not stay switched on behind the scenes.
-  useEffect(() => {
-    if (!caps) return
-    setPasses((p) => {
-      const next = {
-        face: p.face && caps.faceDetail,
-        hand: p.hand && caps.handDetail,
-        hires: p.hires && caps.hires,
-      }
-      return next.face === p.face && next.hand === p.hand && next.hires === p.hires ? p : next
-    })
-  }, [caps])
-
-  const rack = useLoraRack(baseDef, c.model)
-
-  /**
-   * The stack is resolved twice, once per pass. A LoRA catalogued as close
-   * framing work does almost nothing across a whole body and does its whole
-   * job inside the crop, so resolveStack holds it back from the first render
-   * and hands it over for the refine. `noLora` is the reader saying: none.
-   */
-  const basePick = useMemo(
-    () => resolveStack(c.noLora ? [] : rack.stack, rack.lib, rack.target, 'base'),
-    [c.noLora, rack.stack, rack.lib, rack.target],
-  )
-  const refinePick = useMemo(
-    () => resolveStack(c.noLora ? [] : rack.stack, rack.lib, rack.target, 'refine'),
-    [c.noLora, rack.stack, rack.lib, rack.target],
-  )
-
-  /**
-   * The family graph with the passes derived and the LoRAs patched in: what
-   * the button will queue, and what "Show the workflow" must show. Built once
-   * so the two cannot disagree.
-   */
-  const queuedDef: FamilyDef | DerivedDef | null = useMemo(
-    () => (activeDef ? withPasses(activeDef, passes, basePick.specs) : null),
-    [activeDef, passes, basePick],
-  )
-
-  /**
-   * The refine graph, LoRAs and all. Null means: do not offer the pass.
-   *
-   * The stack is held back when the region is drawn by a borrowed style: the
-   * rack resolved it against the picker's architecture, and an SDXL LoRA on a
-   * Qwen base loads without error and changes nothing. Sending it anyway would
-   * be a silent lie about what patched the weights.
-   */
-  const refineDef: DerivedDef | null = useMemo(() => {
-    if (!refineStyle) return null
-    const derived = deriveRefine(refineStyle.def)
-    if (!derived) return null
-    if (refineBorrows || !refinePick.specs.length) return derived
-    return withLoras(derived, refinePick.specs) ?? derived
-  }, [refineStyle, refineBorrows, refinePick])
-
-  /**
-   * What the reader is asking for, read out of the prompt and overridable by
-   * hand. Reading it is a hint, never a switch: nothing changes style on its
-   * own because a word matched.
-   */
-  const brief: Brief = useMemo(() => {
-    const guessed = briefFrom(c.prompt, { intent: 'photoreal', explicit: false, mode: 'image' })
-    return {
-      intent: intentPick ?? guessed.intent,
-      explicit: explicitPick ?? guessed.explicit,
-      mode: c.mode === 'edit' ? 'edit' : 'image',
-    }
-  }, [c.prompt, intentPick, explicitPick, c.mode])
-
-  /**
-   * Files this brief could possibly use.
-   *
-   * A model owned by a family of the WRONG mode is filtered out rather than
-   * passed in, because intentReport marks a file as routed only while walking
-   * families of the mode it was asked about. Hand it the edit checkpoint during
-   * an image brief and it reports a perfectly wired, currently running model as
-   * having no verified graph, which is not a small wrong: the whole point of
-   * that list is to name the real gaps.
-   */
-  const installedForBrief = useMemo(() => {
-    if (!cat) return []
-    return cat.installed.filter((m) => {
-      const owner = familyOwning(m)
-      return !owner || owner.mode === (brief.mode ?? 'image')
-    })
-  }, [cat, brief.mode])
-
-  const report = useMemo(() => {
-    if (!cat) return null
-    return intentReport(brief, {
-      installed: installedForBrief,
-      sizes: cat.sizes,
-      hardware: cat.hardware,
-      limit: 4,
-    })
-  }, [brief, cat, installedForBrief])
-
-  /**
-   * Whether the top ranked base can carry the pass that actually fixes small
-   * anatomy. Ranking weighs what a base draws, not what can be done to it
-   * afterwards, so a base can win the list and still be the wrong tool for the
-   * job the user came here with.
-   */
-  const topRefines = useMemo(() => {
-    const top = report?.ranked[0]
-    return top ? deriveRefine(top.def) !== null : true
-  }, [report])
-
-  const mismatch = useMemo(
-    () => (style ? mismatchHint(style.model, brief, style.def) : null),
-    [style, brief],
-  )
-
-  const timing = useMemo(() => timingNote(records, c.model), [records, c.model])
 
   // --- mode ---------------------------------------------------------------
   const setMode = useCallback(
     (mode: Mode) => {
-      const current = store.get()
-      if (mode === current.mode) return
-      if (mode === 'edit') {
-        if (!editStyle) return
-        lastPictureStyle = { familyId: current.familyId, model: current.model }
-        store.patch({ mode, denoise: null, megapixels: null })
-        applyStyle(editStyle)
-        return
-      }
-      if (current.mode === 'edit') {
-        const back =
-          pictureStyles.find(
-            (s) => s.def.id === lastPictureStyle?.familyId && s.model === lastPictureStyle?.model,
-          ) ?? pictureStyles[0]
-        store.patch({ mode })
-        if (back) applyStyle(back)
-      } else {
-        store.patch({ mode })
-      }
-      if (mode === 'i2i') {
-        const now = store.get()
-        store.patch({
-          denoise: now.denoise ?? DEFAULT_DENOISE,
-          megapixels:
-            now.megapixels ??
-            (style ? round2((defaultsFor(style.def, style.model).width * defaultsFor(style.def, style.model).height) / 1e6) : 1),
-        })
-      }
+      if (mode === store.get().mode) return
+      if (mode === 'edit' && !editStyle) return
+      store.patch({ mode })
     },
-    [applyStyle, editStyle, pictureStyles, style],
+    [editStyle],
   )
 
   // --- the source picture -------------------------------------------------
   const clearSource = useCallback(() => {
-    const s = store.get().source
-    if (s?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(s.previewUrl)
-    store.patch({ source: null })
+    const now = store.get()
+    if (now.source?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(now.source.previewUrl)
+    store.patch({ source: null, mode: now.mode === 'i2i' ? 't2i' : now.mode })
     setSourceError(null)
   }, [])
 
-  const takeFile = useCallback(
-    async (file: File) => {
-      if (!file.type.startsWith('image/')) {
-        setSourceError('That file is not a picture. Try a PNG or a JPEG.')
-        return
+  const takeFile = useCallback(async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      setSourceError('That file is not a picture. Try a PNG or a JPEG.')
+      return
+    }
+    setSourceError(null)
+    setUploading(true)
+    const previewUrl = URL.createObjectURL(file)
+    try {
+      const name = await uploadImage(file)
+      const size = await measure(previewUrl)
+      const previous = store.get().source
+      if (previous?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previous.previewUrl)
+      const source: SourceRef = {
+        name,
+        previewUrl,
+        label: file.name,
+        width: size?.width,
+        height: size?.height,
+        bytes: file.size,
       }
-      setSourceError(null)
-      setUploading(true)
-      const previewUrl = URL.createObjectURL(file)
-      try {
-        const name = await uploadImage(file)
-        const size = await measure(previewUrl)
-        const previous = store.get().source
-        if (previous?.previewUrl?.startsWith('blob:')) URL.revokeObjectURL(previous.previewUrl)
-        const source: SourceRef = {
-          name,
-          previewUrl,
-          label: file.name,
-          width: size?.width,
-          height: size?.height,
-          bytes: file.size,
-        }
-        const now = store.get()
-        const mode: Mode =
-          now.mode === 'edit' ? 'edit' : canI2I ? 'i2i' : now.mode
-        store.patch({ source, mode })
-        if (mode === 'i2i') {
-          store.patch({ denoise: store.get().denoise ?? DEFAULT_DENOISE })
-        }
-      } catch (err) {
-        URL.revokeObjectURL(previewUrl)
-        const status = err instanceof Error ? err.message : String(err)
-        setSourceError(`ComfyUI refused the file (${status}). Try a PNG or JPEG under 50 MB.`)
-      } finally {
-        setUploading(false)
-      }
-    },
-    [canI2I],
-  )
+      const now = store.get()
+      store.patch({ source, mode: now.mode === 't2i' ? 'i2i' : now.mode })
+    } catch (err) {
+      URL.revokeObjectURL(previewUrl)
+      const status = err instanceof Error ? err.message : String(err)
+      setSourceError(`ComfyUI refused the file (${status}). Try a PNG or JPEG under 50 MB.`)
+    } finally {
+      setUploading(false)
+    }
+  }, [])
 
   const takeRecord = useCallback((entry: HistoryEntry) => {
     const previous = store.get().source
@@ -1590,7 +1418,7 @@ export function Pictures() {
     })
   }, [])
 
-  // A picture adopted from the archive lives in the *output* folder; LoadImage
+  // A picture adopted from the archive lives in the OUTPUT folder; LoadImage
   // reads the input folder, so it is copied across once, here.
   useEffect(() => {
     const s = c.source
@@ -1647,70 +1475,77 @@ export function Pictures() {
   }
 
   // --- running ------------------------------------------------------------
-  const ready = useMemo(() => {
-    if (!activeDef || !style) return { ok: false, why: 'Waiting for the model list.' }
-    if (!c.prompt.trim()) {
-      return {
-        ok: false,
-        why: c.mode === 'edit' ? 'Describe the change first.' : 'Write a line first.',
-      }
-    }
-    if (needsSource(c.mode)) {
-      if (!c.source) return { ok: false, why: 'Add a picture to work from.' }
-      if (!c.source.name) return { ok: false, why: 'Still copying your picture across.' }
-    }
-    return { ok: true, why: '' }
-  }, [activeDef, style, c.prompt, c.mode, c.source])
 
+  /**
+   * Queue the recipe, as settled.
+   *
+   * Everything is read off `settled`, never off the plan directly: an override
+   * the reader set behind More has to reach the server or the panel is a lie.
+   */
   const start = useCallback(() => {
-    if (!ready.ok || !queuedDef || !style || busy(press)) return
+    if (!plan || !settled || busy(press)) return
     const base = store.get()
-    const seed0 = base.seedLocked ? Math.floor(base.seed) : randomSeed()
+    const first = settled.seedLocked ? settled.params.seed : randomSeed()
     const plans: RunPlan[] = []
 
-    for (let i = 0; i < base.runs; i += 1) {
-      const seed = seed0 + i
+    for (let i = 0; i < settled.runs; i += 1) {
+      const seed = first + i
+      const params: Params = { ...settled.params, seed }
+      const graph = buildGraph({ ...settled, params })
       const composition: Composition = {
         ...base,
+        desk: DESK,
+        mode: c.mode,
+        familyId: plan.familyId,
+        model: plan.model,
+        prompt: plan.prompt,
+        // The prefix and the trigger tokens are already inside params.positive,
+        // so filing one here would prepend it a second time on reuse.
+        positivePrefix: null,
+        negative: params.negative,
+        source: needsSource(c.mode) ? base.source : null,
+        width: params.width,
+        height: params.height,
+        megapixels: params.megapixels ?? null,
+        denoise: params.denoise ?? null,
         seed,
-        // Only carry what this mode actually used into the record.
-        source: needsSource(base.mode) ? base.source : null,
-        // And only what the graph can actually receive. The archive is the
-        // record of what made the picture: a shift filed against a family
-        // with no ModelSampling node reached nothing, and offering it back
-        // as the way to reproduce the picture would be a second lie.
-        shift: hasShift ? base.shift : null,
-        clipSkip: hasClipSkip ? base.clipSkip : null,
-        denoise: base.mode === 'i2i' ? (base.denoise ?? DEFAULT_DENOISE) : null,
-        megapixels: base.mode === 'i2i' ? (base.megapixels ?? 1) : null,
+        seedLocked: settled.seedLocked,
+        steps: params.steps,
+        cfg: params.cfg,
+        sampler: params.sampler,
+        scheduler: params.scheduler,
+        shift: params.shift ?? null,
+        clipSkip: params.clipSkip ?? null,
+        split: params.split ?? null,
         length: null,
         fps: null,
+        // The LoRA chain is filed in `loras`, not as a variant flag: `noLora`
+        // means the reader stripped a family's own Lightning LoRAs, which is a
+        // different thing and not something the recipe does.
+        noLora: false,
+        runs: settled.runs as Composition['runs'],
       }
-      const params = toParams(composition, { negative: houseNegative })
-      const graph = buildQueued(queuedDef, params, passes.hires)
       plans.push({
         graph,
         composition,
         seed,
-        familyLabel: style.group,
-        modelLabel: style.label,
-        variant: base.mode === 'i2i' ? 'img2img' : base.noLora ? 'nolora' : null,
-        label: style.label,
-        passes,
-        loras: basePick.specs,
+        familyLabel: plan.familyLabel,
+        modelLabel: plan.label,
+        variant: c.mode === 'i2i' ? 'img2img' : null,
+        label: plan.label,
+        passes: settled.passes,
+        loras: settled.specs,
       })
     }
 
-    store.patch({ seed: seed0 })
+    setSeed0(first)
     startRuns(plans)
-  }, [ready.ok, queuedDef, style, houseNegative, passes, basePick.specs, hasShift, hasClipSkip])
+  }, [plan, settled, c.mode])
 
   // Ctrl/⌘+Enter runs, and is the one shortcut that works inside the prompt.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // A key somebody nearer the event already claimed is not ours. The
-      // player and the mask canvas both preventDefault on keys this desk also
-      // binds, and firing both opens two things at once.
+      // A key somebody nearer the event already claimed is not ours.
       if (e.defaultPrevented) return
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault()
@@ -1723,26 +1558,12 @@ export function Pictures() {
       if (typing || e.ctrlKey || e.metaKey || e.altKey) return
       if (e.key === 'u') {
         e.preventDefault()
-        fileInput.current?.click()
+        setPicking(true)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [start])
-
-  // Expert mode opens where the reader clicked.
-  useEffect(() => {
-    if (!focusField || !expert) return
-    const el = document.getElementById(focusField)
-    el?.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' })
-    ;(el as HTMLElement | null)?.focus?.()
-    setFocusField(null)
-  }, [focusField, expert, reduced])
-
-  const openExpert = useCallback((field: string) => {
-    settings.patch({ expert: true })
-    setFocusField(field)
-  }, [])
 
   const flash = useCallback((what: string) => {
     setAdopted(what)
@@ -1756,31 +1577,163 @@ export function Pictures() {
     return records.find((r) => r.id === cur.id) ?? cur
   }, [state, records])
 
+  /**
+   * A figure taken off a finished picture becomes an override, not a draft
+   * field. The recipe decides these now, so writing one into the composition
+   * would change nothing and the link would quietly do nothing at all.
+   */
   const adopt = useCallback(
     (field: Parameters<typeof adoptValue>[1], value: number | string, label: string) => {
-      adoptValue(DESK, field, value as never)
+      if (!ADOPTABLE.has(field)) return
+      ov.one(field as never, value as never)
+      if (field === 'seed') ov.one('seedLocked', true)
       flash(label)
     },
-    [flash],
+    [flash, ov],
+  )
+
+  // --- the passes the finished picture offers -----------------------------
+
+  /**
+   * The graph a finished picture was actually made with.
+   *
+   * The result surface asks this graph what it can carry, so handing it the
+   * bare family would offer a picture made through image to image the wrong
+   * passes. Image to image first, LoRA chain second, exactly as decide() builds
+   * it, so what is offered is what can really be derived.
+   */
+  const defOf = useCallback((entry: HistoryEntry): FamilyDef | DerivedDef | null => {
+    const base = BY_ID[entry.familyId]
+    if (!base) return null
+    let def: FamilyDef | DerivedDef = base
+    if (entry.mode === 'i2i') def = IMG2IMG[base.id] ?? deriveImg2Img(base) ?? base
+    if (entry.loras?.length) {
+      def = withLoras(def, entry.loras.map((l) => ({ name: l.name, strength: l.strength }))) ?? def
+    }
+    return def
+  }, [])
+
+  const resultDef = useMemo(() => (current ? defOf(current) : null), [current, defOf])
+
+  /**
+   * Run one pass on the picture in front of the reader, or make another like it.
+   *
+   * Queued against the record's OWN composition, not against whatever is in the
+   * compose field now: the reader has usually typed something since. Same
+   * model, same prompt, same LoRAs, and for a pass the same seed, so "fix the
+   * hands" fixes these hands rather than drawing a different picture with
+   * better ones. "Make another" is the one that draws a fresh seed.
+   */
+  const rerun = useCallback(
+    (entry: HistoryEntry, kind: 'face' | 'hand' | 'hires' | null) => {
+      if (busy(press)) return
+      const base = BY_ID[entry.familyId]
+      if (!base) return
+      const fresh = kind === null
+      const reuse = compositionFromEntry(entry, {
+        installedModels: cat?.installed,
+        freshSeed: fresh,
+      })
+      const composition: Composition = {
+        ...reuse.composition,
+        seed: fresh ? reuse.composition.seed : entry.seed,
+        seedLocked: !fresh,
+      }
+
+      let def = defOf(entry)
+      if (!def) return
+      if (kind) {
+        const derived = kind === 'hires' ? deriveHiresFix(def) : deriveAutoDetail(def, kind)
+        if (!derived) return
+        // The chain is re-applied on top of the derivation, because deriving
+        // from an already-chained graph is what refine.ts expects and the pass
+        // must sample on the same patched weights the picture did.
+        def = derived
+      }
+
+      const params = toParams(composition, {
+        negative: defaultsFor(base, composition.model).negative ?? '',
+      })
+      const graph = instantiate(def, params)
+      if ('derived' in def) {
+        writeExtras(graph, def, { hiresSteps: hiresStepsFor(params.steps) })
+      }
+
+      const passes: Passes = {
+        face: kind === 'face',
+        hand: kind === 'hand',
+        hires: kind === 'hires',
+      }
+      startRuns([
+        {
+          graph,
+          composition,
+          seed: composition.seed,
+          familyLabel: entry.familyLabel,
+          modelLabel: entry.modelLabel,
+          variant: entry.variant ?? null,
+          label: kind
+            ? `${entry.modelLabel}, ${kind === 'hires' ? 'larger render' : `${kind} pass`}`
+            : entry.modelLabel,
+          passes,
+          loras: entry.loras ?? [],
+        },
+      ])
+    },
+    [cat, defOf],
   )
 
   // --- region refine ------------------------------------------------------
 
   /**
+   * Which style draws the region.
+   *
+   * Normally the one the recipe chose. But the edit family, which is the
+   * "change a picture" the reader relies on, cannot carry a refine pass at all:
+   * its conditioning carries reference latents a detached crop would misread,
+   * so deriveRefine returns null for it. Refusing to refine an edited picture
+   * would leave exactly the pictures with the worst anatomy unfixable, so the
+   * bench falls back to a picture style and says so in print.
+   */
+  const refineStyle = useMemo(() => {
+    if (style && deriveRefine(style.def)) return style
+    return pictureStyles.find((s) => deriveRefine(s.def) !== null) ?? null
+  }, [style, pictureStyles])
+
+  const canRefine = !!refineStyle
+
+  /** True when the region will be drawn by something other than the recipe's model. */
+  const refineBorrows =
+    !!refineStyle && !!style && (refineStyle.def.id !== style.def.id || refineStyle.model !== style.model)
+
+  /**
+   * The refine graph, LoRAs and all. Null means: do not offer the pass.
+   *
+   * The stack is held back when the region is drawn by a borrowed style: it was
+   * resolved against a different architecture, and an SDXL LoRA on a Qwen base
+   * loads without error and changes nothing.
+   */
+  const refineDef: DerivedDef | null = useMemo(() => {
+    if (!refineStyle) return null
+    const derived = deriveRefine(refineStyle.def)
+    if (!derived) return null
+    if (refineBorrows) return derived
+    const specs: LoraSpec[] = [
+      ...(settled?.specs ?? []),
+      ...(plan?.refineLoras ?? []).map((l) => ({ name: l.file, strength: l.strength })),
+    ]
+    if (!specs.length) return derived
+    return withLoras(derived, specs) ?? derived
+  }, [refineStyle, refineBorrows, settled, plan])
+
+  /**
    * Open the refine surface on a finished picture.
    *
-   * Two things have to be true before a mask can be drawn. The picture must be
-   * in ComfyUI's INPUT folder, because LoadImage will not read an output, so it
-   * is copied across here exactly as the source well does it. And its real
-   * pixel size must be known, because every crop number is computed from it.
-   *
-   * The size is always measured off the file, never read out of the record.
-   * The record files the size the composer ASKED for, and a two pass render
-   * upscales the latent by 1.5 on the way to disk with nothing in the record
-   * to say so. Trusting it put the crop, the mask and the composite in the
-   * pre upscale space and pasted a correct patch into the wrong part of the
-   * frame, burning a whole generation to produce a visible graft. The record
-   * is kept only as a fallback for a file the browser cannot decode.
+   * The size is always measured off the file, never read out of the record. The
+   * record files the size the composer ASKED for, and a two pass render
+   * upscales the latent on the way to disk with nothing in the record to say
+   * so. Trusting it put the crop, the mask and the composite in the pre upscale
+   * space and pasted a correct patch into the wrong part of the frame.
    */
   const openRefine = useCallback(async (entry: HistoryEntry) => {
     const token = (refineToken.current += 1)
@@ -1835,8 +1788,7 @@ export function Pictures() {
    *
    * The mask arrives as a source-sized PNG, white on black and opaque, and is
    * uploaded exactly as handed over: re-encoding it with an alpha channel would
-   * make LoadImageMask read it as empty and the pass would finish having
-   * changed nothing.
+   * make LoadImageMask read it as empty and the pass would change nothing.
    */
   const runRefine = useCallback(
     async (req: RefineRequest) => {
@@ -1845,33 +1797,24 @@ export function Pictures() {
       try {
         const mask = await uploadImage(req.mask, req.maskName)
         const base = store.get()
-        const seed = req.seed ?? Math.floor(base.seed)
-        // A borrowed style brings its own recipe. Carrying the edit family's
-        // CFG of 2.5 onto an SDXL checkpoint would wash the region out, and it
-        // would look like the refine pass had failed rather than like the wrong
-        // numbers had been handed to it.
         const rd = defaultsFor(refineStyle.def, refineStyle.model)
-        const recipe = refineBorrows
-          ? {
-              steps: rd.steps,
-              cfg: rd.cfg,
-              sampler: rd.sampler,
-              scheduler: rd.scheduler,
-              negative: null,
-              positivePrefix: refineStyle.positivePrefix,
-              shift: refineStyle.shift,
-              clipSkip: refineStyle.clipSkip,
-            }
-          : {}
+        const seed = req.seed ?? settled?.params.seed ?? seed0
         const composition: Composition = {
           ...base,
           // Filed as image-to-image, which is what it is: a partial denoise of
-          // an existing picture. That also files no width or height, which is
-          // right, because the output is the source's size, not the composer's.
+          // an existing picture. That files no width or height either, which is
+          // right: the output is the source's size, not the composer's.
           mode: 'i2i',
           familyId: refineStyle.def.id,
           model: refineStyle.model,
-          ...recipe,
+          steps: rd.steps,
+          cfg: rd.cfg,
+          sampler: rd.sampler,
+          scheduler: rd.scheduler,
+          negative: rd.negative ?? null,
+          positivePrefix: refineStyle.positivePrefix,
+          shift: refineStyle.shift,
+          clipSkip: refineStyle.clipSkip,
           prompt: req.prompt,
           seed,
           source: {
@@ -1899,11 +1842,6 @@ export function Pictures() {
           prompt: req.prompt,
           seed,
         })
-        // The same two settings the bindings cannot carry. A borrowed style
-        // brings its own shift and clip skip in `recipe` above; without these
-        // the region would be drawn at the picker style's numbers.
-        applyShift(graph, params.shift)
-        applyClipSkip(graph, params.clipSkip)
         awaitingRefine.current = true
         startRuns([
           {
@@ -1915,26 +1853,21 @@ export function Pictures() {
             variant: 'img2img',
             label: `${refineStyle.label}, region refine`,
             // A refine pass carries no detail passes of its own; it IS the
-            // detail pass. The rack is held back entirely for a borrowed
-            // style, which is what refineDef was built with.
+            // detail pass.
             passes: NO_PASSES,
-            loras: refineBorrows ? [] : refinePick.specs,
+            loras: refineBorrows ? [] : (settled?.specs ?? []),
           },
         ])
       } catch (err) {
-        setRefineFault(
-          err instanceof Error ? err.message : 'The refine pass could not be queued.',
-        )
+        setRefineFault(err instanceof Error ? err.message : 'The refine pass could not be queued.')
       }
     },
-    [refineDef, refineSource, refineStyle, refineBorrows, refinePick.specs, houseNegative],
+    [refineDef, refineSource, refineStyle, refineBorrows, settled, seed0, houseNegative],
   )
 
   // The result is whatever the press produced for the pass we queued, and only
   // that: the composer still works while the bench is open, so an ordinary
-  // picture made in the meantime must not be presented as the refined one. The
-  // result is deliberately not made the source either. Swapping it in would
-  // turn a before and after into two copies of the same frame.
+  // picture made in the meantime must not be presented as the refined one.
   useEffect(() => {
     if (!awaitingRefine.current) return
     const cur = state.current
@@ -1943,8 +1876,6 @@ export function Pictures() {
     setRefineResult(cur)
   }, [state, refineSource])
 
-  // A style that cannot carry a refine, or a press already busy with something
-  // else, blocks the button in print rather than failing at queue time.
   const refineBlocked =
     refineFault ??
     (!refineDef
@@ -1952,6 +1883,42 @@ export function Pictures() {
       : openingRefine
         ? 'Copying the picture into ComfyUI’s input folder.'
         : null)
+
+  // --- the advanced panel, mounted only while More is open ----------------
+  const advanced = (
+    <div className="space-y-7">
+      <Choice
+        legend="What this desk is doing"
+        hint="A picture dropped or pasted on the page sets this on its own."
+        options={MODE_CHOICES.filter((m) => m.id !== 'edit' || !!editStyle)}
+        value={c.mode}
+        onChange={setMode}
+      />
+
+      <div>
+        <Choice legend="The look, in full" options={INTENTS} value={look} onChange={setLook} />
+        <p className="mt-1.5 max-w-[62ch] text-caption text-grey-500">
+          The simple screen offers three of these. Cartoon is the fourth and it ranks differently:
+          western toon and comic styling rather than Japanese cel shading. The one line under the
+          button has three names for these four routes, so a cartoon brief reads there as
+          illustration. The ranking above is the one that actually ran.
+        </p>
+      </div>
+      <AdvancedPanel
+        recipe={recipe}
+        overrides={ov.value}
+        onOverrides={ov.set}
+        lib={lib}
+        onLibraryReload={() => void loadLoraLibrary().then(setLib, () => {})}
+        samplers={cat?.samplers ?? []}
+        schedulers={cat?.schedulers ?? []}
+        pinnedModel={pinned}
+        onPinModel={setPinned}
+        faultNode={state.fault?.node ?? null}
+        onClose={() => settings.patch({ expert: false })}
+      />
+    </div>
+  )
 
   // --- render -------------------------------------------------------------
   if (catError) {
@@ -1980,7 +1947,9 @@ export function Pictures() {
 
   return (
     <main
-      className="relative grid grid-cols-1 items-start lg:grid-cols-[24rem_minmax(0,1fr)] xl:h-full xl:grid-cols-[17rem_24rem_1fr]"
+      className={`relative grid grid-cols-1 items-start xl:h-full ${
+        expert ? 'lg:grid-cols-[minmax(0,44rem)_minmax(0,1fr)]' : 'lg:grid-cols-[minmax(0,34rem)_minmax(0,1fr)]'
+      }`}
       onDragEnter={onDragEnter}
       onDragOver={(e) => {
         if ([...e.dataTransfer.types].includes('Files')) e.preventDefault()
@@ -1994,33 +1963,12 @@ export function Pictures() {
         </div>
       )}
 
-      {/* ---- the margin: empty in simple, the whole apparatus in expert ---- */}
-      <aside className="order-2 px-6 py-6 lg:order-3 lg:col-span-2 lg:border-t lg:border-grey-300 xl:order-1 xl:col-span-1 xl:border-t-0 xl:h-full xl:overflow-y-auto">
-        {expert && style && activeDef && cat && (
-          <ExpertMargin
-            c={c}
-            style={style}
-            cat={cat}
-            hasNegative={hasNegative}
-            hasScheduler={hasScheduler}
-            hasShift={hasShift}
-            hasClipSkip={hasClipSkip}
-            houseNegative={houseNegative}
-            onClose={() => settings.patch({ expert: false })}
-            graph={activeDef}
-            queued={queuedDef ?? activeDef}
-            hires={passes.hires}
-            faultNode={state.fault?.node ?? null}
-          />
-        )}
-      </aside>
-
-      {/* ---- the composer ---- */}
-      <div className="order-1 border-grey-300 px-6 py-6 lg:order-1 lg:border-r xl:order-2 xl:h-full xl:overflow-y-auto xl:border-x">
+      {/* ---- the composer: three answers and a button ---- */}
+      <div className="order-1 border-grey-300 px-6 py-6 lg:border-r xl:h-full xl:overflow-y-auto">
         <h2 className="mb-1 border-b-2 border-burgundy-900 pb-1.5 text-overline font-semibold uppercase tracking-[0.18em] text-burgundy-900">
           The Pictures Desk
         </h2>
-        <p className="mb-5 text-caption italic text-grey-500">
+        <p className="mb-6 text-caption italic text-grey-500">
           {timing ??
             'Nothing timed for this model yet. After three pictures this line says how long one takes here.'}
         </p>
@@ -2037,198 +1985,64 @@ export function Pictures() {
         {correction && (
           <div className="mb-4">
             <Notice kind="correction" title="Correction">
-              {correction}{' '}
-              <Link onClick={() => setCorrection(null)}>Dismiss</Link>
+              {correction} <Link onClick={() => setCorrection(null)}>Dismiss</Link>
             </Notice>
           </div>
         )}
 
-        <ModeTabs mode={c.mode} canI2I={tabI2I} canEdit={!!editStyle} onPick={setMode} />
-
-        {c.mode === 't2i' && !canI2I && c.source && (
-          <div className="mt-3">
-            <Notice kind="correction" title="Correction">
-              {style?.label ?? 'This style'} works from words only, so your picture is standing by
-              unused.{' '}
-              {i2iAlternative && (
-                <Link
-                  onClick={() => {
-                    applyStyle(i2iAlternative)
-                    setMode('i2i')
-                  }}
-                >
-                  {i2iAlternative.label} works from a picture
-                </Link>
-              )}
-            </Notice>
-          </div>
-        )}
-
-        {!canI2I && c.mode !== 'edit' && !c.source && (
-          <p className="mt-2 text-caption italic text-grey-700">
-            {style?.label ?? 'This style'} works from words only.{' '}
-            {i2iAlternative && (
-              <Link onClick={() => applyStyle(i2iAlternative)}>
-                {i2iAlternative.label} works from a picture.
-              </Link>
-            )}
-          </p>
-        )}
-
-        {(c.mode === 'i2i' || c.mode === 'edit') && (
-          <div className="mt-5">
-            <SourceWell
-              source={c.source}
-              busy={uploading}
-              required={c.mode === 'edit'}
-              error={sourceError}
-              onPick={() => fileInput.current?.click()}
-              onArchive={() => setPicking(true)}
-              onClear={clearSource}
-            />
-          </div>
-        )}
-
-        <div className="mt-5">
-          <PromptField
-            textRef={promptRef}
-            mode={c.mode}
-            value={c.prompt}
-            prefix={expert ? null : c.positivePrefix}
-            onChange={(prompt) => store.patch({ prompt })}
-          />
-        </div>
-
-        {c.mode !== 'edit' && (
-          <div className="mt-5">
-            <StylePicker
-              styles={pictureStyles}
-              style={style}
-              expert={expert}
-              onPick={applyStyle}
-            />
-            <IntentRail
-              brief={brief}
-              report={report}
-              unavailable={cat?.unavailable ?? []}
-              topRefines={topRefines}
-              mismatch={mismatch}
-              current={style}
-              styles={pictureStyles}
-              onIntent={(i) => setIntentPick((was) => (was === i ? null : i))}
-              onExplicit={(v) => setExplicitPick(v)}
-              onPick={(rec) => {
-                const next = pictureStyles.find(
-                  (s) => s.def.id === rec.familyId && s.model === rec.model,
-                )
-                if (next) applyStyle(next)
-              }}
-            />
-          </div>
-        )}
-
-        {c.mode === 'edit' && editStyle && (
-          <p className="mt-4 text-caption italic text-grey-700">
-            Changing a picture always uses {editStyle.label}; it is the only model here that follows
-            an instruction. {editStyle.verdict && editStyle.verdict.level !== 'ok' && (
-              <span className="not-italic"> {editStyle.verdict.reason}</span>
-            )}
-          </p>
-        )}
-
-        {c.mode === 't2i' && hasSize && (
-          <div className="mt-6">
-            <ShapePicker
-              shapes={shapes}
-              width={c.width}
-              height={c.height}
-              expert={expert}
-              onPick={(s) => store.edit({ width: s.width, height: s.height }, 'width', 'height')}
-              onSize={(w, h) => store.edit({ width: w, height: h }, 'width', 'height')}
-            />
-          </div>
-        )}
-
-        {c.mode === 'i2i' && (
-          <div className="mt-6">
-            <SizeFollows
-              megapixels={c.megapixels ?? 1}
-              expert={expert}
-              onPick={(mp) => store.edit({ megapixels: mp }, 'megapixels')}
-            />
-          </div>
-        )}
-
-        {c.mode === 'i2i' && (
-          <div className="mt-6">
-            <Strength
-              denoise={c.denoise ?? DEFAULT_DENOISE}
-              expert={expert}
-              steps={c.steps}
-              modelLabel={style?.label ?? 'This model'}
-              onChange={(d) => store.edit({ denoise: d }, 'denoise')}
-            />
-          </div>
-        )}
-
-        {caps && (caps.faceDetail || caps.handDetail || caps.hires) && (
-          <div className="mt-6">
-            <QualityPasses
-              caps={caps}
-              value={passes}
-              onChange={setPasses}
-              size={{ width: c.width, height: c.height }}
-              sized={c.mode === 't2i' && hasSize}
-              steps={c.steps}
-            />
-          </div>
-        )}
-
-        {baseDef && (
-          <div className="mt-6">
-            <LoraRack
-              rack={rack}
-              prompt={c.prompt}
-              expert={expert}
-              onAddTriggers={(tokens) => {
-                const now = store.get().prompt
-                const joined = tokens.join(', ')
-                store.patch({ prompt: now.trim() ? `${joined}, ${now}` : joined })
-              }}
-            />
-            {refinePick.deferred.length > 0 && (
-              <p className="mt-2 text-caption leading-snug text-grey-700">
-                <Kicker className="block">Held for the refine pass</Kicker>
-                {refinePick.deferred.map((d) => d.label).join(', ')}
-                {refinePick.deferred.length === 1 ? ' is' : ' are'} trained on close framing, so
-                {refinePick.deferred.length === 1 ? ' it is' : ' they are'} applied when you refine a
-                region rather than on the first render.
-              </p>
-            )}
-          </div>
-        )}
-
-        <div className="mt-7">
-          <RunButton
-            label={c.mode === 'edit' ? 'Make the change' : 'Make the picture'}
-            disabled={!ready.ok}
-            why={ready.why}
-            running={running}
-            queuedAhead={ahead}
-            lastMs={state.lastMs}
-            runs={c.runs}
-            job={state.job}
+        {c.mode === 'edit' ? (
+          <EditDesk
+            prompt={c.prompt}
+            onPrompt={(prompt) => store.patch({ prompt })}
+            promptRef={promptRef}
+            recipe={recipe}
+            source={c.source}
+            sourceBusy={uploading}
+            sourceError={sourceError}
+            onPickSource={() => setPicking(true)}
+            onClearSource={clearSource}
             onRun={start}
             onStop={() => void stopRun()}
-            reduced={reduced}
+            running={running}
+            job={state.job}
+            queuedAhead={ahead}
+            lastMs={state.lastMs}
+            reducedMotion={reduced}
+            advanced={advanced}
+            moreOpen={expert}
+            onMoreOpenChange={(open) => settings.patch({ expert: open })}
           />
-          <SettingLine
-            c={c}
-            expert={expert}
-            hasScheduler={hasScheduler}
-            onOpen={openExpert}
+        ) : (
+          <ComposeDesk
+            prompt={c.prompt}
+            look={look as Look}
+            anatomy={anatomy}
+            onPrompt={(prompt) => store.patch({ prompt })}
+            onLook={setLook}
+            onAnatomy={(next) => {
+              setAnatomySaid(true)
+              setAnatomy(next)
+            }}
+            recipe={recipe}
+            source={c.source}
+            needsSource={c.mode === 'i2i'}
+            sourceBusy={uploading}
+            sourceError={sourceError}
+            onPickSource={canI2I ? () => setPicking(true) : undefined}
+            onClearSource={clearSource}
+            onRun={start}
+            onStop={() => void stopRun()}
+            running={running}
+            job={state.job}
+            queuedAhead={ahead}
+            lastMs={state.lastMs}
+            promptRef={promptRef}
+            reducedMotion={reduced}
+            advanced={advanced}
+            moreOpen={expert}
+            onMoreOpenChange={(open) => settings.patch({ expert: open })}
           />
-        </div>
+        )}
 
         {state.fault && (
           <div className="mt-5">
@@ -2250,7 +2064,7 @@ export function Pictures() {
       </div>
 
       {/* ---- the plate, or the refine bench standing in for it ---- */}
-      <section className="order-3 px-6 py-6 lg:order-2 xl:order-3 xl:h-full xl:overflow-y-auto">
+      <section className="order-2 px-6 py-6 xl:h-full xl:overflow-y-auto">
         {refining ? (
           <div className="flex h-full flex-col">
             <div className="mb-4 flex items-baseline justify-between gap-4 border-b-2 border-burgundy-900 pb-1.5">
@@ -2261,8 +2075,8 @@ export function Pictures() {
               <p className="mb-3 text-caption leading-snug text-grey-700">
                 <Kicker className="block">Drawn by {refineStyle.label}</Kicker>
                 {refineBorrows
-                  ? `${style?.label ?? 'The style in the picker'} cannot re render a region, so the region is drawn by ${refineStyle.label} at its own settings. The rest of the picture is untouched, and any LoRAs in the rack are held back because they were resolved against a different architecture.`
-                  : 'The region is drawn by the style in the picker, at its own settings, with the LoRAs in the rack applied.'}
+                  ? `${style?.label ?? 'The model the recipe chose'} cannot re render a region, so the region is drawn by ${refineStyle.label} at its own settings. The rest of the picture is untouched, and any LoRAs are held back because they were resolved against a different architecture.`
+                  : 'The region is drawn by the model the recipe chose, at its own settings, with the LoRAs applied.'}
               </p>
             )}
             {refineResult && (
@@ -2292,37 +2106,66 @@ export function Pictures() {
             )}
           </div>
         ) : (
-        <Plate
-          state={state}
-          entry={current}
-          c={c}
-          style={style}
-          reduced={reduced}
-          adopted={adopted}
-          examples={c.prompt.trim() ? [] : exampleLines(pictureStyles)}
-          onExample={(ex) => {
-            const s = pictureStyles.find((p) => p.def.id === ex.familyId)
-            if (s) applyStyle(s)
-            const shape = shapesFor(s ?? style).find((sh) => sh.key === ex.shape)
-            store.patch({ prompt: ex.prompt })
-            if (shape) store.edit({ width: shape.width, height: shape.height }, 'width', 'height')
-            promptRef.current?.focus()
-          }}
-          onAdopt={adopt}
-          onShow={showResult}
-          onWorkFrom={(entry) => {
-            takeRecord(entry)
-            setMode('i2i')
-          }}
-          onChangeThis={(entry) => {
-            takeRecord(entry)
-            setMode('edit')
-          }}
-          canI2I={tabI2I}
-          canEdit={!!editStyle}
-          canRefine={canRefine}
-          onRefine={(entry) => void openRefine(entry)}
-        />
+          <>
+            <Plate
+              state={state}
+              entry={current}
+              c={c}
+              style={style}
+              reduced={reduced}
+              adopted={adopted}
+              examples={c.prompt.trim() ? [] : EXAMPLES}
+              onExample={(ex) => {
+                store.patch({ prompt: ex.prompt })
+                setLook(ex.look)
+                promptRef.current?.focus()
+              }}
+              onAdopt={adopt}
+              onShow={showResult}
+              onWorkFrom={(entry) => {
+                takeRecord(entry)
+                setMode('i2i')
+              }}
+              onChangeThis={(entry) => {
+                takeRecord(entry)
+                setMode('edit')
+              }}
+              canI2I={canI2I}
+              canEdit={!!editStyle}
+              canRefine={canRefine}
+              onRefine={(entry) => void openRefine(entry)}
+            />
+
+            {/*
+              What the picture can be told to do next. This is requirement three
+              of the simplification: the quality passes are offered HERE, where
+              the reader can see whether the hands came out wrong, instead of
+              being checkboxes to guess at before anything exists.
+            */}
+            {current && (
+              <ResultActions
+                picture={{
+                  url: fileUrl(current.file),
+                  width: current.width ?? undefined,
+                  height: current.height ?? undefined,
+                }}
+                def={resultDef}
+                canSource={canI2I}
+                busy={running}
+                blocked={offline ? 'ComfyUI is not answering, so nothing can be queued.' : null}
+                onAction={(id) => {
+                  if (id === 'refine') return void openRefine(current)
+                  if (id === 'again') return rerun(current, null)
+                  if (id === 'source') {
+                    takeRecord(current)
+                    setMode('i2i')
+                    return
+                  }
+                  rerun(current, id)
+                }}
+              />
+            )}
+          </>
         )}
       </section>
 
@@ -2330,6 +2173,10 @@ export function Pictures() {
         <ArchivePicker
           records={records}
           onClose={() => setPicking(false)}
+          onFile={() => {
+            setPicking(false)
+            fileInput.current?.click()
+          }}
           onPick={(entry) => {
             takeRecord(entry)
             setPicking(false)
@@ -2342,8 +2189,145 @@ export function Pictures() {
 
 export default Pictures
 
-function exampleLines(styles: Style[]) {
-  return EXAMPLES.filter((ex) => styles.some((s) => s.def.id === ex.familyId))
+/**
+ * The edit desk: the same three-answer page, minus the two answers that mean
+ * nothing here.
+ *
+ * Changing a picture has one model and no look to choose, so printing a look
+ * picker and an anatomy picker that change nothing would be exactly the kind of
+ * dead control this redesign exists to remove. The pieces are the compose
+ * rail's own, used directly.
+ *
+ * Four controls: the instruction, the picture (a plate and a Remove link), and
+ * the button. Plus the More footnote, which is the fifth.
+ */
+function EditDesk({
+  prompt,
+  onPrompt,
+  promptRef,
+  recipe,
+  source,
+  sourceBusy,
+  sourceError,
+  onPickSource,
+  onClearSource,
+  onRun,
+  onStop,
+  running,
+  job,
+  queuedAhead,
+  lastMs,
+  reducedMotion,
+  advanced,
+  moreOpen,
+  onMoreOpenChange,
+}: {
+  prompt: string
+  onPrompt: (v: string) => void
+  promptRef: RefObject<HTMLTextAreaElement | null>
+  recipe: Recipe
+  source: SourceRef | null
+  sourceBusy: boolean
+  sourceError: string | null
+  onPickSource: () => void
+  onClearSource: () => void
+  onRun: () => void
+  onStop: () => void
+  running: boolean
+  job: DeskJob | null
+  queuedAhead: number
+  lastMs: number | null
+  reducedMotion: boolean
+  advanced: ReactNode
+  moreOpen: boolean
+  onMoreOpenChange: (open: boolean) => void
+}) {
+  const why = !prompt.trim()
+    ? 'Say what to change.'
+    : !recipe.ok
+      ? recipe.reason
+      : !source
+        ? 'Choose the picture to change.'
+        : !source.name || sourceBusy
+          ? 'The picture is still copying across.'
+          : ''
+
+  return (
+    <section className="max-w-[46rem]">
+      <header className="mb-8">
+        <Kicker>Compose</Kicker>
+        <h2 className="mt-1 text-h2 font-semibold leading-tight text-ink">Change a picture</h2>
+        <div className="mt-2 mb-4 border-b-2 border-burgundy-900" />
+        <p className="max-w-[62ch] text-body leading-relaxed text-grey-700">
+          Hand it a picture and say what should be different. Everything else follows the source.
+        </p>
+      </header>
+
+      <div className="space-y-8">
+        <PromptField
+          value={prompt}
+          onChange={onPrompt}
+          onSubmit={why ? undefined : onRun}
+          textRef={promptRef}
+          label="The change"
+          placeholder="Make the jacket red"
+          rows={3}
+        />
+
+        <SourceWell
+          source={source}
+          busy={sourceBusy}
+          error={sourceError}
+          onPick={onPickSource}
+          onClear={onClearSource}
+        />
+
+        <div>
+          <RunButton
+            label="Make the change"
+            disabled={Boolean(why)}
+            why={why}
+            running={running}
+            queuedAhead={queuedAhead}
+            lastMs={lastMs}
+            job={job}
+            onRun={onRun}
+            onStop={onStop}
+            reduced={reducedMotion}
+          />
+
+          <div className="mt-6">
+            <Hairline className="mb-3" />
+            <Kicker>{recipe.ok ? 'What the desk chose' : 'Nothing to run'}</Kicker>
+            {recipe.ok ? (
+              <>
+                <p className="mt-2 max-w-[62ch] text-body leading-relaxed text-ink">
+                  {recipe.label} follows the instruction. The size and the shape come from your
+                  picture, not from a size control. Faces, hands, a masked region and a larger
+                  render are offered once the change exists.
+                </p>
+                {recipe.warnings.map((w, i) => (
+                  <p key={i} className="mt-2 max-w-[62ch] text-caption text-grey-700">
+                    {w}
+                  </p>
+                ))}
+              </>
+            ) : (
+              <div className="mt-2 max-w-[62ch]">
+                <Notice kind="correction" title="Correction">
+                  {recipe.reason}
+                </Notice>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <MoreFootnote open={moreOpen} onOpenChange={onMoreOpenChange}>
+        {advanced}
+      </MoreFootnote>
+    </section>
+  )
 }
 
 async function measure(url: string): Promise<{ width: number; height: number } | null> {
@@ -2354,1103 +2338,6 @@ async function measure(url: string): Promise<{ width: number; height: number } |
     img.src = url
   })
 }
-
-// ---------------------------------------------------------------------------
-// Mode tabs
-// ---------------------------------------------------------------------------
-
-function ModeTabs({
-  mode,
-  canI2I,
-  canEdit,
-  onPick,
-}: {
-  mode: Mode
-  canI2I: boolean
-  canEdit: boolean
-  onPick: (m: Mode) => void
-}) {
-  const enabled = (m: Mode) => (m === 'i2i' ? canI2I : m === 'edit' ? canEdit : true)
-  return (
-    <div role="tablist" aria-label="What are you making from?" className="flex border border-grey-300">
-      {DESK_MODES.map((m, i) => {
-        const on = m === mode
-        const live = enabled(m)
-        return (
-          <button
-            key={m}
-            role="tab"
-            type="button"
-            aria-selected={on}
-            disabled={!live}
-            onClick={() => onPick(m)}
-            title={live ? undefined : 'This style cannot do that'}
-            className={[
-              'flex-1 px-2 py-2 text-overline font-semibold uppercase tracking-[0.16em] transition-colors',
-              i > 0 ? 'border-l border-grey-300' : '',
-              on
-                ? 'border-t-2 border-t-burgundy-900 bg-newsprint text-ink'
-                : live
-                  ? 'cursor-pointer text-grey-500 hover:text-ink'
-                  : 'cursor-not-allowed text-grey-300',
-              'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900',
-            ].join(' ')}
-          >
-            {MODE_LABEL[m]}
-          </button>
-        )
-      })}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// The source well
-// ---------------------------------------------------------------------------
-
-function SourceWell({
-  source,
-  busy: uploading,
-  required,
-  error,
-  onPick,
-  onArchive,
-  onClear,
-}: {
-  source: SourceRef | null
-  busy: boolean
-  required: boolean
-  error: string | null
-  onPick: () => void
-  onArchive: () => void
-  onClear: () => void
-}) {
-  const caption = source
-    ? [
-        source.label ?? source.name,
-        source.width && source.height ? times(source.width, source.height) : null,
-        source.bytes ? bytes(source.bytes) : null,
-      ]
-        .filter(Boolean)
-        .join(' · ')
-    : ''
-
-  return (
-    <div>
-      <Label hint={required ? 'required' : undefined}>Your picture</Label>
-      {source ? (
-        <div className="flex items-start gap-3 border border-grey-300 bg-newsprint-aged p-2">
-          <div className="h-16 w-16 shrink-0 overflow-hidden border border-grey-300 bg-newsprint">
-            {source.previewUrl ? (
-              <img
-                src={source.previewUrl}
-                alt=""
-                className="h-full w-full object-cover"
-              />
-            ) : (
-              <div className="grid h-full place-items-center text-caption text-grey-400">—</div>
-            )}
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-caption italic text-grey-700">{caption}</p>
-            {uploading && <p className="text-caption italic text-grey-500">Copying it across…</p>}
-            {source.fromEntryId && (
-              <p className="text-caption italic text-grey-500">From your archive.</p>
-            )}
-            <p className="mt-1 text-caption">
-              <Link onClick={onPick}>Replace</Link>
-              <span className="text-grey-400"> · </span>
-              <Link onClick={onArchive}>From the archive</Link>
-              <span className="text-grey-400"> · </span>
-              <Link onClick={onClear}>Clear</Link>
-            </p>
-          </div>
-        </div>
-      ) : (
-        <button
-          type="button"
-          onClick={onPick}
-          className="w-full cursor-pointer border border-dashed border-grey-400 bg-newsprint-aged px-3 py-5 text-center transition-colors hover:border-burgundy-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
-        >
-          <span className="block text-overline font-semibold uppercase tracking-[0.18em] text-grey-700">
-            Choose a picture
-          </span>
-          <span className="mt-1 block text-caption italic text-grey-500">
-            Drop one here, paste it, or press u
-          </span>
-        </button>
-      )}
-      {!source && (
-        <p className="mt-1 text-caption italic text-grey-500">
-          You can also <Link onClick={onArchive}>take one from the archive</Link>.
-        </p>
-      )}
-      {error && (
-        <div className="mt-2">
-          <Notice kind="error" title="We could not use that picture">
-            {error}
-          </Notice>
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Prompt
-// ---------------------------------------------------------------------------
-
-function PromptField({
-  textRef,
-  mode,
-  value,
-  prefix,
-  onChange,
-}: {
-  textRef: RefObject<HTMLTextAreaElement | null>
-  mode: Mode
-  value: string
-  prefix: string | null
-  onChange: (v: string) => void
-}) {
-  const edit = mode === 'edit'
-  return (
-    <label className="block">
-      <Label>{edit ? 'Describe the change' : 'Describe the picture'}</Label>
-      <textarea
-        ref={textRef}
-        value={value}
-        rows={edit ? 3 : 5}
-        spellCheck
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={
-          edit ? 'Make the jacket red' : 'A rain-slicked tram stop at dusk, neon in the puddles'
-        }
-        className="field"
-        style={{ fontSize: '1.125rem', lineHeight: 1.6, maxWidth: '62ch' }}
-      />
-      <span className="mt-1 block text-caption italic text-grey-500">
-        {prefix
-          ? `The maker’s quality words are added for you: “${prefix.trim().replace(/,$/, '')}”. `
-          : ''}
-        Ctrl+Enter runs it.
-      </span>
-    </label>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Style
-// ---------------------------------------------------------------------------
-
-function fitTag(v: Verdict | null): string | null {
-  if (!v) return null
-  if (v.level === 'risky') return 'not enough free memory'
-  if (v.level === 'tight') return 'tight fit'
-  if (v.offloads) return 'heavy'
-  return null
-}
-
-function StylePicker({
-  styles,
-  style,
-  expert,
-  onPick,
-}: {
-  styles: Style[]
-  style: Style | null
-  expert: boolean
-  onPick: (s: Style) => void
-}) {
-  const groups = useMemo(() => {
-    const map = new Map<string, Style[]>()
-    for (const s of styles) map.set(s.group, [...(map.get(s.group) ?? []), s])
-    return [...map.entries()]
-  }, [styles])
-
-  const verdict = style?.verdict ?? null
-  const tag = fitTag(verdict)
-
-  return (
-    <label className="block">
-      <Label>Style</Label>
-      <select
-        className="field"
-        value={style ? `${style.def.id}::${style.model}` : ''}
-        onChange={(e) => {
-          const [id, model] = e.target.value.split('::')
-          const next = styles.find((s) => s.def.id === id && s.model === model)
-          if (next) onPick(next)
-        }}
-      >
-        {!style && <option value="">Reading the model list…</option>}
-        {groups.map(([group, list]) => (
-          <optgroup key={group} label={group}>
-            {list.map((s) => {
-              const t = fitTag(s.verdict)
-              return (
-                <option key={s.model} value={`${s.def.id}::${s.model}`}>
-                  {s.label}
-                  {s.def.verified ? '' : ' †'}
-                  {t ? ` · ${t}` : ''}
-                </option>
-              )
-            })}
-          </optgroup>
-        ))}
-      </select>
-
-      {verdict && verdict.level !== 'ok' && (
-        <span className="mt-1 block text-caption italic text-grey-700">{verdict.reason}</span>
-      )}
-      {verdict && verdict.level === 'ok' && verdict.offloads && (
-        <span className="mt-1 block text-caption italic text-grey-700">
-          <Kicker className="block not-italic">Heavy</Kicker>
-          The largest file is {gb(verdict.footprint.largestBytes)}, more than the card holds, so it
-          streams from memory and runs slower.
-        </span>
-      )}
-      {tag === null && verdict && verdict.level === 'ok' && !verdict.offloads && (
-        <span className="mt-1 block text-caption italic text-grey-500">{verdict.reason}</span>
-      )}
-      {style && !style.def.verified && (
-        <span className="mt-1 block text-caption italic text-grey-700">
-          † These settings come from the model’s card and have not been checked against a live run.
-        </span>
-      )}
-      {expert && style && (
-        <span className="mt-1 block truncate text-caption text-grey-500" title={style.model}>
-          {style.model}
-        </span>
-      )}
-    </label>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Intent routing
-//
-// The picker above lists every installed style alphabetically, which is the
-// right order for finding a name and the wrong order for choosing one. This
-// rail reads the prompt, ranks the installed weights against what it asks for,
-// and says which one to use and why.
-//
-// It never switches style on its own. A keyword match is a hint; overriding a
-// deliberate choice because someone typed "photo" would be worse than the
-// mismatch it was trying to prevent.
-// ---------------------------------------------------------------------------
-
-function IntentRail({
-  brief,
-  report,
-  unavailable,
-  topRefines,
-  mismatch,
-  current,
-  styles,
-  onIntent,
-  onExplicit,
-  onPick,
-}: {
-  brief: Brief
-  report: IntentReport | null
-  /** Why each detected file did not make it into the picker. */
-  unavailable: { name: string; why: string }[]
-  /** False when the top ranked base cannot carry a region refine pass. */
-  topRefines: boolean
-  mismatch: string | null
-  current: Style | null
-  styles: Style[]
-  onIntent: (i: Intent) => void
-  onExplicit: (v: boolean) => void
-  onPick: (rec: Recommendation) => void
-}) {
-  const [open, setOpen] = useState(false)
-  if (!report) return null
-
-  const top = report.ranked[0] ?? null
-  const isCurrent = (r: Recommendation) =>
-    !!current && current.def.id === r.familyId && current.model === r.model
-  const blurb = INTENTS.find((i) => i.id === brief.intent)?.blurb ?? ''
-  const reachable = (r: Recommendation) =>
-    styles.some((s) => s.def.id === r.familyId && s.model === r.model)
-
-  /**
-   * Why a ranked model is not in the picker.
-   *
-   * The ranking runs over every installed weight; the picker drops anything
-   * whose graph names a CLIP, VAE or LoRA that is not on disk, or that the
-   * card cannot hold. The reason is already known by then, so a headline that
-   * names a model the reader cannot select has no excuse to withhold it.
-   */
-  const whyUnavailable = (r: Recommendation): string =>
-    sentence(
-      unavailable.find((u) => u.name === r.model)?.why ??
-        report.unrouted.find((u) => u.model === r.model)?.why ??
-        'It is on disk, but the picker has no verified graph for it',
-    )
-
-  return (
-    <div className="mt-3 border-t border-grey-300 pt-3">
-      <Kicker>What are you after</Kicker>
-
-      <div className="mt-1.5 flex flex-wrap gap-1.5">
-        {INTENTS.map((opt) => {
-          const on = brief.intent === opt.id
-          return (
-            <button
-              key={opt.id}
-              type="button"
-              aria-pressed={on}
-              onClick={() => onIntent(opt.id)}
-              title={opt.blurb}
-              className={`cursor-pointer border px-2 py-1 text-overline font-semibold uppercase tracking-[0.14em] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 ${
-                on
-                  ? 'border-burgundy-900 bg-burgundy-900 text-newsprint'
-                  : 'border-grey-300 text-grey-500 hover:border-ink hover:text-ink'
-              }`}
-            >
-              {opt.label}
-            </button>
-          )
-        })}
-      </div>
-
-      {blurb && <p className="mt-1.5 text-caption italic text-grey-500">{blurb}</p>}
-
-      <label className="mt-2 flex cursor-pointer items-start gap-2 text-caption text-grey-700">
-        <input
-          type="checkbox"
-          className="mt-0.5 cursor-pointer accent-burgundy-900"
-          checked={brief.explicit}
-          onChange={(e) => onExplicit(e.target.checked)}
-        />
-        <span>
-          Explicit anatomy in frame. Weighs what a base was actually trained to draw as heavily as
-          how it looks, which reorders the list completely.
-        </span>
-      </label>
-
-      <p className="mt-2 text-caption leading-snug text-grey-700">{report.note}</p>
-
-      {top && !isCurrent(top) && reachable(top) && (
-        <p className="mt-1 text-caption">
-          <Link onClick={() => onPick(top)}>Use {top.label}</Link>
-          <span className="text-grey-400"> · </span>
-          <Link onClick={() => setOpen((v) => !v)}>{open ? 'hide the ranking' : 'see the ranking'}</Link>
-        </p>
-      )}
-      {top && (isCurrent(top) || !reachable(top)) && (
-        <p className="mt-1 text-caption">
-          {isCurrent(top) && <span className="italic text-grey-500">You are on it. </span>}
-          <Link onClick={() => setOpen((v) => !v)}>{open ? 'hide the ranking' : 'see the ranking'}</Link>
-        </p>
-      )}
-
-      {top && !reachable(top) && (
-        <p className="mt-1.5 text-caption leading-snug text-warning">
-          <Kicker className="block text-warning">Ranks first, not in the picker</Kicker>
-          {top.label} cannot be selected here. {whyUnavailable(top)}
-        </p>
-      )}
-
-      {open && (
-        <ol className="mt-2 border-t border-grey-300">
-          {report.ranked.map((r) => (
-            <li key={`${r.familyId}:${r.model}`} className="border-b border-grey-300 py-1.5">
-              <div className="flex items-baseline justify-between gap-3">
-                <span className="text-small font-semibold">
-                  {r.rank}. {r.label}
-                  {isCurrent(r) ? ' ·  in use' : ''}
-                </span>
-                <span className="shrink-0 text-caption tabular-nums text-grey-500">{r.score}</span>
-              </div>
-              <p className="mt-0.5 text-caption leading-snug text-grey-700">{r.why}</p>
-              {r.warning && (
-                <p className="mt-0.5 text-caption leading-snug text-warning">{r.warning}</p>
-              )}
-              {r.caveat && (
-                <p className="mt-0.5 text-caption italic leading-snug text-grey-500">{r.caveat}</p>
-              )}
-              {!isCurrent(r) && reachable(r) && (
-                <p className="mt-0.5 text-caption">
-                  <Link onClick={() => onPick(r)}>Use it</Link>
-                </p>
-              )}
-              {!reachable(r) && (
-                <p className="mt-0.5 text-caption italic leading-snug text-grey-500">
-                  Not in the picker. {whyUnavailable(r)}
-                </p>
-              )}
-            </li>
-          ))}
-        </ol>
-      )}
-
-      {top && !topRefines && (
-        <p className="mt-2 text-caption leading-snug text-warning">
-          <Kicker className="block text-warning">Ranks first, cannot be refined</Kicker>
-          {top.label} samples through a custom schedule with no denoise control, so neither a region
-          refine nor a face or hand detail pass can run on it. It is ranked on what it draws, not on
-          what can be done to it afterwards. For anatomy at small scale, pick a base one row down
-          that can carry the passes.
-        </p>
-      )}
-
-      {mismatch && (
-        <p className="mt-2 text-caption leading-snug text-warning">
-          <Kicker className="block text-warning">Mismatch</Kicker>
-          {mismatch}
-        </p>
-      )}
-
-      {top && (
-        <p className="mt-2 text-caption leading-snug text-grey-700">
-          <Kicker className="block">How to write it</Kicker>
-          {promptStyleNote(isCurrentStyleRec(current, report) ?? top)}
-        </p>
-      )}
-
-      <p className="mt-2 text-caption leading-snug text-grey-700">
-        <Kicker className="block">Anatomy</Kicker>
-        {anatomyNote(brief)}
-      </p>
-
-      {report.unrouted.length > 0 && (
-        <p className="mt-2 text-caption leading-snug text-error">
-          <Kicker className="block text-error">On disk, not wired up</Kicker>
-          {report.unrouted.map((u) => u.why).join(' ')} Adding it means a verified graph in
-          src/lib/registry.ts, which is generated rather than written by hand.
-        </p>
-      )}
-
-      {report.blocked.length > 0 && (
-        <p className="mt-2 text-caption leading-snug text-grey-500">
-          <Kicker className="block">Too large for this machine</Kicker>
-          {report.blocked.map((b) => `${b.label}: ${b.why}`).join(' ')}
-        </p>
-      )}
-    </div>
-  )
-}
-
-/** The ranking row for the style actually selected, when it has one. */
-function isCurrentStyleRec(current: Style | null, report: IntentReport): Recommendation | null {
-  if (!current) return null
-  return (
-    report.ranked.find((r) => r.familyId === current.def.id && r.model === current.model) ?? null
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Quality passes
-//
-// Three switches, each one a real derivation of the graph and each one costing
-// real GPU time. The arithmetic is printed rather than implied: a card that is
-// busy for three minutes because of one unlabelled checkbox is a bad tool.
-//
-// There is no detector for breasts, nipples, vulvas or penises. Faces and hands
-// are the two regions YOLO can find on its own, which is why they are the only
-// two offered here. Every other region needs a drawn mask and the refine bench.
-// ---------------------------------------------------------------------------
-
-function QualityPasses({
-  caps,
-  value,
-  onChange,
-  size,
-  sized,
-  steps,
-}: {
-  caps: Capabilities
-  value: Passes
-  onChange: (p: Passes) => void
-  size: { width: number; height: number }
-  /** False when the frame size is not the composer's to set, as in image to image. */
-  sized: boolean
-  steps: number
-}) {
-  const cost = passCost(value)
-  const big = hiresSize(size)
-
-  const toggle = (key: keyof Passes) => onChange({ ...value, [key]: !value[key] })
-
-  return (
-    <div>
-      <Label hint="Each pass re renders part of the picture at a higher resolution. That is the only thing that adds real detail, and it costs a full pass of GPU time.">
-        Detail passes
-      </Label>
-
-      <ul className="mt-1 border-t border-grey-300">
-        {caps.faceDetail && (
-          <PassRow
-            on={value.face}
-            onToggle={() => toggle('face')}
-            title="Detail every face"
-            note="Finds faces with a detector, crops each one, re renders it at up to 1024px and pastes it back. A face 80px across has 100 latent cells and cannot hold two eyes and a mouth; at 1024 it has nine thousand."
-            cost="about one extra pass per face found"
-          />
-        )}
-        {caps.handDetail && (
-          <PassRow
-            on={value.hand}
-            onToggle={() => toggle('hand')}
-            title="Detail every hand"
-            note="The same pass, on the hand detector, at a higher strength. Hands come out wrong rather than merely soft, so this one is allowed to rebuild rather than sharpen."
-            cost="about one extra pass per hand found"
-          />
-        )}
-        {caps.hires && (
-          <PassRow
-            on={value.hires}
-            onToggle={() => toggle('hires')}
-            title="Two pass render"
-            note={`Composes at the size the model was trained on, upscales the latent by 1.5, then redraws at ${hiresStepsFor(steps)} steps and 0.45 strength. Every region, breasts and hands and faces included, gets 2.25 times the cells to resolve in.${sized ? ` Output ${times(big.width, big.height)}.` : ''}`}
-            cost="about 1.35 extra passes, and noticeably more VRAM"
-          />
-        )}
-      </ul>
-
-      {cost > 1 && (
-        <p className="mt-1.5 text-caption tabular-nums text-grey-700">
-          Roughly {cost.toFixed(2)}x the time of a plain picture, at least. A detector that finds
-          two faces runs the face pass twice.
-        </p>
-      )}
-    </div>
-  )
-}
-
-function PassRow({
-  on,
-  onToggle,
-  title,
-  note,
-  cost,
-}: {
-  on: boolean
-  onToggle: () => void
-  title: string
-  note: string
-  cost: string
-}) {
-  return (
-    <li className="border-b border-grey-300 py-2">
-      <label className="flex cursor-pointer items-start gap-2">
-        <input
-          type="checkbox"
-          className="mt-1 cursor-pointer accent-burgundy-900"
-          checked={on}
-          onChange={onToggle}
-        />
-        <span className="min-w-0">
-          <span className="block text-small font-semibold">{title}</span>
-          <span className="mt-0.5 block text-caption leading-snug text-grey-700">{note}</span>
-          <span className="mt-0.5 block text-caption italic text-grey-500">Costs {cost}.</span>
-        </span>
-      </label>
-    </li>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Shape
-// ---------------------------------------------------------------------------
-
-function ShapePicker({
-  shapes,
-  width,
-  height,
-  expert,
-  onPick,
-  onSize,
-}: {
-  shapes: Shape[]
-  width: number
-  height: number
-  expert: boolean
-  onPick: (s: Shape) => void
-  onSize: (w: number, h: number) => void
-}) {
-  const active = shapes.find((s) => s.width === width && s.height === height) ?? null
-  const mp = round2((width * height) / 1e6)
-
-  return (
-    <div>
-      <Label>Shape</Label>
-      <div className="flex items-end gap-2">
-        {shapes.map((s) => {
-          const on = active?.key === s.key
-          const w = 46
-          const scale = Math.min(w / Math.max(s.width, s.height), 1)
-          return (
-            <button
-              key={s.key}
-              type="button"
-              aria-pressed={on}
-              onClick={() => onPick(s)}
-              title={`${s.label} · ${times(s.width, s.height)}`}
-              className="group flex w-16 cursor-pointer flex-col items-center gap-1 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
-            >
-              <span className="grid h-12 w-full place-items-center">
-                <span
-                  className={`block border ${on ? 'border-ink bg-ink' : 'border-grey-400 bg-transparent group-hover:border-ink'}`}
-                  style={{
-                    width: Math.max(10, Math.round(s.width * scale)),
-                    height: Math.max(10, Math.round(s.height * scale)),
-                  }}
-                />
-              </span>
-              <span
-                className={`text-overline font-semibold uppercase tracking-[0.14em] ${on ? 'text-ink' : 'text-grey-500'}`}
-              >
-                {s.label}
-              </span>
-            </button>
-          )
-        })}
-      </div>
-      <p className="mt-1.5 text-caption italic text-grey-700 tabular-nums">
-        {times(width, height)} · {mp.toFixed(2)} megapixels
-        {active?.maker ? ' · the maker’s shape' : ''}
-      </p>
-
-      {expert && (
-        <div className="mt-3 flex items-end gap-3">
-          <Stepper
-            id="sg-width"
-            label="Width"
-            value={width}
-            step={16}
-            min={256}
-            max={4096}
-            onChange={(v) => onSize(snap16(v), height)}
-          />
-          <span className="pb-2 text-grey-400">×</span>
-          <Stepper
-            id="sg-height"
-            label="Height"
-            value={height}
-            step={16}
-            min={256}
-            max={4096}
-            onChange={(v) => onSize(width, snap16(v))}
-          />
-        </div>
-      )}
-    </div>
-  )
-}
-
-function Stepper({
-  id,
-  label,
-  value,
-  step,
-  min,
-  max,
-  onChange,
-}: {
-  id: string
-  label: string
-  value: number
-  step: number
-  min: number
-  max: number
-  onChange: (v: number) => void
-}) {
-  return (
-    <label className="block w-24">
-      <Label>{label}</Label>
-      <input
-        id={id}
-        type="number"
-        className="field tabular-nums"
-        value={value}
-        step={step}
-        min={min}
-        max={max}
-        onChange={(e) => {
-          const v = Number(e.target.value)
-          if (Number.isFinite(v)) onChange(clamp(v, min, max))
-        }}
-      />
-    </label>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Size, in image-to-image
-// ---------------------------------------------------------------------------
-
-function SizeFollows({
-  megapixels,
-  expert,
-  onPick,
-}: {
-  megapixels: number
-  expert: boolean
-  onPick: (mp: number) => void
-}) {
-  if (!expert) {
-    return (
-      <p className="text-caption text-grey-700">
-        <Kicker>Size</Kicker>{' '}
-        <span className="italic">
-          follows your picture. About {megapixels.toFixed(1)} megapixels, edges rounded to 16.
-          Nothing is cropped or stretched.
-        </span>
-      </p>
-    )
-  }
-  return (
-    <label className="block">
-      <Label hint="aspect ratio is always kept">Output size</Label>
-      <div className="flex border border-grey-300">
-        {MEGAPIXELS.map((mp, i) => {
-          const on = Math.abs(mp - megapixels) < 0.001
-          return (
-            <button
-              key={mp}
-              id={i === 0 ? 'sg-megapixels' : undefined}
-              type="button"
-              aria-pressed={on}
-              onClick={() => onPick(mp)}
-              className={`flex-1 cursor-pointer px-2 py-1.5 text-caption tabular-nums ${i > 0 ? 'border-l border-grey-300' : ''} ${
-                on ? 'bg-ink text-newsprint' : 'text-grey-700 hover:text-ink'
-              } focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900`}
-            >
-              {mp.toFixed(1)} MP
-            </button>
-          )
-        })}
-      </div>
-      <span className="mt-1 block text-caption italic text-grey-700">
-        Your picture is scaled to this budget, aspect kept, edges rounded to 16.
-      </span>
-    </label>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Strength
-// ---------------------------------------------------------------------------
-
-function Strength({
-  denoise,
-  expert,
-  steps,
-  modelLabel,
-  onChange,
-}: {
-  denoise: number
-  expert: boolean
-  steps: number
-  modelLabel: string
-  onChange: (d: number) => void
-}) {
-  const railRef = useRef<HTMLDivElement | null>(null)
-  const min = 0.05
-  const max = 0.95
-  const nearest = STOPS.reduce((best, s) =>
-    Math.abs(s.denoise - denoise) < Math.abs(best.denoise - denoise) ? s : best,
-  )
-  const onStop = Math.abs(nearest.denoise - denoise) < 0.005
-  const pos = (denoise - min) / (max - min)
-
-  const commit = (value: number) => {
-    if (expert) onChange(round2(clamp(value, min, max)))
-    else {
-      const stop = STOPS.reduce((best, s) =>
-        Math.abs(s.denoise - value) < Math.abs(best.denoise - value) ? s : best,
-      )
-      onChange(stop.denoise)
-    }
-  }
-
-  const fromPointer = (clientX: number) => {
-    const rect = railRef.current?.getBoundingClientRect()
-    if (!rect || rect.width === 0) return
-    commit(min + ((clientX - rect.left) / rect.width) * (max - min))
-  }
-
-  const onKey = (e: ReactKeyboardEvent) => {
-    const i = STOPS.indexOf(nearest)
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-      e.preventDefault()
-      if (expert) onChange(round2(clamp(denoise - 0.01, min, max)))
-      else onChange(STOPS[Math.max(0, i - 1)].denoise)
-    } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-      e.preventDefault()
-      if (expert) onChange(round2(clamp(denoise + 0.01, min, max)))
-      else onChange(STOPS[Math.min(STOPS.length - 1, i + 1)].denoise)
-    } else if (e.key === 'Home') {
-      e.preventDefault()
-      onChange(STOPS[0].denoise)
-    } else if (e.key === 'End') {
-      e.preventDefault()
-      onChange(STOPS[STOPS.length - 1].denoise)
-    }
-  }
-
-  const advise = steps <= 10 && nearest.key === 'touch'
-
-  return (
-    <div>
-      <div className="flex items-end justify-between">
-        <Label>How much to change</Label>
-        {expert && (
-          <label className="mb-1.5 flex items-center gap-1.5 text-caption text-grey-700">
-            <span className="uppercase tracking-[0.14em]">denoise</span>
-            <input
-              id="sg-denoise"
-              type="number"
-              className="field w-20 tabular-nums"
-              value={denoise}
-              min={min}
-              max={max}
-              step={0.01}
-              onChange={(e) => {
-                const v = Number(e.target.value)
-                if (Number.isFinite(v)) onChange(round2(clamp(v, min, max)))
-              }}
-            />
-          </label>
-        )}
-      </div>
-
-      <div
-        ref={railRef}
-        role="slider"
-        tabIndex={0}
-        aria-label="How much to change"
-        aria-valuemin={min}
-        aria-valuemax={max}
-        aria-valuenow={denoise}
-        aria-valuetext={onStop ? nearest.label : `${nearest.label}, denoise ${denoise.toFixed(2)}`}
-        onKeyDown={onKey}
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId)
-          fromPointer(e.clientX)
-        }}
-        onPointerMove={(e) => {
-          if (e.buttons) fromPointer(e.clientX)
-        }}
-        className="sg-tap relative mt-1 h-4 touch-none cursor-pointer select-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
-      >
-        <span className="absolute inset-x-0 top-1/2 block h-[2px] -translate-y-1/2 bg-grey-300" />
-        <span
-          className="absolute top-1/2 left-0 block h-[2px] -translate-y-1/2 bg-burgundy-900"
-          style={{ width: `${clamp(pos, 0, 1) * 100}%` }}
-        />
-        {STOPS.map((s) => (
-          <span
-            key={s.key}
-            aria-hidden
-            className="absolute top-1/2 block h-2 w-px -translate-x-1/2 -translate-y-1/2 bg-grey-400"
-            style={{ left: `${((s.denoise - min) / (max - min)) * 100}%` }}
-          />
-        ))}
-        <span
-          aria-hidden
-          className="absolute top-1/2 block h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 bg-burgundy-900"
-          style={{ left: `${clamp(pos, 0, 1) * 100}%` }}
-        />
-      </div>
-
-      <div className="relative mt-1 h-4">
-        {STOPS.map((s) => {
-          const on = nearest.key === s.key
-          const left = ((s.denoise - min) / (max - min)) * 100
-          return (
-            <button
-              key={s.key}
-              type="button"
-              onClick={() => onChange(s.denoise)}
-              className={`absolute -translate-x-1/2 cursor-pointer whitespace-nowrap text-overline font-semibold uppercase tracking-[0.12em] ${
-                on ? 'text-ink' : 'text-grey-500 hover:text-ink'
-              } focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900`}
-              style={{ left: `${clamp(left, 8, 92)}%` }}
-            >
-              {s.label}
-            </button>
-          )
-        })}
-      </div>
-
-      <p className="mt-4 text-caption italic text-grey-700">{nearest.help}</p>
-      {advise && (
-        <p className="mt-1 text-caption italic text-grey-700">
-          {modelLabel} works in {steps} steps. At Touch up only two of them are used. Rework will
-          serve you better.
-        </p>
-      )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// The run button
-// ---------------------------------------------------------------------------
-
-function RunButton({
-  label,
-  disabled,
-  why,
-  running,
-  queuedAhead,
-  lastMs,
-  runs,
-  job,
-  onRun,
-  onStop,
-  reduced,
-}: {
-  label: string
-  disabled: boolean
-  why: string
-  running: boolean
-  queuedAhead: number
-  lastMs: number | null
-  runs: 1 | 2 | 4
-  job: DeskJob | null
-  onRun: () => void
-  onStop: () => void
-  reduced: boolean
-}) {
-  const [holding, setHolding] = useState(false)
-  const [receipt, setReceipt] = useState<string | null>(null)
-  const timer = useRef<number | null>(null)
-  const seen = useRef<number | null>(null)
-
-  useEffect(() => {
-    if (lastMs == null || seen.current === lastMs) return
-    seen.current = lastMs
-    setReceipt(seconds(lastMs))
-    const t = window.setTimeout(() => setReceipt(null), 2600)
-    return () => window.clearTimeout(t)
-  }, [lastMs])
-
-  const beginHold = () => {
-    setHolding(true)
-    timer.current = window.setTimeout(() => {
-      setHolding(false)
-      onStop()
-    }, 600)
-  }
-  const endHold = () => {
-    setHolding(false)
-    if (timer.current) window.clearTimeout(timer.current)
-    timer.current = null
-  }
-
-  if (running) {
-    return (
-      <div>
-        <button
-          type="button"
-          aria-label="Hold to stop this job"
-          onPointerDown={beginHold}
-          onPointerUp={endHold}
-          onPointerLeave={endHold}
-          onPointerCancel={endHold}
-          onKeyDown={(e: ReactKeyboardEvent) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              onStop()
-            }
-          }}
-          className="press sg-hold relative overflow-hidden"
-          style={{ backgroundColor: 'var(--color-newsprint)', color: 'var(--color-burgundy-900)' }}
-        >
-          <span className="relative">Hold to stop</span>
-          <span
-            aria-hidden
-            className="absolute inset-0 grid place-items-center bg-burgundy-900 text-newsprint"
-            style={{
-              clipPath: holding ? 'inset(0 0 0 0)' : 'inset(0 100% 0 0)',
-              transition: reduced ? 'none' : 'clip-path 600ms linear',
-            }}
-          >
-            Hold to stop
-          </span>
-        </button>
-        <p className="mt-1.5 text-caption italic text-grey-700 tabular-nums">
-          {job?.total && job.total > 1 ? `Picture ${job.index} of ${job.total} · ` : ''}
-          {job?.stage ?? 'Working'}
-          {job && job.pct >= 0.97 && job.status === 'running' ? ' · running long, still working' : ''}
-        </p>
-      </div>
-    )
-  }
-
-  return (
-    <div>
-      <button type="button" className="press" disabled={disabled} onClick={onRun}>
-        {receipt ? (
-          <span className="tabular-nums">{receipt}</span>
-        ) : (
-          <>
-            {label}
-            {runs > 1 ? ` · ×${runs}` : ''}
-            {queuedAhead > 0 ? ' · next in line' : ''}
-          </>
-        )}
-      </button>
-      {disabled && why && <p className="mt-1.5 text-caption italic text-grey-500">{why}</p>}
-      {!disabled && queuedAhead > 0 && (
-        <p className="mt-1.5 text-caption italic text-grey-700">
-          There is one 16 GB card and it is busy. Your picture starts when the job in front of it
-          finishes.
-        </p>
-      )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// What simple mode chose
-// ---------------------------------------------------------------------------
-
-function SettingLine({
-  c,
-  expert,
-  hasScheduler,
-  onOpen,
-}: {
-  c: Composition
-  expert: boolean
-  hasScheduler: boolean
-  onOpen: (field: string) => void
-}) {
-  if (expert) return null
-  return (
-    <p className="mt-2 text-caption italic text-grey-700">
-      Using the maker’s settings:{' '}
-      <Link className="not-italic tabular-nums" onClick={() => onOpen('sg-steps')}>
-        {c.steps} steps
-      </Link>
-      <span> · </span>
-      <Link className="not-italic tabular-nums" onClick={() => onOpen('sg-cfg')}>
-        CFG {c.cfg.toFixed(1)}
-      </Link>
-      <span> · </span>
-      <Link className="not-italic" onClick={() => onOpen('sg-sampler')}>
-        {c.sampler}
-        {hasScheduler ? ` / ${c.scheduler}` : ''}
-      </Link>
-      <span> · </span>
-      <Link className="not-italic" onClick={() => onOpen('sg-seed')}>
-        seed {c.seedLocked ? c.seed : 'random'}
-      </Link>
-      . <Link onClick={() => onOpen('sg-steps')}>Show all controls →</Link>
-    </p>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Faults
-// ---------------------------------------------------------------------------
 
 function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }) {
   if (fault.cancelled) {
@@ -3495,427 +2382,6 @@ function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }
     </Notice>
   )
 }
-
-// ---------------------------------------------------------------------------
-// The expert margin
-// ---------------------------------------------------------------------------
-
-function ExpertMargin({
-  c,
-  style,
-  cat,
-  hasNegative,
-  hasScheduler,
-  hasShift,
-  hasClipSkip,
-  houseNegative,
-  graph,
-  queued,
-  hires,
-  faultNode,
-  onClose,
-}: {
-  c: Composition
-  style: Style
-  cat: Catalogue
-  hasNegative: boolean
-  hasScheduler: boolean
-  hasShift: boolean
-  hasClipSkip: boolean
-  houseNegative: string
-  /** The family graph, for the registry's own notes. */
-  graph: FamilyDef
-  /** The same graph with the passes and LoRAs on it, which is what gets sent. */
-  queued: FamilyDef | DerivedDef
-  hires: boolean
-  faultNode: string | null
-  onClose: () => void
-}) {
-  const [showJson, setShowJson] = useState(false)
-  const reduced = useReducedMotion()
-  const [filled, setFilled] = useState(false)
-
-  // The margin fills in; nothing else on the desk moves.
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setFilled(true))
-    return () => cancelAnimationFrame(id)
-  }, [])
-
-  const shown = filled || reduced
-
-  return (
-    <div
-      style={{
-        opacity: shown ? 1 : 0,
-        transform: shown ? 'translateX(0)' : 'translateX(-8px)',
-        transition: reduced ? 'none' : 'opacity 180ms ease-out, transform 180ms ease-out',
-      }}
-      className="text-small"
-    >
-      <div className="mb-4 flex items-baseline justify-between border-b-2 border-burgundy-900 pb-1.5">
-        <Kicker className="text-burgundy-900">All controls</Kicker>
-        <Link className="text-caption" onClick={onClose}>
-          ◂ Simple
-        </Link>
-      </div>
-
-      <ExpertRow label="Steps" hint="more steps, more time">
-        <input
-          id="sg-steps"
-          type="number"
-          className="field tabular-nums"
-          min={1}
-          max={150}
-          value={c.steps}
-          onChange={(e) => {
-            const v = Number(e.target.value)
-            if (Number.isFinite(v)) store.edit({ steps: clamp(Math.round(v), 1, 150) }, 'steps')
-          }}
-        />
-      </ExpertRow>
-
-      <ExpertRow label="CFG" hint="how hard it follows the words">
-        <input
-          id="sg-cfg"
-          type="number"
-          className="field tabular-nums"
-          min={0}
-          max={30}
-          step={0.1}
-          value={c.cfg}
-          onChange={(e) => {
-            const v = Number(e.target.value)
-            if (Number.isFinite(v)) store.edit({ cfg: clamp(v, 0, 30) }, 'cfg')
-          }}
-        />
-      </ExpertRow>
-
-      <ExpertRow label="Sampler">
-        <select
-          id="sg-sampler"
-          className="field"
-          value={c.sampler}
-          onChange={(e) => store.edit({ sampler: e.target.value }, 'sampler')}
-        >
-          {!cat.samplers.includes(c.sampler) && <option value={c.sampler}>{c.sampler}</option>}
-          {cat.samplers.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
-      </ExpertRow>
-
-      {hasScheduler && (
-        <ExpertRow label="Scheduler">
-          <select
-            id="sg-scheduler"
-            className="field"
-            value={c.scheduler}
-            onChange={(e) => store.edit({ scheduler: e.target.value }, 'scheduler')}
-          >
-            {!cat.schedulers.includes(c.scheduler) && (
-              <option value={c.scheduler}>{c.scheduler}</option>
-            )}
-            {cat.schedulers.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        </ExpertRow>
-      )}
-
-      {style.alt && (
-        <button
-          type="button"
-          onClick={() =>
-            store.edit(
-              {
-                sampler: style.alt!.sampler,
-                scheduler: style.alt!.scheduler,
-                steps: style.alt!.steps,
-                cfg: style.alt!.cfg,
-              },
-              'sampler',
-              'scheduler',
-              'steps',
-              'cfg',
-            )
-          }
-          className="mb-4 w-full cursor-pointer border border-grey-300 px-2 py-1.5 text-left text-caption text-grey-700 hover:border-ink hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
-        >
-          <span className="block text-overline font-semibold uppercase tracking-[0.16em]">
-            Use the author’s alternative
-          </span>
-          <span className="tabular-nums">
-            {style.alt.sampler} / {style.alt.scheduler}, {style.alt.steps} steps, CFG{' '}
-            {style.alt.cfg.toFixed(1)}
-          </span>
-        </button>
-      )}
-
-      <ExpertRow label="Seed">
-        <div className="flex items-center gap-2">
-          <input
-            id="sg-seed"
-            type="number"
-            className={`field tabular-nums ${c.seedLocked ? 'not-italic text-ink' : 'italic text-grey-500'}`}
-            value={c.seed}
-            min={0}
-            onChange={(e) => {
-              const v = Number(e.target.value)
-              if (Number.isFinite(v)) store.edit({ seed: Math.max(0, Math.floor(v)), seedLocked: true }, 'seed')
-            }}
-          />
-          <button
-            type="button"
-            onClick={() => store.patch({ seedLocked: !c.seedLocked })}
-            aria-pressed={c.seedLocked}
-            className={`shrink-0 cursor-pointer border px-2 py-1.5 text-overline font-semibold uppercase tracking-[0.14em] ${
-              c.seedLocked ? 'border-ink bg-ink text-newsprint' : 'border-grey-300 text-grey-700'
-            } focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900`}
-          >
-            {c.seedLocked ? 'Fixed' : 'Random'}
-          </button>
-        </div>
-        <span className="mt-1 block text-caption italic text-grey-500">
-          {c.seedLocked
-            ? 'The same seed and the same settings make the same picture.'
-            : 'A fresh seed every run. The last one used is shown above.'}
-        </span>
-      </ExpertRow>
-
-      {hasNegative && (
-        <ExpertRow label="Negative prompt" hint="what to keep out">
-          <textarea
-            id="sg-negative"
-            className="field"
-            rows={3}
-            value={c.negative ?? houseNegative}
-            onChange={(e) => store.edit({ negative: e.target.value }, 'negative')}
-          />
-          {c.negative !== null && (
-            <Link
-              className="mt-1 text-caption"
-              onClick={() => store.set({ ...c, negative: null, touched: c.touched.filter((t) => t !== 'negative') })}
-            >
-              Reset to the house wording
-            </Link>
-          )}
-        </ExpertRow>
-      )}
-
-      {style.positivePrefix !== null && (
-        <ExpertRow label="Quality words" hint="added in front of your prompt">
-          <input
-            id="sg-prefix"
-            className="field"
-            value={c.positivePrefix ?? ''}
-            onChange={(e) => store.edit({ positivePrefix: e.target.value }, 'positivePrefix')}
-          />
-        </ExpertRow>
-      )}
-
-      {hasClipSkip && (
-        <ExpertRow label="Clip skip" hint="−2 on Illustrious checkpoints">
-          <input
-            id="sg-clipskip"
-            type="number"
-            className="field tabular-nums"
-            min={-12}
-            max={-1}
-            value={c.clipSkip ?? -1}
-            onChange={(e) => {
-              const v = Number(e.target.value)
-              if (Number.isFinite(v)) store.edit({ clipSkip: clamp(Math.round(v), -12, -1) }, 'clipSkip')
-            }}
-          />
-        </ExpertRow>
-      )}
-
-      {hasShift && (
-        <ExpertRow label="Shift" hint="sampling curve">
-          <input
-            id="sg-shift"
-            type="number"
-            className="field tabular-nums"
-            step={0.1}
-            min={0}
-            max={12}
-            value={c.shift ?? 0}
-            onChange={(e) => {
-              const v = Number(e.target.value)
-              if (Number.isFinite(v)) store.edit({ shift: clamp(v, 0, 12) }, 'shift')
-            }}
-          />
-        </ExpertRow>
-      )}
-
-      <ExpertRow label="How many" hint="one after another, never in one batch">
-        <div className="flex border border-grey-300">
-          {([1, 2, 4] as const).map((n, i) => (
-            <button
-              key={n}
-              type="button"
-              aria-pressed={c.runs === n}
-              onClick={() => store.patch({ runs: n })}
-              className={`flex-1 cursor-pointer px-2 py-1.5 text-caption tabular-nums ${i > 0 ? 'border-l border-grey-300' : ''} ${
-                c.runs === n ? 'bg-ink text-newsprint' : 'text-grey-700 hover:text-ink'
-              } focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900`}
-            >
-              ×{n}
-            </button>
-          ))}
-        </div>
-      </ExpertRow>
-
-      {(style.note || graph.notes) && (
-        <div className="mb-5 border-l-[3px] border-burgundy-900 pl-3">
-          <p className="text-small italic leading-snug text-grey-700">
-            {style.note || trim(graph.notes, 320)}
-          </p>
-          {style.note && graph.notes && (
-            <details className="mt-2">
-              <summary className="cursor-pointer text-caption text-grey-500">
-                More on this family
-              </summary>
-              <p className="mt-1 text-caption italic leading-snug text-grey-700">
-                {trim(graph.notes, 700)}
-              </p>
-            </details>
-          )}
-        </div>
-      )}
-
-      {cat.unavailable.length > 0 && (
-        <details className="mb-5">
-          <summary className="cursor-pointer text-caption text-grey-500">
-            Detected but unavailable ({cat.unavailable.length})
-          </summary>
-          <ul className="mt-1 space-y-1">
-            {cat.unavailable.map((u) => (
-              <li key={u.name} className="text-caption text-grey-700">
-                <span className="block truncate">{u.name}</span>
-                <span className="italic text-grey-500">{u.why}</span>
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
-
-      <div>
-        <Link className="text-caption" onClick={() => setShowJson((v) => !v)}>
-          {showJson ? 'Hide the workflow' : 'Show the workflow'}
-        </Link>
-        {showJson && (
-          <WorkflowPeek
-            def={queued}
-            hires={hires}
-            c={c}
-            houseNegative={houseNegative}
-            faultNode={faultNode}
-          />
-        )}
-      </div>
-    </div>
-  )
-}
-
-function ExpertRow({
-  label,
-  hint,
-  children,
-}: {
-  label: string
-  hint?: string
-  children: ReactNode
-}) {
-  return (
-    <div className="mb-4 border-b border-grey-300 pb-3">
-      <Label hint={hint}>{label}</Label>
-      {children}
-    </div>
-  )
-}
-
-function trim(text: string, n: number): string {
-  if (text.length <= n) return text
-  return `${text.slice(0, n).replace(/\s+\S*$/, '')}…`
-}
-
-/**
- * The graph, as JSON, with a Copy button.
- *
- * `def` is the derived graph the run button would send, not the bare family
- * one: with a detail pass, a two pass render or a LoRA switched on, the two
- * differ by several nodes and a rewired decode, and printing the bare graph
- * under a Copy button meant the JSON on screen reproduced none of the picture.
- */
-function WorkflowPeek({
-  def,
-  hires,
-  c,
-  houseNegative,
-  faultNode,
-}: {
-  def: FamilyDef | DerivedDef
-  hires: boolean
-  c: Composition
-  houseNegative: string
-  faultNode: string | null
-}) {
-  const [copied, setCopied] = useState(false)
-  const json = useMemo(() => {
-    try {
-      // The same shaping start() does before it queues. Without it the preview
-      // carries a denoise or a source left over from another mode, which the
-      // real run drops.
-      const shaped: Composition = {
-        ...c,
-        source: needsSource(c.mode) ? c.source : null,
-        denoise: c.mode === 'i2i' ? (c.denoise ?? DEFAULT_DENOISE) : null,
-        megapixels: c.mode === 'i2i' ? (c.megapixels ?? 1) : null,
-        length: null,
-        fps: null,
-      }
-      const params = toParams(shaped, { negative: houseNegative })
-      return JSON.stringify(buildQueued(def, params, hires), null, 2)
-    } catch (err) {
-      return `Could not build the graph: ${err instanceof Error ? err.message : String(err)}`
-    }
-  }, [def, hires, c, houseNegative])
-
-  return (
-    <div className="mt-2">
-      <p className="mb-1 text-caption text-grey-500">
-        {Object.keys(def.graph).length} nodes
-        {faultNode ? ` · node ${faultNode} is the one ComfyUI complained about` : ''}
-        {' · '}
-        <Link
-          onClick={() => {
-            void navigator.clipboard?.writeText(json).then(
-              () => {
-                setCopied(true)
-                setTimeout(() => setCopied(false), 1500)
-              },
-              () => setCopied(false),
-            )
-          }}
-        >
-          {copied ? 'Copied' : 'Copy'}
-        </Link>
-      </p>
-      <pre className="max-h-80 overflow-auto border border-grey-300 bg-newsprint-aged p-2 text-[11px] leading-snug">
-        {json}
-      </pre>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// The plate
-// ---------------------------------------------------------------------------
 
 function Plate({
   state,
@@ -4072,7 +2538,7 @@ function EmptyPlate({
                 >
                   <span className="text-body">{ex.prompt}</span>
                   <span className="shrink-0 text-caption italic text-grey-500">
-                    {BY_ID[ex.familyId] ? groupName(BY_ID[ex.familyId]) : ex.familyId} · {ex.shape}
+                    {LOOKS.find((l) => l.id === ex.look)?.label ?? ex.look}
                   </span>
                 </button>
               </li>
@@ -4253,10 +2719,13 @@ function TodayStrip({
 function ArchivePicker({
   records,
   onClose,
+  onFile,
   onPick,
 }: {
   records: readonly HistoryEntry[]
   onClose: () => void
+  /** Choose a file from disk instead. The two used to be separate links. */
+  onFile: () => void
   onPick: (e: HistoryEntry) => void
 }) {
   const [query, setQuery] = useState('')
@@ -4325,10 +2794,14 @@ function ArchivePicker({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-baseline justify-between border-b-2 border-burgundy-900 pb-1.5">
-          <Kicker className="text-burgundy-900">From the archive</Kicker>
-          <Link className="text-caption" onClick={onClose}>
-            Close
-          </Link>
+          <Kicker className="text-burgundy-900">Choose a picture</Kicker>
+          <p className="text-caption">
+            <Link onClick={onFile}>Choose a file</Link>
+            <span className="px-2 text-grey-400" aria-hidden>
+              ·
+            </span>
+            <Link onClick={onClose}>Close</Link>
+          </p>
         </div>
 
         <input

@@ -295,7 +295,7 @@ export const LORA_CATALOGUE: readonly CatalogueEntry[] = [
     category: "anatomy",
     priority: 1,
     bases: ["ponyDiffusionV6XL.safetensors"],
-    trigger: "rnat",
+    trigger: "rnct", // read from ss_tag_frequency: rnct appears in 26 of 26 training images. "rnat" was a transcription error and would have injected a token the LoRA was never trained on.
     recommended: 0.7,
     slider: false,
     usage: "refine",

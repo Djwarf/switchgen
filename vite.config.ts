@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 import { switchgenApi } from './server/api.mjs'
 import { switchgenDownloads } from './server/downloads.mjs'
 import { switchgenReel } from './server/reel.mjs'
+import { switchgenVision } from './server/vision.mjs'
 
 // ComfyUI runs as a systemd user service on :8188.
 // Proxy through Vite so the browser sees one origin (no CORS, no mixed content).
@@ -41,7 +42,7 @@ const allowedHosts = [
 ]
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), switchgenApi(), switchgenDownloads(), switchgenReel()],
+  plugins: [react(), tailwindcss(), switchgenApi(), switchgenDownloads(), switchgenReel(), switchgenVision()],
   server: { host, port: 5273, proxy, allowedHosts },
   preview: { host, port: 5273, proxy, allowedHosts },
 })
