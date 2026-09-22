@@ -244,8 +244,12 @@ export function sidecarsOf(def: FamilyDef): { clip: string[]; vae: string } {
   const clip = new Set<string>()
   let vae = ''
   for (const node of Object.values(def.graph)) {
-    const cn = node.inputs['clip_name']
-    if (typeof cn === 'string') clip.add(cn)
+    // DualCLIPLoader and TripleCLIPLoader use clip_name1/2/3, not clip_name.
+    // Reading only clip_name made every encoder of a dual-encoder family
+    // invisible here, so both availability and the "needs X" message were wrong.
+    for (const [k, v] of Object.entries(node.inputs)) {
+      if (/^clip_name\d*$/.test(k) && typeof v === 'string') clip.add(v)
+    }
     const vn = node.inputs['vae_name']
     if (typeof vn === 'string') vae = vn
   }

@@ -3498,5 +3498,567 @@ export const FAMILY_DEFS: FamilyDef[] = [
         ]
       ]
     }
+  },
+  {
+    "id": "hunyuan-video",
+    "label": "HunyuanVideo (uncensored text to video)",
+    "mode": "video",
+    "models": [
+      "hunyuan-video-t2v-720p-Q4_K_M.gguf"
+    ],
+    "verified": true,
+    "dualModel": false,
+    "clipType": "hunyuan_video",
+    "clipFile": "llava_llama3_fp8_scaled.safetensors",
+    "vaeFile": "hunyuan_video_vae_bf16.safetensors",
+    "defaults": {
+      "steps": 20,
+      "cfg": 1.0,
+      "width": 848,
+      "height": 480,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "length": 73,
+      "fps": 24.0,
+      "negative": "low quality, worst quality, jpeg artifacts, blurry, static, watermark, text, deformed hands, extra fingers"
+    },
+    "perModel": {
+      "hunyuan-video-t2v-720p-Q4_K_M.gguf": {
+        "label": "Hunyuan Video T2V 720p - Q4_K_M (7.9 GB)",
+        "note": "Already installed. The comfortable choice on a 16 GB card.",
+        "bytes": 7883680512,
+        "requiresBytes": 17714201345,
+        "fitsTypicalFreeRAM": true
+      },
+      "hunyuan-video-t2v-720p-Q5_K_M.gguf": {
+        "label": "Hunyuan Video T2V 720p - Q5_K_M (9.4 GB)",
+        "note": "1.6 GB more weights than Q4_K_M for a small quality gain.",
+        "bytes": 9449663232,
+        "requiresBytes": 19280184065,
+        "fitsTypicalFreeRAM": true
+      },
+      "hunyuan-video-t2v-720p-Q6_K.gguf": {
+        "label": "Hunyuan Video T2V 720p - Q6_K (11.0 GB)",
+        "note": "Highest quantisation that still leaves activation headroom at 848x480x73 on 16 GB.",
+        "bytes": 10953714432,
+        "requiresBytes": 20784235265,
+        "fitsTypicalFreeRAM": true
+      }
+    },
+    "notes": "SwarmUI rates its censorship \"No\". Distilled, so CFG stays at 1 and guidance is carried by the FluxGuidance node instead. 16.5 GB resident, comfortably inside this machine.",
+    "graph": {
+      "1": {
+        "class_type": "UnetLoaderGGUF",
+        "inputs": {
+          "unet_name": "hunyuan-video-t2v-720p-Q4_K_M.gguf"
+        }
+      },
+      "2": {
+        "class_type": "DualCLIPLoader",
+        "inputs": {
+          "clip_name1": "clip_l.safetensors",
+          "clip_name2": "llava_llama3_fp8_scaled.safetensors",
+          "type": "hunyuan_video",
+          "device": "default"
+        }
+      },
+      "3": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "hunyuan_video_vae_bf16.safetensors"
+        }
+      },
+      "4": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "A cinematic tracking shot of a red vintage sports car driving along a coastal highway at golden hour, waves breaking on the rocks below, warm rim light, shallow depth of field.",
+          "clip": [
+            "2",
+            0
+          ]
+        }
+      },
+      "5": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "low quality, worst quality, jpeg artifacts, blurry, static, watermark, text, deformed hands, extra fingers",
+          "clip": [
+            "2",
+            0
+          ]
+        }
+      },
+      "6": {
+        "class_type": "FluxGuidance",
+        "inputs": {
+          "conditioning": [
+            "4",
+            0
+          ],
+          "guidance": 6.0
+        }
+      },
+      "7": {
+        "class_type": "ModelSamplingSD3",
+        "inputs": {
+          "model": [
+            "1",
+            0
+          ],
+          "shift": 7.0
+        }
+      },
+      "8": {
+        "class_type": "EmptyHunyuanLatentVideo",
+        "inputs": {
+          "width": 848,
+          "height": 480,
+          "length": 73,
+          "batch_size": 1
+        }
+      },
+      "9": {
+        "class_type": "CFGGuider",
+        "inputs": {
+          "model": [
+            "7",
+            0
+          ],
+          "positive": [
+            "6",
+            0
+          ],
+          "negative": [
+            "5",
+            0
+          ],
+          "cfg": 1.0
+        }
+      },
+      "10": {
+        "class_type": "KSamplerSelect",
+        "inputs": {
+          "sampler_name": "euler"
+        }
+      },
+      "11": {
+        "class_type": "BasicScheduler",
+        "inputs": {
+          "model": [
+            "7",
+            0
+          ],
+          "scheduler": "simple",
+          "steps": 20,
+          "denoise": 1.0
+        }
+      },
+      "12": {
+        "class_type": "RandomNoise",
+        "inputs": {
+          "noise_seed": 0
+        }
+      },
+      "13": {
+        "class_type": "SamplerCustomAdvanced",
+        "inputs": {
+          "noise": [
+            "12",
+            0
+          ],
+          "guider": [
+            "9",
+            0
+          ],
+          "sampler": [
+            "10",
+            0
+          ],
+          "sigmas": [
+            "11",
+            0
+          ],
+          "latent_image": [
+            "8",
+            0
+          ]
+        }
+      },
+      "14": {
+        "class_type": "VAEDecodeTiled",
+        "inputs": {
+          "samples": [
+            "13",
+            0
+          ],
+          "vae": [
+            "3",
+            0
+          ],
+          "tile_size": 256,
+          "overlap": 64,
+          "temporal_size": 32,
+          "temporal_overlap": 4
+        }
+      },
+      "16": {
+        "class_type": "SaveWEBM",
+        "inputs": {
+          "images": [
+            "14",
+            0
+          ],
+          "filename_prefix": "switchgen/hunyuan-video",
+          "codec": "vp9",
+          "fps": 24.0,
+          "crf": 32.0
+        }
+      }
+    },
+    "bindings": {
+      "model": [
+        [
+          "1",
+          "unet_name"
+        ]
+      ],
+      "seed": [
+        [
+          "12",
+          "noise_seed"
+        ]
+      ],
+      "steps": [
+        [
+          "11",
+          "steps"
+        ]
+      ],
+      "cfg": [
+        [
+          "9",
+          "cfg"
+        ]
+      ],
+      "sampler": [
+        [
+          "10",
+          "sampler_name"
+        ]
+      ],
+      "scheduler": [
+        [
+          "11",
+          "scheduler"
+        ]
+      ],
+      "positive": [
+        [
+          "4",
+          "text"
+        ]
+      ],
+      "negative": [
+        [
+          "5",
+          "text"
+        ]
+      ],
+      "width": [
+        [
+          "8",
+          "width"
+        ]
+      ],
+      "height": [
+        [
+          "8",
+          "height"
+        ]
+      ],
+      "length": [
+        [
+          "8",
+          "length"
+        ]
+      ],
+      "fps": [
+        [
+          "15",
+          "fps"
+        ]
+      ],
+      "denoise": [
+        [
+          "11",
+          "denoise"
+        ]
+      ]
+    }
+  },
+  {
+    "id": "ltxv-0_9_6-gguf",
+    "label": "LTX-Video 0.9.6 distilled (fast video)",
+    "mode": "video",
+    "models": [
+      "ltxv-2b-0.9.6-distilled-Q8_0.gguf"
+    ],
+    "verified": true,
+    "dualModel": false,
+    "clipType": "ltxv",
+    "clipFile": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+    "vaeFile": "",
+    "defaults": {
+      "steps": 30,
+      "cfg": 3.0,
+      "width": 768,
+      "height": 512,
+      "sampler": "euler",
+      "scheduler": "simple",
+      "length": 97,
+      "fps": 24.0,
+      "negative": "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"
+    },
+    "perModel": {
+      "ltx-video-2b-v0.9.5.safetensors": {
+        "label": "LTX-Video 2B v0.9.5 (6.3 GB)",
+        "steps": 30,
+        "cfg": 3.0,
+        "note": "All-in-one checkpoint: DiT + video VAE in one file, so vaeFile is empty and VAEDecode reads CheckpointLoaderSimple output slot 2. Fastest video model in this group.",
+        "bytes": 6340729500,
+        "requiresBytes": 11498078188,
+        "fitsTypicalFreeRAM": true
+      },
+      "ltxv-2b-0.9.8-distilled.safetensors": {
+        "label": "LTX-Video 2B 0.9.8 distilled (6.3 GB)",
+        "steps": 8,
+        "cfg": 1.0,
+        "note": "Distilled - run at CFG 1.0 and 8 steps. Higher CFG burns the output.",
+        "bytes": 6340744492,
+        "requiresBytes": 11498093180,
+        "fitsTypicalFreeRAM": true
+      },
+      "ltxv-13b-0.9.8-dev-fp8.safetensors": {
+        "label": "LTX-Video 13B 0.9.8 dev fp8 (15.7 GB)",
+        "steps": 30,
+        "cfg": 3.0,
+        "note": "15.7 GB of weights plus a 5.2 GB encoder = 20.9 GB; fits in RAM but needs ComfyUI offload on a 16 GB card.",
+        "bytes": 15694279916,
+        "requiresBytes": 20851628604,
+        "fitsTypicalFreeRAM": true
+      }
+    },
+    "notes": "Distilled and small, so it is the quickest way to see whether an idea works before spending minutes on Wan. The catalogue entry is the 0.9.5 checkpoint, which bundles its VAE; this is the 0.9.6 GGUF, so the VAE is loaded separately and must be the matching 0.9.6 file.",
+    "graph": {
+      "1": {
+        "class_type": "UnetLoaderGGUF",
+        "inputs": {
+          "unet_name": "ltxv-2b-0.9.6-distilled-Q8_0.gguf"
+        }
+      },
+      "2": {
+        "class_type": "CLIPLoader",
+        "inputs": {
+          "clip_name": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+          "type": "ltxv",
+          "device": "default"
+        }
+      },
+      "3": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "A cinematic tracking shot of a red vintage sports car driving along a coastal highway at golden hour, waves breaking on the rocks below, warm rim light, shallow depth of field.",
+          "clip": [
+            "2",
+            0
+          ]
+        }
+      },
+      "4": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly",
+          "clip": [
+            "2",
+            0
+          ]
+        }
+      },
+      "5": {
+        "class_type": "EmptyLTXVLatentVideo",
+        "inputs": {
+          "width": 768,
+          "height": 512,
+          "length": 97,
+          "batch_size": 1
+        }
+      },
+      "6": {
+        "class_type": "LTXVConditioning",
+        "inputs": {
+          "positive": [
+            "3",
+            0
+          ],
+          "negative": [
+            "4",
+            0
+          ],
+          "frame_rate": 24.0
+        }
+      },
+      "7": {
+        "class_type": "KSamplerSelect",
+        "inputs": {
+          "sampler_name": "euler"
+        }
+      },
+      "8": {
+        "class_type": "LTXVScheduler",
+        "inputs": {
+          "steps": 30,
+          "max_shift": 2.05,
+          "base_shift": 0.95,
+          "stretch": true,
+          "terminal": 0.1,
+          "latent": [
+            "5",
+            0
+          ]
+        }
+      },
+      "9": {
+        "class_type": "SamplerCustom",
+        "inputs": {
+          "model": [
+            "1",
+            0
+          ],
+          "add_noise": true,
+          "noise_seed": 0,
+          "cfg": 3.0,
+          "positive": [
+            "6",
+            0
+          ],
+          "negative": [
+            "6",
+            1
+          ],
+          "sampler": [
+            "7",
+            0
+          ],
+          "sigmas": [
+            "8",
+            0
+          ],
+          "latent_image": [
+            "5",
+            0
+          ]
+        }
+      },
+      "10": {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": [
+            "9",
+            0
+          ],
+          "vae": [
+            "__ltx_vae",
+            0
+          ]
+        }
+      },
+      "12": {
+        "class_type": "SaveWEBM",
+        "inputs": {
+          "images": [
+            "10",
+            0
+          ],
+          "filename_prefix": "switchgen/ltxv",
+          "codec": "vp9",
+          "fps": 24.0,
+          "crf": 32.0
+        }
+      },
+      "__ltx_vae": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "LTX-Video-0.9.6-VAE-BF16.safetensors"
+        }
+      }
+    },
+    "bindings": {
+      "model": [
+        [
+          "1",
+          "unet_name"
+        ]
+      ],
+      "seed": [
+        [
+          "9",
+          "noise_seed"
+        ]
+      ],
+      "steps": [
+        [
+          "8",
+          "steps"
+        ]
+      ],
+      "cfg": [
+        [
+          "9",
+          "cfg"
+        ]
+      ],
+      "sampler": [
+        [
+          "7",
+          "sampler_name"
+        ]
+      ],
+      "positive": [
+        [
+          "3",
+          "text"
+        ]
+      ],
+      "negative": [
+        [
+          "4",
+          "text"
+        ]
+      ],
+      "width": [
+        [
+          "5",
+          "width"
+        ]
+      ],
+      "height": [
+        [
+          "5",
+          "height"
+        ]
+      ],
+      "length": [
+        [
+          "5",
+          "length"
+        ]
+      ],
+      "fps": [
+        [
+          "6",
+          "frame_rate"
+        ]
+      ]
+    }
   }
 ] as FamilyDef[]
