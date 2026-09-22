@@ -15,6 +15,7 @@
  * behaviour and no desk has to remember to ask for it; the writers are also
  * exported for the few places that already hold a built graph.
  */
+import { clamp } from './num'
 import type { ApiNode, ApiWorkflow } from './comfy'
 import { FAMILY_DEFS, type FamilyDef, type Binding } from './registry'
 
@@ -93,7 +94,6 @@ const SHIFT_NODE = /^ModelSampling/
 const CLIP_SKIP_NODE = 'CLIPSetLastLayer'
 const ADVANCED_SAMPLER = 'KSamplerAdvanced'
 
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
 
 /**
  * Write the sampling shift onto every ModelSampling* node in a graph.

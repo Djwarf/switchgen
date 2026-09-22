@@ -11,11 +11,11 @@
  */
 import { useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 
-/** The house focus ring: square, burgundy, offset. Never rounded. */
-export const RING =
-  'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900'
+import { RING } from '../type'
+export { RING }
 
-export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+import { clamp } from '../../lib/num'
+export { clamp }
 
 /** Round to the slider's own step, so 0.7000000000000001 never reaches the UI. */
 const toStep = (n: number, step: number) => Math.round(n / step) * step

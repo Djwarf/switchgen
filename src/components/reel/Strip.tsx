@@ -184,13 +184,13 @@ function ShotRow(p: RowProps) {
         ))}
 
         {state?.stale ? (
-          <p className="mt-1 border-l-2 border-warning pl-2 text-caption text-[#78350f]">
+          <p className="mt-1 border-l-2 border-warning pl-2 text-caption text-ink-warning">
             Rendered, then the shot before it changed. This clip still opens on the old frame.
           </p>
         ) : null}
 
         {state?.error ? (
-          <p className="mt-1 border-l-2 border-error pl-2 text-caption text-[#7f1d1d]">{state.error}</p>
+          <p className="mt-1 border-l-2 border-error pl-2 text-caption text-ink-error">{state.error}</p>
         ) : null}
 
         {expert ? (

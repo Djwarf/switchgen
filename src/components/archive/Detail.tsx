@@ -15,7 +15,7 @@ import { get as getEntry, update as updateEntry, type HistoryEntry } from '../..
 import { adoptValue, type DeskId, type TunableField } from '../../lib/session'
 import { ArchiveVideo } from './ArchiveVideo'
 import { CardActions, type EntryActions } from './CardActions'
-import { Notice } from './Notices'
+import { Notice } from '../type'
 import { duration, editionNo, fullDate, madeFrom } from './query'
 
 type Props = EntryActions & {
@@ -221,7 +221,7 @@ export function Detail({
         <div className="mt-6 grid gap-8 lg:grid-cols-[minmax(0,1.6fr)_minmax(22rem,1fr)]">
           <div>
             {entry.missing ? (
-              <Notice variant="correction" title="Not on disk">
+              <Notice tone="correction" title="Not on disk">
                 This file has been moved or deleted. Everything that made it is still here, so you
                 can make it again.
               </Notice>

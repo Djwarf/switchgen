@@ -116,7 +116,7 @@ export function SourceWell({
 
       {error && (
         <div className="mt-2">
-          <Notice kind="error" title="We could not use that picture">
+          <Notice tone="error" title="We could not use that picture">
             {error}
           </Notice>
         </div>

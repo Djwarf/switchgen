@@ -15,11 +15,11 @@
  */
 import type { ReactNode } from 'react'
 
-/** The house focus ring: square, burgundy, offset. */
-export const RING =
-  'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900'
+import { RING } from '../type'
+export { RING }
 
-export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+import { clamp } from '../../lib/num'
+export { clamp }
 
 /** `1,284`. Latent cell counts run into five figures, so they get grouped. */
 export const grouped = (n: number) => Math.round(n).toLocaleString('en-GB')
@@ -124,7 +124,7 @@ export function Note({ children }: { children: ReactNode }) {
 /** A short caution, set as a printed note rather than an alert box. */
 export function Caution({ children }: { children: ReactNode }) {
   return (
-    <p className="border-l-2 border-warning bg-[#fffbeb] px-2 py-1 text-caption leading-snug text-[#78350f]">
+    <p className="border-l-2 border-warning bg-paper-warning px-2 py-1 text-caption leading-snug text-ink-warning">
       {children}
     </p>
   )

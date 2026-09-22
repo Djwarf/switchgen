@@ -26,6 +26,11 @@
  * can never stop somebody else's picture.
  */
 
+import { availabilityOf, inventoryFrom } from '../lib/availability'
+import { measureImage as measure } from '../lib/images'
+import { clamp } from '../lib/num'
+import { ServerDown } from '../components/ServerDown'
+import { Notice, RING } from '../components/type'
 import {
   useCallback,
   useEffect,
@@ -45,7 +50,6 @@ import {
   getJob,
   listJobs,
   objectInfo,
-  optionsFor,
   run,
   systemStats,
   uploadImage,
@@ -61,13 +65,10 @@ import {
   FAMILIES,
   defaultsFor,
   instantiate,
-  modelsOf,
-  sidecarsOf,
   type FamilyDef,
 } from '../lib/workflows'
 
 import {
-  feasibility,
   gb,
   modelFiles,
   probeHardware,
@@ -123,10 +124,6 @@ export type VideoProps = {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
-
-/** The house focus ring: square, burgundy, offset. Never rounded. */
-const RING = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900'
 
 const isTyping = (e: KeyboardEvent): boolean => {
   const t = e.target as HTMLElement | null
@@ -361,14 +358,8 @@ async function loadCatalogue(): Promise<Catalogue> {
     systemStats().catch(() => null),
   ])
 
-  const clips = optionsFor(info, 'CLIPLoader', 'clip_name')
-  const vaes = optionsFor(info, 'VAELoader', 'vae_name')
-  const loras = optionsFor(info, 'LoraLoaderModelOnly', 'lora_name')
-  const weights = new Set<string>([
-    ...optionsFor(info, 'CheckpointLoaderSimple', 'ckpt_name'),
-    ...optionsFor(info, 'UNETLoader', 'unet_name'),
-    ...optionsFor(info, 'UnetLoaderGGUF', 'unet_name'),
-  ])
+  const inv = inventoryFrom(info)
+  const weights = inv.weights
 
   const families: VideoFamily[] = []
   const blocked: Catalogue['blocked'] = []
@@ -376,26 +367,14 @@ async function loadCatalogue(): Promise<Catalogue> {
   for (const def of FAMILIES) {
     if (def.mode !== 'video') continue
 
-    const { clip, vae } = sidecarsOf(def)
-    const missing = [
-      ...clip.filter((c) => !clips.includes(c)),
-      ...(vae && !vaes.includes(vae) ? [vae] : []),
-      ...modelsOf(def).filter((m) => !weights.has(m)),
-      ...Object.values(def.graph)
-        .map((n) => n.inputs['lora_name'])
-        .filter((l): l is string => typeof l === 'string' && !loras.includes(l)),
-    ]
-    if (missing.length) {
-      blocked.push({ label: def.label, why: `needs ${[...new Set(missing)].join(', ')}` })
+    const avail = availabilityOf(def, inv, hardware, sizes)
+    if (!avail.ok) {
+      blocked.push({ label: def.label, why: avail.why })
       continue
     }
+    const verdict = avail.verdict
 
     const model = def.dualModel ? '' : (def.models.find((m) => weights.has(m)) ?? def.models[0] ?? '')
-    const verdict = hardware ? feasibility(def, sizes, hardware) : null
-    if (verdict && !verdict.selectable) {
-      blocked.push({ label: def.label, why: verdict.reason })
-      continue
-    }
 
     const latent = latentClassOf(def)
     families.push({
@@ -418,8 +397,8 @@ async function loadCatalogue(): Promise<Catalogue> {
   return {
     families,
     blocked,
-    samplers: optionsFor(info, 'KSampler', 'sampler_name'),
-    schedulers: optionsFor(info, 'KSampler', 'scheduler'),
+    samplers: inv.samplers,
+    schedulers: inv.schedulers,
     hardware,
     vramFree,
   }
@@ -936,31 +915,6 @@ function Head({ title, children }: { title: string; children?: ReactNode }) {
     <div className="mb-2 flex items-baseline justify-between border-b border-grey-300 pb-1">
       <h3 className="text-[0.625rem] font-semibold uppercase tracking-[0.18em] text-grey-700">{title}</h3>
       {children}
-    </div>
-  )
-}
-
-function Notice({
-  kind,
-  title,
-  children,
-}: {
-  kind: 'info' | 'correction' | 'error'
-  title: string
-  children?: ReactNode
-}) {
-  const tone =
-    kind === 'error'
-      ? 'border-error bg-[#FEF2F2] text-[#7F1D1D]'
-      : kind === 'correction'
-        ? 'border-ink bg-[#F5F5F5] italic'
-        : 'border-burgundy-900 bg-burgundy-50'
-  return (
-    <div className={`border-l-4 px-4 py-3 text-small leading-relaxed ${tone}`} role="status">
-      <strong className="block not-italic text-[0.75rem] font-bold uppercase tracking-[0.05em]">
-        {title}
-      </strong>
-      {children ? <span className="mt-1 block not-italic">{children}</span> : null}
     </div>
   )
 }
@@ -1608,22 +1562,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
   // --- render --------------------------------------------------------------
 
-  if (catError && !cat) {
-    return (
-      <main className="mx-auto max-w-2xl px-6 py-16">
-        <Notice kind="error" title="The server is not answering">
-          We could not reach ComfyUI on port 8188. It may not be running. Start it with{' '}
-          <code className="font-mono text-caption">systemctl --user start comfyui</code>.
-        </Notice>
-        <p className="mt-3 text-caption italic text-grey-700">
-          Trying again every 5 seconds.{' '}
-          <button className="text-burgundy-900 underline" onClick={() => setAttempt((a) => a + 1)}>
-            Try now
-          </button>
-        </p>
-      </main>
-    )
-  }
+  if (catError && !cat) return <ServerDown onRetry={() => setAttempt((a) => a + 1)} detail={catError} />
 
   const progress = runningJob
     ? runningJob.max > 1
@@ -1927,7 +1866,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
           {!cat ? (
             <p className="text-small italic text-grey-500">Reading what this machine has…</p>
           ) : !family ? (
-            <Notice kind="correction" title="Correction" >
+            <Notice tone="correction" title="Correction" >
               No video model is installed. {cat.blocked.length ? `${cat.blocked[0].label} ${cat.blocked[0].why}.` : ''}
             </Notice>
           ) : (
@@ -1960,7 +1899,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
               {mode === 'i2v' && !family.canStartFromPicture ? (
                 <div className="mb-4">
-                  <Notice kind="correction" title="Correction">
+                  <Notice tone="correction" title="Correction">
                     {family.label} works from words only. Nothing was carried over from your picture.
                   </Notice>
                 </div>
@@ -2254,7 +2193,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
               {reuseNotice ? (
                 <div className="mt-4">
-                  <Notice kind="correction" title="Settings loaded">
+                  <Notice tone="correction" title="Settings loaded">
                     from No. {reuseNotice.no.toLocaleString('en-GB')}. Nothing has run yet.{' '}
                     {reuseNotice.applied.notes.map((n) => n.reason).join(' ')}{' '}
                     <button
@@ -2276,7 +2215,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
               {notice ? (
                 <div className="mt-4">
-                  <Notice kind={notice.kind} title={notice.title}>
+                  <Notice tone={notice.kind} title={notice.title}>
                     {notice.body}
                   </Notice>
                 </div>
@@ -2284,7 +2223,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
               {connection === 'closed' && live.length ? (
                 <div className="mt-4">
-                  <Notice kind="correction" title="Correction">
+                  <Notice tone="correction" title="Correction">
                     We lost the connection to ComfyUI. Your clip may still be running. We will reconnect and pick it up.
                   </Notice>
                 </div>
@@ -2366,7 +2305,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
           {failed ? (
             <div className="mb-4">
               <Notice
-                kind={failed.status === 'cancelled' ? 'correction' : 'error'}
+                tone={failed.status === 'cancelled' ? 'correction' : 'error'}
                 title={failed.status === 'cancelled' ? 'Correction' : errorTitle(failed.error)}
               >
                 {failed.status === 'cancelled'
@@ -2560,15 +2499,6 @@ function WorkflowPeek({ build }: { build: () => ApiWorkflow | null }) {
 }
 
 /** Read a picture's real dimensions, for the well's caption. */
-function measure(url: string): Promise<{ width: number; height: number } | null> {
-  return new Promise((resolve) => {
-    const img = new Image()
-    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight })
-    img.onerror = () => resolve(null)
-    img.src = url
-  })
-}
-
 /**
  * Lift the last frame out of a finished clip and stand it up as the next start
  * frame. Shot follows shot, which is the whole reason to have both modes in

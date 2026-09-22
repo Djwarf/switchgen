@@ -28,6 +28,8 @@
  * workflow from a registry family that was already validated against the live
  * schema. Nothing here builds a graph by hand.
  */
+import { availabilityOf, inventoryFrom } from '../lib/availability'
+import { modelFiles, probeHardware, type ModelFile } from '../lib/hardware'
 import {
   useCallback,
   useEffect,
@@ -38,7 +40,7 @@ import {
   type ReactNode,
 } from 'react'
 
-import { connect, fileUrl, objectInfo, optionsFor, type FileRef, type OutputFile } from '../lib/comfy'
+import { connect, fileUrl, objectInfo, type FileRef, type OutputFile } from '../lib/comfy'
 import {
   annotatedRef,
   checkReel,
@@ -52,7 +54,7 @@ import {
 } from '../lib/continuation'
 import { history } from '../lib/history'
 import { newComposition, randomSeed, type Composition } from '../lib/session'
-import { FAMILIES, defaultsFor, modelsOf, sidecarsOf, type FamilyDef, type Params } from '../lib/workflows'
+import { FAMILIES, defaultsFor, type FamilyDef, type Params } from '../lib/workflows'
 import { go, parseRoute, useExpert } from '../components/shell'
 
 import {
@@ -139,16 +141,14 @@ function readSpec(info: Record<string, unknown>, cls: string | null, field: stri
  * and the bench says so where the choice is made.
  */
 async function loadCatalogue(): Promise<Catalogue> {
-  const info = await objectInfo()
-
-  const clips = optionsFor(info, 'CLIPLoader', 'clip_name')
-  const vaes = optionsFor(info, 'VAELoader', 'vae_name')
-  const loras = optionsFor(info, 'LoraLoaderModelOnly', 'lora_name')
-  const weights = new Set<string>([
-    ...optionsFor(info, 'CheckpointLoaderSimple', 'ckpt_name'),
-    ...optionsFor(info, 'UNETLoader', 'unet_name'),
-    ...optionsFor(info, 'UnetLoaderGGUF', 'unet_name'),
+  const [info, hardware, sizes] = await Promise.all([
+    objectInfo(),
+    probeHardware().catch(() => null),
+    modelFiles().catch(() => new Map<string, ModelFile>()),
   ])
+
+  const inv = inventoryFrom(info)
+  const weights = inv.weights
 
   const families: ReelFamily[] = []
   const blocked: Catalogue['blocked'] = []
@@ -156,17 +156,12 @@ async function loadCatalogue(): Promise<Catalogue> {
   for (const def of FAMILIES) {
     if (def.mode !== 'video') continue
 
-    const { clip, vae } = sidecarsOf(def)
-    const missing = [
-      ...clip.filter((c) => !clips.includes(c)),
-      ...(vae && !vaes.includes(vae) ? [vae] : []),
-      ...modelsOf(def).filter((m) => !weights.has(m)),
-      ...Object.values(def.graph)
-        .map((n) => n.inputs['lora_name'])
-        .filter((l): l is string => typeof l === 'string' && !loras.includes(l)),
-    ]
-    if (missing.length) {
-      blocked.push({ label: def.label, why: `needs ${[...new Set(missing)].join(', ')}` })
+    // Files, then memory. This desk used to skip the memory verdict, so it
+    // could offer a family the machine cannot hold and let the reader find out
+    // eight shots in.
+    const avail = availabilityOf(def, inv, hardware, sizes)
+    if (!avail.ok) {
+      blocked.push({ label: def.label, why: avail.why })
       continue
     }
 
@@ -189,8 +184,8 @@ async function loadCatalogue(): Promise<Catalogue> {
   return {
     families,
     blocked,
-    samplers: optionsFor(info, 'KSampler', 'sampler_name'),
-    schedulers: optionsFor(info, 'KSampler', 'scheduler'),
+    samplers: inv.samplers,
+    schedulers: inv.schedulers,
   }
 }
 
@@ -707,7 +702,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
           {issues.length ? (
             <div className="mb-4 space-y-1">
               {issues.map((issue) => (
-                <p key={issue} className="border-l-2 border-warning pl-2 text-caption text-[#78350f]">
+                <p key={issue} className="border-l-2 border-warning pl-2 text-caption text-ink-warning">
                   {issue}
                 </p>
               ))}
@@ -743,7 +738,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
             </div>
 
             {stale ? (
-              <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-[#78350f]">
+              <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-ink-warning">
                 Some shots were rendered before the shot above them changed. Rendering what is missing brings them back
                 into line.
               </p>

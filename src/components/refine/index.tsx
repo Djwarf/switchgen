@@ -266,7 +266,7 @@ export function RegionRefine({
                   Drawn by
                 </span>
                 <select
-                  className="mt-1 block w-full max-w-[42ch] rounded border border-grey-300 bg-white px-2 py-1.5 text-body text-grey-900"
+                  className="field mt-1 block max-w-[42ch]"
                   value={model.value}
                   disabled={busy}
                   onChange={e => model.onChange(e.target.value)}

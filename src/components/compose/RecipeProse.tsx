@@ -31,7 +31,7 @@ export function RecipeProse({ recipe }: { recipe: Recipe }) {
         <p className="mt-2 max-w-[62ch] text-body leading-relaxed text-ink">{text}</p>
       ) : (
         <div className="mt-2 max-w-[62ch]">
-          <Notice kind="correction" title="Correction">
+          <Notice tone="correction" title="Correction">
             <p>{text}</p>
           </Notice>
         </div>
@@ -44,7 +44,7 @@ export function RecipeProse({ recipe }: { recipe: Recipe }) {
       {recipe.warnings.length > 0 && (
         <div className="mt-3 max-w-[62ch] space-y-2">
           {recipe.warnings.map((w, i) => (
-            <Notice key={i} kind="warning" title="Note">
+            <Notice key={i} tone="warning" title="Note">
               <p>{w}</p>
             </Notice>
           ))}

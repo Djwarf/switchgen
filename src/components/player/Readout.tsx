@@ -15,11 +15,8 @@
  * inverse of the seek the spec specifies, so that is what is implemented here.
  */
 
-/** Clamp `n` into [lo, hi]. */
-export function clamp(n: number, lo: number, hi: number): number {
-  if (!Number.isFinite(n)) return lo
-  return n < lo ? lo : n > hi ? hi : n
-}
+import { clamp } from '../../lib/num'
+export { clamp }
 
 /** The frame a playback time belongs to. */
 export function frameAt(time: number, fps: number, frames?: number): number {

@@ -11,11 +11,11 @@
  */
 import type { ReactNode } from 'react'
 
-/** The house focus ring: square, burgundy, offset. Never rounded. */
-export const RING =
-  'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900'
+import { RING } from '../type'
+export { RING }
 
-export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+import { clamp } from '../../lib/num'
+export { clamp }
 
 /** `4 min 10 s`, `42 s`, `0.9 s`. Never a bare decimal minute. */
 export function duration(ms: number): string {
@@ -233,6 +233,6 @@ export function Rail({ value, max }: { value: number; max: number }) {
 /** A short warning, set as a correction note rather than an alert box. */
 export function Caution({ children }: { children: ReactNode }) {
   return (
-    <p className="border-l-2 border-warning bg-[#fffbeb] px-2 py-1 text-caption text-[#78350f]">{children}</p>
+    <p className="border-l-2 border-warning bg-paper-warning px-2 py-1 text-caption text-ink-warning">{children}</p>
   )
 }

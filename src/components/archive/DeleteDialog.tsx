@@ -142,7 +142,7 @@ export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Prop
         )}
 
         {error && (
-          <p className="mt-4 border-l-4 border-error bg-[#FEF2F2] px-4 py-3 text-small text-[#7F1D1D]">
+          <p className="mt-4 border-l-4 border-error bg-paper-error px-4 py-3 text-small text-ink-error">
             <strong className="mr-2 font-bold tracking-[0.05em] uppercase">
               We could not delete that
             </strong>

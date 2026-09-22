@@ -126,7 +126,7 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
             </span>
           </p>
         ) : failed ? (
-          <p className="text-caption text-[#78350f]">{failed}</p>
+          <p className="text-caption text-ink-warning">{failed}</p>
         ) : (
           <p className="text-caption italic text-grey-500">
             The server does the joining. Nothing touches the card.
@@ -135,7 +135,7 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
       </div>
 
       {cut?.warnings.length ? (
-        <ul className="mb-4 border-l-2 border-warning pl-2 text-caption text-[#78350f]">
+        <ul className="mb-4 border-l-2 border-warning pl-2 text-caption text-ink-warning">
           {cut.warnings.map((w) => (
             <li key={w}>{w}</li>
           ))}
@@ -158,7 +158,7 @@ export function Assembly({ clips, fps, shots, prefix }: AssemblyProps) {
           </div>
 
           {partial ? (
-            <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-[#78350f]">
+            <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-ink-warning">
               This cuts the {clips.length} shots that have rendered. {shots - clips.length} of the reel's shots are not
               in it yet.
             </p>

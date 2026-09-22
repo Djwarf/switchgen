@@ -31,7 +31,17 @@
   --color-error: #991b1b;
   --color-warning: #92400e;
 
+  /* Paper and ink for notices: the tint a ruled block sits on, and reads in. */
+  --color-paper-correction: #f5f5f5;
+  --color-paper-error: #fef2f2;
+  --color-paper-warning: #fffbeb;
+  --color-paper-success: #f0fdf4;
+  --color-ink-error: #7f1d1d;
+  --color-ink-warning: #78350f;
+  --color-ink-success: #065f46;
+
   --font-serif: "Crimson Text", Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
 
   /* Type scale - typography.md */
   --text-display: 3.5rem;
@@ -187,10 +197,10 @@ select.field {
 .notice { padding: 0.75rem 1rem; border-left: 4px solid; line-height: 1.5; }
 .notice strong { font-weight: 700; }
 .notice-info       { background: var(--color-burgundy-50); border-color: var(--color-burgundy-900); color: var(--color-ink); }
-.notice-success    { background: #f0fdf4; border-color: var(--color-success); color: #065f46; }
-.notice-error      { background: #fef2f2; border-color: var(--color-error); color: #7f1d1d; }
-.notice-warning    { background: #fffbeb; border-color: var(--color-warning); color: #78350f; }
-.notice-correction { background: #f5f5f5; border-left-color: var(--color-ink); font-style: italic; }
+.notice-success    { background: var(--color-paper-success); border-color: var(--color-success); color: var(--color-ink-success); }
+.notice-error      { background: var(--color-paper-error); border-color: var(--color-error); color: var(--color-ink-error); }
+.notice-warning    { background: var(--color-paper-warning); border-color: var(--color-warning); color: var(--color-ink-warning); }
+.notice-correction { background: var(--color-paper-correction); border-left-color: var(--color-ink); font-style: italic; }
 .notice-correction strong {
   font-style: normal;
   text-transform: uppercase;

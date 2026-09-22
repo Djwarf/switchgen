@@ -64,7 +64,8 @@ import { DateHead } from '../components/archive/DateHead'
 import { DeleteDialog } from '../components/archive/DeleteDialog'
 import { Detail } from '../components/archive/Detail'
 import { FacetRail } from '../components/archive/FacetRail'
-import { Notice, UndoBar } from '../components/archive/Notices'
+import { Notice } from '../components/type'
+import { offerUndo } from '../components/shell/UndoBar'
 import { SearchBand, type KindFilter } from '../components/archive/SearchBand'
 import { SelectionBar } from '../components/archive/SelectionBar'
 import { Table, type SortKey } from '../components/archive/Table'
@@ -175,7 +176,6 @@ type Banner = {
 }
 
 let auditedThisSession = false
-let undoSerial = 0
 
 // ---------------------------------------------------------------------------
 
@@ -189,11 +189,6 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const [focusedId, setFocusedId] = useState<string | null>(null)
   const [openId, setOpenId] = useState<string | null>(null)
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set())
-  // `seq` keys the undo bar. Without it a second removal reuses the bar that is
-  // already up, and inherits the remains of the first removal's window.
-  const [undo, setUndo] = useState<
-    { seq: number; records: HistoryEntry[]; text: string; detail?: string } | null
-  >(null)
   const [banner, setBanner] = useState<Banner | null>(null)
   const [pendingDelete, setPendingDelete] = useState<HistoryEntry[] | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -440,14 +435,18 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     if (!removed.length) return
     setSelected(new Set())
     setOpenId(null)
-    setUndo({
-      seq: ++undoSerial,
-      records: removed,
-      text:
-        removed.length === 1
-          ? 'One record removed. The file is still on disk.'
-          : `${removed.length} records removed. The files are still on disk.`,
-      detail: removed.length === 1 ? relPath(removed[0].file) : undefined,
+    // The shell's undo bar, so Ctrl+Z works from anywhere and the archive does
+    // not keep a second bar of its own.
+    offerUndo({
+      body:
+        removed.length === 1 ? (
+          <>
+            One record removed. The file is still on disk at <code>{relPath(removed[0].file)}</code>.
+          </>
+        ) : (
+          `${removed.length} records removed. The files are still on disk.`
+        ),
+      undo: () => restore(...removed),
     })
   }, [])
 
@@ -565,13 +564,6 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       if (e.defaultPrevented) return
       const typing = isTyping(e.target)
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !typing && undo) {
-        e.preventDefault()
-        restore(...undo.records)
-        setUndo(null)
-        return
-      }
-
       if (typing) {
         if (e.key === 'Escape') {
           if (query) setQuery('')
@@ -673,7 +665,6 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     return () => window.removeEventListener('keydown', onKey)
   }, [
     pendingDelete,
-    undo,
     query,
     open,
     openIndex,
@@ -760,7 +751,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
           <div className="mt-4 space-y-3">
             {issue && (
               <Notice
-                variant="correction"
+                tone="correction"
                 title="Correction"
                 onDismiss={() => {
                   clearLoadIssue()
@@ -772,7 +763,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
             )}
             {quota && (
               <Notice
-                variant="correction"
+                tone="correction"
                 title="Correction"
                 onDismiss={() => {
                   clearQuotaIssue()
@@ -783,7 +774,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
               </Notice>
             )}
             {banner && (
-              <Notice variant={banner.variant} title={banner.title} onDismiss={() => setBanner(null)}>
+              <Notice tone={banner.variant} title={banner.title} onDismiss={() => setBanner(null)}>
                 {banner.text}
                 {banner.notes?.map((note) => (
                   <span key={note.field} className="mt-1 block text-caption not-italic">
@@ -1000,18 +991,6 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
         />
       )}
 
-      {undo && (
-        <UndoBar
-          key={undo.seq}
-          text={undo.text}
-          detail={undo.detail}
-          onUndo={() => {
-            restore(...undo.records)
-            setUndo(null)
-          }}
-          onDismiss={() => setUndo(null)}
-        />
-      )}
     </div>
   )
 }

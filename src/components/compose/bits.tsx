@@ -22,16 +22,9 @@ import { useRef, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from
 // Type
 // ---------------------------------------------------------------------------
 
-/** Metadata caps. Grey, not burgundy: burgundy is rationed to the page. */
-export function Kicker({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return (
-    <span
-      className={`text-overline font-semibold uppercase tracking-[0.18em] text-grey-700 ${className}`}
-    >
-      {children}
-    </span>
-  )
-}
+/** The kicker, the editorial link and the notice are the house's, not this room's. */
+export { Kicker, Link as EditorialLink, Notice } from '../type'
+export type { NoticeTone as NoticeKind } from '../type'
 
 /** A field's name, set as a kicker above it. */
 export function Label({ children, hint }: { children: ReactNode; hint?: string }) {
@@ -57,59 +50,6 @@ export function Deck({ children }: { children: ReactNode }) {
 /** One of the two rule weights in this application. Nothing else is drawn. */
 export function Hairline({ className = '' }: { className?: string }) {
   return <hr className={`border-0 border-b border-grey-300 ${className}`} />
-}
-
-/** An editorial link: burgundy, underlined, never a button in disguise. */
-export function EditorialLink({
-  onClick,
-  children,
-  className = '',
-  title,
-  expanded,
-  controls,
-}: {
-  onClick: () => void
-  children: ReactNode
-  className?: string
-  title?: string
-  expanded?: boolean
-  controls?: string
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      onClick={onClick}
-      aria-expanded={expanded}
-      aria-controls={controls}
-      className={`sg-link ring ${className}`}
-    >
-      {children}
-    </button>
-  )
-}
-
-export type NoticeKind = 'info' | 'correction' | 'error' | 'warning'
-
-/**
- * A ruled notice, in the house variants. Warnings are never folded away behind
- * the More link: a thing that is true and unwelcome is printed on the page.
- */
-export function Notice({
-  kind = 'info',
-  title,
-  children,
-}: {
-  kind?: NoticeKind
-  title?: string
-  children?: ReactNode
-}) {
-  return (
-    <div role={kind === 'error' ? 'alert' : 'status'} className={`notice notice-${kind} text-small`}>
-      {title && <strong>{title}</strong>}
-      {children}
-    </div>
-  )
 }
 
 // ---------------------------------------------------------------------------

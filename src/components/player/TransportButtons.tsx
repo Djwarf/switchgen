@@ -11,9 +11,8 @@
 
 import type { ReactNode, RefObject } from 'react'
 
-/** The house focus ring. Square, 2 px burgundy, 2 px offset. */
-export const RING =
-  'focus-visible:[outline:2px_solid_var(--color-burgundy-900)] focus-visible:[outline-offset:2px]'
+import { RING } from '../type'
+export { RING }
 
 const LABEL = 'text-overline font-semibold uppercase tracking-[0.16em]'
 

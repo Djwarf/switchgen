@@ -22,16 +22,15 @@
  */
 import type { ReactNode } from 'react'
 
-/** The house focus ring: square, burgundy, offset. Never rounded. */
-export const RING =
-  'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900'
+import { RING } from '../type'
+export { RING }
 
-export const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
+import { clamp } from '../../lib/num'
+export { clamp }
 
-export const round2 = (n: number) => Math.round(n * 100) / 100
+import { round2, snap16 } from '../../lib/num'
+export { round2, snap16 }
 
-/** Latent sizes are multiples of 8; the desk has always snapped to 16. */
-export const snap16 = (n: number) => Math.max(16, Math.round(n / 16) * 16)
 
 const THIN = ' '
 
@@ -108,7 +107,7 @@ export function Note({ children }: { children: ReactNode }) {
 /** A short caution, set as a printed note rather than an alert box. */
 export function Caution({ children }: { children: ReactNode }) {
   return (
-    <p className="border-l-2 border-warning bg-[#fffbeb] px-2 py-1 text-caption leading-snug text-[#78350f]">
+    <p className="border-l-2 border-warning bg-paper-warning px-2 py-1 text-caption leading-snug text-ink-warning">
       {children}
     </p>
   )
@@ -117,7 +116,7 @@ export function Caution({ children }: { children: ReactNode }) {
 /** The same, for something that is simply broken rather than merely costly. */
 export function Fault({ children }: { children: ReactNode }) {
   return (
-    <p className="border-l-2 border-error bg-[#fef2f2] px-2 py-1 text-caption leading-snug text-[#7f1d1d]">
+    <p className="border-l-2 border-error bg-paper-error px-2 py-1 text-caption leading-snug text-ink-error">
       {children}
     </p>
   )

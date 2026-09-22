@@ -25,6 +25,11 @@
  * its progress while you read the archive is the difference between a tool and
  * a demo, and there is no press.ts in this build to do it for us.
  */
+import { availabilityOf, inventoryFrom } from '../lib/availability'
+import { measureImage as measure } from '../lib/images'
+import { clamp } from '../lib/num'
+import { ServerDown } from '../components/ServerDown'
+import { Kicker, Link, Notice } from '../components/type'
 import {
   useCallback,
   useEffect,
@@ -44,7 +49,6 @@ import {
   getJob,
   listJobs,
   objectInfo,
-  optionsFor,
   run,
   uploadImage,
   watchConnection,
@@ -57,13 +61,10 @@ import {
   defaultsFor,
   deriveImg2Img,
   instantiate,
-  modelsOf,
-  sidecarsOf,
   type FamilyDef,
   type Params,
 } from '../lib/workflows'
 import {
-  feasibility,
   modelFiles,
   probeHardware,
   type Hardware,
@@ -230,8 +231,6 @@ function timingNote(records: readonly HistoryEntry[], model: string): string | n
 
 /** A fragment from elsewhere, made into a sentence. */
 
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
-
 function titleFromFilename(file: string): string {
   const stem = file.replace(/\.[^.]+$/, '')
   const cleaned = stem
@@ -334,14 +333,8 @@ async function readCatalogue(): Promise<Catalogue> {
     modelFiles().catch(() => new Map<string, ModelFile>()),
   ])
 
-  const clips = optionsFor(info, 'CLIPLoader', 'clip_name')
-  const vaes = optionsFor(info, 'VAELoader', 'vae_name')
-  const loras = optionsFor(info, 'LoraLoaderModelOnly', 'lora_name')
-  const installed = new Set([
-    ...optionsFor(info, 'CheckpointLoaderSimple', 'ckpt_name'),
-    ...optionsFor(info, 'UNETLoader', 'unet_name'),
-    ...optionsFor(info, 'UnetLoaderGGUF', 'unet_name'),
-  ])
+  const inv = inventoryFrom(info)
+  const installed = inv.weights
 
   const styles: Style[] = []
   const unavailable: { name: string; why: string }[] = []
@@ -351,27 +344,13 @@ async function readCatalogue(): Promise<Catalogue> {
     if (!def || (def.mode !== 'image' && def.mode !== 'edit')) continue
 
     // Every file the graph references must exist, or the run fails with an
-    // opaque backend error. Name the missing file instead.
-    const { clip, vae } = sidecarsOf(def)
-    const missing = [
-      ...clip.filter((c) => !clips.includes(c)),
-      ...(vae && !vaes.includes(vae) ? [vae] : []),
-      ...modelsOf(def).filter((m) => !installed.has(m)),
-      ...Object.values(def.graph)
-        .map((n) => n.inputs['lora_name'])
-        .filter((l): l is string => typeof l === 'string' && !loras.includes(l)),
-    ]
-    if (missing.length) {
-      unavailable.push({ name: model, why: `needs ${missing.join(', ')}` })
+    // opaque backend error. Name the missing file instead; then the memory.
+    const avail = availabilityOf(def, inv, hardware, sizes)
+    if (!avail.ok) {
+      unavailable.push({ name: model, why: avail.why })
       continue
     }
-
-    const verdict = hardware ? feasibility(def, sizes, hardware) : null
-    if (verdict && !verdict.selectable) {
-      unavailable.push({ name: model, why: verdict.reason })
-      continue
-    }
-    styles.push(styleOf(def, model, verdict))
+    styles.push(styleOf(def, model, avail.verdict))
   }
 
   styles.sort((a, b) => a.group.localeCompare(b.group) || a.label.localeCompare(b.label))
@@ -379,8 +358,8 @@ async function readCatalogue(): Promise<Catalogue> {
   return {
     styles,
     unavailable,
-    samplers: optionsFor(info, 'KSampler', 'sampler_name'),
-    schedulers: optionsFor(info, 'KSampler', 'scheduler'),
+    samplers: inv.samplers,
+    schedulers: inv.schedulers,
     hardware,
     installed: [...installed],
     sizes,
@@ -841,73 +820,6 @@ function useReducedMotion(): boolean {
     return () => mq.removeEventListener('change', on)
   }, [])
   return reduced
-}
-
-type NoticeKind = 'info' | 'correction' | 'error' | 'warning'
-
-const NOTICE_STYLE: Record<NoticeKind, string> = {
-  info: 'bg-burgundy-50 border-burgundy-900 text-ink',
-  correction: 'bg-[#F5F5F5] border-ink text-ink italic',
-  error: 'bg-[#FEF2F2] border-error text-[#7F1D1D]',
-  warning: 'bg-[#FFFBEB] border-warning text-[#78350F]',
-}
-
-function Notice({
-  kind = 'info',
-  title,
-  children,
-}: {
-  kind?: NoticeKind
-  title?: string
-  children?: ReactNode
-}) {
-  return (
-    <div
-      role={kind === 'error' ? 'alert' : 'status'}
-      className={`border-l-4 px-4 py-3 text-small leading-normal ${NOTICE_STYLE[kind]}`}
-    >
-      {title && (
-        <strong className="mr-2 text-small font-bold uppercase not-italic tracking-[0.05em]">
-          {title}
-        </strong>
-      )}
-      {children}
-    </div>
-  )
-}
-
-function Kicker({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return (
-    <span
-      className={`text-overline font-semibold uppercase tracking-[0.18em] text-grey-700 ${className}`}
-    >
-      {children}
-    </span>
-  )
-}
-
-/** An editorial link: burgundy, underlined, no button chrome. */
-function Link({
-  onClick,
-  children,
-  className = '',
-  title,
-}: {
-  onClick: () => void
-  children: ReactNode
-  className?: string
-  title?: string
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      onClick={onClick}
-      className={`cursor-pointer text-burgundy-900 underline decoration-burgundy-900/60 underline-offset-2 hover:decoration-burgundy-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 ${className}`}
-    >
-      {children}
-    </button>
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,29 +1964,7 @@ export function Pictures() {
   )
 
   // --- render -------------------------------------------------------------
-  if (catError) {
-    return (
-      <main className="mx-auto max-w-2xl px-6 py-16">
-        <h1 className="mb-1 text-h3 font-semibold">The server is not answering</h1>
-        <p className="mb-4 text-body text-grey-700">
-          We could not read the model list from ComfyUI on port 8188. It may not be running.
-        </p>
-        <pre className="mb-4 border border-grey-300 bg-newsprint-aged px-3 py-2 text-caption">
-          systemctl --user start comfyui
-        </pre>
-        <p className="text-small text-grey-700">
-          <Link onClick={() => load(true)}>Try now</Link>
-          <span className="px-2 text-grey-400" aria-hidden>
-            ·
-          </span>
-          <span className="italic text-grey-500">
-            Trying again in <span className="tabular-nums">{retryIn}</span>s.
-          </span>
-        </p>
-        <p className="mt-6 text-caption italic text-grey-500">{catError}</p>
-      </main>
-    )
-  }
+  if (catError) return <ServerDown onRetry={() => load(true)} retryIn={retryIn} detail={catError} />
 
   return (
     <main
@@ -2106,7 +1996,7 @@ export function Pictures() {
 
         {offline && (
           <div className="mb-4">
-            <Notice kind="correction" title="Correction">
+            <Notice tone="correction" title="Correction">
               We have lost the connection to ComfyUI. Anything already running will be picked up
               when it comes back.
             </Notice>
@@ -2115,7 +2005,7 @@ export function Pictures() {
 
         {correction && (
           <div className="mb-4">
-            <Notice kind="correction" title="Correction">
+            <Notice tone="correction" title="Correction">
               {correction} <Link onClick={() => setCorrection(null)}>Dismiss</Link>
             </Notice>
           </div>
@@ -2510,7 +2400,7 @@ function EditDesk({
               </>
             ) : (
               <div className="mt-2 max-w-[62ch]">
-                <Notice kind="correction" title="Correction">
+                <Notice tone="correction" title="Correction">
                   {recipe.reason}
                 </Notice>
               </div>
@@ -2526,19 +2416,10 @@ function EditDesk({
   )
 }
 
-async function measure(url: string): Promise<{ width: number; height: number } | null> {
-  return new Promise((resolve) => {
-    const img = new Image()
-    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight })
-    img.onerror = () => resolve(null)
-    img.src = url
-  })
-}
-
 function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }) {
   if (fault.cancelled) {
     return (
-      <Notice kind="correction" title="Correction">
+      <Notice tone="correction" title="Correction">
         Job stopped. Nothing was saved. <Link onClick={onDismiss}>Dismiss</Link>
       </Notice>
     )
@@ -2546,7 +2427,7 @@ function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }
 
   if (fault.lost) {
     return (
-      <Notice kind="warning" title="We lost track of that job">
+      <Notice tone="warning" title="We lost track of that job">
         {fault.message} The desk is free again, so you can try again.{' '}
         <Link onClick={onDismiss}>Dismiss</Link>
       </Notice>
@@ -2556,7 +2437,7 @@ function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }
   const text = `${fault.message} ${fault.detail ?? ''}`.toLowerCase()
   if (text.includes('out of memory') || text.includes('cuda') || text.includes('alloc')) {
     return (
-      <Notice kind="error" title="The card ran out of memory">
+      <Notice tone="error" title="The card ran out of memory">
         This size needs more than the card has free. Try a smaller shape, or close anything else
         using the GPU. <Link onClick={onDismiss}>Dismiss</Link>
       </Notice>
@@ -2564,7 +2445,7 @@ function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }
   }
 
   return (
-    <Notice kind="error" title="That job was rejected">
+    <Notice tone="error" title="That job was rejected">
       ComfyUI would not accept it: {fault.detail ?? fault.message}
       {fault.nodeType && (
         <span className="block text-caption">

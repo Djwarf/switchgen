@@ -103,7 +103,7 @@ export function Card({
         </h3>
 
         {entry.missing && (
-          <div className="mt-2 border-l-4 border-ink bg-[#F5F5F5] px-3 py-2 text-caption leading-relaxed">
+          <div className="mt-2 border-l-4 border-ink bg-paper-correction px-3 py-2 text-caption leading-relaxed">
             <p className="italic">
               <strong className="mr-1 text-[0.625rem] font-bold tracking-[0.05em] uppercase not-italic">
                 Not on disk

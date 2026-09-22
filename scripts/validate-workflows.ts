@@ -20,7 +20,8 @@
  * than as anything a reader could act on. A validator that checks only the
  * base graphs certifies the least interesting third of what actually runs.
  */
-import { FAMILIES, IMG2IMG, defaultsFor, instantiate, sidecarsOf, modelsOf, type Params } from '../src/lib/workflows'
+import { inventoryFrom, missingFilesFor } from '../src/lib/availability.ts'
+import { FAMILIES, IMG2IMG, defaultsFor, instantiate, type Params } from '../src/lib/workflows'
 import type { FamilyDef } from '../src/lib/registry'
 import type { ApiWorkflow } from '../src/lib/comfy'
 import {
@@ -59,34 +60,18 @@ const res = await fetch(`${COMFY}/object_info`)
 if (!res.ok) { console.error(`Cannot reach ComfyUI at ${COMFY} (HTTP ${res.status})`); process.exit(2) }
 const info: Record<string, any> = await res.json()
 
-const have = (node: string, field: string): string[] => {
-  const s = info?.[node]?.input?.required?.[field]?.[0]
-  return Array.isArray(s) ? s : []
-}
-const installed = new Set([
-  ...have('CheckpointLoaderSimple', 'ckpt_name'),
-  ...have('UNETLoader', 'unet_name'),
-  ...have('UnetLoaderGGUF', 'unet_name'),
-])
-// GGUF encoders are listed by CLIPLoaderGGUF, not CLIPLoader, so a family using
-// a quantised encoder reads as 'missing' unless both lists are consulted.
-const clips = [...have('CLIPLoader', 'clip_name'), ...have('CLIPLoaderGGUF', 'clip_name')]
-const vaes = have('VAELoader', 'vae_name')
-const loras = have('LoraLoaderModelOnly', 'lora_name')
+// The same inventory the desks read, so what validates here is what is offered
+// there: it consults CLIPLoaderGGUF as well as CLIPLoader, which is what keeps a
+// family with a quantised encoder from reading as 'missing'.
+const inv = inventoryFrom(info)
+const installed = inv.weights
+const loras = [...inv.loras]
 
 let fail = 0, skip = 0, ok = 0
 
 for (const def of FAMILIES) {
   const model = def.models.find(m => installed.has(m)) ?? def.models[0]
-  const { clip, vae } = sidecarsOf(def)
-  const missing = [
-    ...clip.filter(c => !clips.includes(c)),
-    ...(vae && !vaes.includes(vae) ? [vae] : []),
-    ...modelsOf(def).filter(m => !installed.has(m)),
-    ...Object.values(def.graph)
-      .map(n => n.inputs['lora_name'])
-      .filter((l): l is string => typeof l === 'string' && !loras.includes(l)),
-  ]
+  const missing = missingFilesFor(def, inv)
   if (missing.length) { console.log(`SKIP  ${def.label}: missing ${missing.join(', ')}`); skip++; continue }
 
   const d = defaultsFor(def, model)
@@ -128,7 +113,9 @@ for (const def of FAMILIES) {
       // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
       // but which never appears in the static enum. Checking it here would fail
       // every graph that does the correct thing.
-      if (node.class_type === 'LoadImage' && k === 'image') continue
+      // LoadImageMask.image is the same: the region bench uploads the mask as it
+      // queues the pass, so it is never in the enum either.
+      if ((node.class_type === 'LoadImage' || node.class_type === 'LoadImageMask') && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         const shown = opts.length > 6 ? `${opts.slice(0, 6).join(', ')}, …` : opts.join(', ')
@@ -156,12 +143,7 @@ for (const [srcId, def] of Object.entries(IMG2IMG)) {
   const base = FAMILIES.find(f => f.id === srcId)
   if (!base) continue
   const model = base.models.find(m => installed.has(m)) ?? base.models[0]
-  const { clip, vae } = sidecarsOf(def)
-  const missing = [
-    ...clip.filter(c => !clips.includes(c)),
-    ...(vae && !vaes.includes(vae) ? [vae] : []),
-    ...modelsOf(base).filter(m => !installed.has(m)),
-  ]
+  const missing = missingFilesFor(def, inv)
   if (missing.length) { i2iSkip++; continue }
 
   const d = defaultsFor(base, model)
@@ -193,7 +175,9 @@ for (const [srcId, def] of Object.entries(IMG2IMG)) {
       // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
       // but which never appears in the static enum. Checking it here would fail
       // every graph that does the correct thing.
-      if (node.class_type === 'LoadImage' && k === 'image') continue
+      // LoadImageMask.image is the same: the region bench uploads the mask as it
+      // queues the pass, so it is never in the enum either.
+      if ((node.class_type === 'LoadImage' || node.class_type === 'LoadImageMask') && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         errs.push(`node ${id} (${node.class_type}): "${k}"="${v}" not in enum`)
@@ -252,7 +236,9 @@ function checkGraph(wf: ApiWorkflow): string[] {
       // annotated output path ("sub/name.png [output]"), which ComfyUI resolves
       // but which never appears in the static enum. Checking it here would fail
       // every graph that does the correct thing.
-      if (node.class_type === 'LoadImage' && k === 'image') continue
+      // LoadImageMask.image is the same: the region bench uploads the mask as it
+      // queues the pass, so it is never in the enum either.
+      if ((node.class_type === 'LoadImage' || node.class_type === 'LoadImageMask') && k === 'image') continue
       const opts = optionsOf(known[k])
       if (opts && !opts.includes(v as string)) {
         const shown = opts.length > 6 ? `${opts.slice(0, 6).join(', ')}, …` : opts.join(', ')
@@ -266,14 +252,7 @@ function checkGraph(wf: ApiWorkflow): string[] {
 /** Every node class a graph uses, for the "did the derivation actually fire" check. */
 const classesOf = (wf: ApiWorkflow) => new Set(Object.values(wf).map(n => n.class_type))
 
-const runnable = (def: FamilyDef): boolean => {
-  const { clip, vae } = sidecarsOf(def)
-  return !(
-    clip.some(c => !clips.includes(c)) ||
-    (vae && !vaes.includes(vae)) ||
-    modelsOf(def).some(m => !installed.has(m))
-  )
-}
+const runnable = (def: FamilyDef): boolean => missingFilesFor(def, inv).length === 0
 
 const baseParamsFor = (def: FamilyDef, model: string) => {
   const d = defaultsFor(def, model)
