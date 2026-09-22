@@ -7,19 +7,46 @@
  * download server the add-on picker uses, and keeps going if the reader
  * leaves this panel: the run lives in a store, not in this component.
  *
- * The catalogue itself knows far more families than this app carries a graph
- * for. Those are not offered, and the panel says how many there are rather
- * than pretending the list is the whole world.
+ * Two facts shape the copy. The catalogue and the registry were written
+ * apart, so a family is matched to its catalogue entry by the files it loads
+ * and not by its name; and the catalogue never lists a community finetune,
+ * so a family it has no entry for is named with its file and left to be
+ * placed by hand, and is counted installed from the model tree rather than
+ * from a catalogue that cannot know.
  */
 import { useEffect, useMemo, useState } from 'react'
 import { useServerCapabilities } from '../../lib/capabilities'
 import { bytesText, fetchCatalog, fetchPlan, forgetCatalog, type CatalogFamily, type CatalogPlan } from '../../lib/catalog'
 import { cancelPlan, forgetPlan, startPlan, useDownloads } from '../../lib/downloads'
-import { FAMILIES, type FamilyDef } from '../../lib/workflows'
+import { modelFiles } from '../../lib/hardware'
+import { FAMILIES, modelsOf, type FamilyDef } from '../../lib/workflows'
 import { Meter } from '../loras/bits'
 import { Caution, Head, Link, Note } from './bits'
 
-type Row = { def: FamilyDef; cat: CatalogFamily | null }
+type Row = { def: FamilyDef; cat: CatalogFamily | null; installed: boolean }
+
+const base = (file: string) => file.split('/').pop() ?? file
+
+/**
+ * The catalogue entry for a registry family: the same id, or failing that
+ * the entry that lists the most of the family's weight files, preferring one
+ * of the same mode when two tie (Qwen 2.1 lists its one file under an image
+ * entry and an edit entry).
+ */
+function matchCatalogue(def: FamilyDef, families: readonly CatalogFamily[]): CatalogFamily | null {
+  const direct = families.find((f) => f.id === def.id)
+  if (direct) return direct
+  const wanted = new Set(modelsOf(def).map(base))
+  let best: { fam: CatalogFamily; score: number } | null = null
+  for (const fam of families) {
+    const listed = [...(fam.models ?? []), ...(fam.deps ?? [])]
+    const hits = listed.filter((m) => wanted.has(base(m))).length
+    if (!hits) continue
+    const score = hits * 2 + (fam.mode === def.mode ? 1 : 0)
+    if (!best || score > best.score) best = { fam, score }
+  }
+  return best?.fam ?? null
+}
 
 export function CataloguePanel({
   modes,
@@ -32,7 +59,8 @@ export function CataloguePanel({
 }) {
   const caps = useServerCapabilities()
   const runs = useDownloads()
-  const [catalog, setCatalog] = useState<{ byId: Map<string, CatalogFamily>; total: number } | null>(null)
+  const [catalog, setCatalog] = useState<{ families: CatalogFamily[]; total: number } | null>(null)
+  const [onDisk, setOnDisk] = useState<ReadonlySet<string> | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [plans, setPlans] = useState<Record<string, CatalogPlan | 'loading' | undefined>>({})
 
@@ -41,21 +69,37 @@ export function CataloguePanel({
     let live = true
     void fetchCatalog()
       .then((c) => {
-        if (!live) return
-        setCatalog({ byId: new Map(c.families.map((f) => [f.id, f])), total: c.counts.families })
+        if (live) setCatalog({ families: c.families, total: c.counts.families })
       })
       .catch((e: unknown) => {
         if (live) setError(e instanceof Error ? e.message : String(e))
+      })
+    void modelFiles()
+      .then((m) => {
+        if (live) setOnDisk(new Set([...m.keys()].map(base)))
+      })
+      .catch(() => {
+        if (live) setOnDisk(new Set())
       })
     return () => {
       live = false
     }
   }, [caps?.downloads])
 
-  const rows: Row[] = useMemo(() => {
-    if (!catalog) return []
-    return FAMILIES.filter((d) => modes.includes(d.mode)).map((def) => ({ def, cat: catalog.byId.get(def.id) ?? null }))
-  }, [catalog, modes])
+  const { rows, unmatchedTotal } = useMemo(() => {
+    if (!catalog) return { rows: [] as Row[], unmatchedTotal: 0 }
+    const matchedIds = new Set<string>()
+    const all = FAMILIES.map((def) => {
+      const cat = matchCatalogue(def, catalog.families)
+      if (cat) matchedIds.add(cat.id)
+      const installed = onDisk ? def.models.some((m) => onDisk.has(base(m))) : cat?.installed.ready ?? false
+      return { def, cat, installed }
+    })
+    return {
+      rows: all.filter((r) => modes.includes(r.def.mode)),
+      unmatchedTotal: catalog.total - matchedIds.size,
+    }
+  }, [catalog, onDisk, modes])
 
   if (!caps) return null
   if (!caps.downloads) {
@@ -70,26 +114,31 @@ export function CataloguePanel({
     )
   }
 
-  const missing = rows.filter((r) => r.cat && !r.cat.installed.ready)
-  const installed = rows.filter((r) => r.cat?.installed.ready).length
-  const unlisted = rows.filter((r) => !r.cat)
+  const installedCount = rows.filter((r) => r.installed).length
+  const fetchable = rows.filter((r) => r.cat && !r.installed)
+  const byHand = rows.filter((r) => !r.cat && !r.installed)
 
-  const finished = (family: string) => {
+  const refresh = () => {
     forgetCatalog()
-    void fetchCatalog(true).then((c) => setCatalog({ byId: new Map(c.families.map((f) => [f.id, f])), total: c.counts.families }))
-    setPlans((p) => ({ ...p, [family]: undefined }))
+    void fetchCatalog(true).then((c) => setCatalog({ families: c.families, total: c.counts.families }))
+    void modelFiles().then((m) => setOnDisk(new Set([...m.keys()].map(base)))).catch(() => {})
+  }
+
+  const finished = (catId: string) => {
+    refresh()
+    setPlans((p) => ({ ...p, [catId]: undefined }))
     onInstalled()
   }
 
   const ask = (row: Row) => {
-    const id = row.def.id
-    setPlans((p) => ({ ...p, [id]: 'loading' }))
-    void fetchPlan(id, row.cat?.installed.chosenModel ?? null)
+    const cat = row.cat!
+    setPlans((p) => ({ ...p, [cat.id]: 'loading' }))
+    void fetchPlan(cat.id, cat.installed.chosenModel ?? null)
       .then((plan) => {
-        setPlans((p) => ({ ...p, [id]: plan }))
+        setPlans((p) => ({ ...p, [cat.id]: plan }))
         // Fits, and nothing gated is missing a token: go without another question.
         if (plan.fits && !(plan.gated.files.length && !plan.gated.tokenPresent)) {
-          startPlan({ family: id, model: plan.chosenModel }, () => finished(id))
+          startPlan({ family: cat.id, model: plan.chosenModel }, () => finished(cat.id))
         }
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
@@ -99,29 +148,29 @@ export function CataloguePanel({
     <section className="mb-7">
       <Head
         title="The catalogue"
-        figure={catalog ? `${installed} of ${rows.length} installed` : null}
+        figure={catalog ? `${installedCount} of ${rows.length} installed` : null}
         note={
           catalog
-            ? `${catalog.total - rows.length} more families are in the catalogue with no verified graph in this app, so they are not offered.`
+            ? `${unmatchedTotal} families in the catalogue have no verified graph in this app and are not offered.`
             : 'Reading the catalogue.'
         }
       />
       {error ? <Caution>{error}</Caution> : null}
 
-      {catalog && !missing.length ? (
+      {catalog && !fetchable.length && !byHand.length ? (
         <Note>Every family this desk has a graph for is installed.</Note>
       ) : null}
 
       <ul className="divide-y divide-grey-300">
-        {missing.map((row) => {
-          const id = row.def.id
+        {fetchable.map((row) => {
           const cat = row.cat!
+          const id = cat.id
           const run = runs.get(id)
           const plan = plans[id]
           const files = cat.installed.missing
           const gated = cat.installed.gatedMissing.length > 0
           return (
-            <li key={id} className="py-2">
+            <li key={row.def.id} className="py-2">
               <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
                 <span className="text-small text-ink">{row.def.label}</span>
                 <span className="text-caption tabular-nums text-grey-500">
@@ -196,10 +245,21 @@ export function CataloguePanel({
         })}
       </ul>
 
-      {unlisted.length ? (
-        <Note>
-          Not in the catalogue, so not fetchable from here: {unlisted.map((r) => r.def.label).join(', ')}.
-        </Note>
+      {byHand.length ? (
+        <div className="mt-2">
+          <Note>
+            No download source in the catalogue, so these have to be placed under the models folder by
+            hand:
+          </Note>
+          <ul className="mt-1 space-y-0.5 text-caption text-grey-700">
+            {byHand.map((r) => (
+              <li key={r.def.id}>
+                {r.def.label}: <code>{r.def.models[0]}</code>
+                {r.def.models.length > 1 ? ` or ${r.def.models.length - 1} other file${r.def.models.length > 2 ? 's' : ''} the registry names` : ''}
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : null}
     </section>
   )

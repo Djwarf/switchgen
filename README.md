@@ -199,10 +199,14 @@ add-on chains for the two-model Wan pairs. All of it is validated by
 
 ### The catalogue
 
-`server/catalog.json` knows 104 families; this app carries a graph for the
-fifteen above. The catalogue panel behind More lists the ones not installed,
-what each is missing, how big that is, and the server's fit verdict, with one
-link to fetch. The other 89 are not offered.
+`server/catalog.json` knows 104 families; six of the fifteen above have an
+entry in it, matched by the files they load rather than by name. The
+catalogue panel behind More lists the ones not installed, what each is
+missing, how big that is, and the server's fit verdict, with one link to
+fetch. The nine with no catalogue entry (the SDXL, Anima and Krea finetunes,
+Z-Image, the Wan 2.2 families, VACE 1.3B and LTX 0.9.6) are named with the
+file to place by hand. The 98 catalogue families with no graph here are not
+offered.
 
 ## The recipe
 
