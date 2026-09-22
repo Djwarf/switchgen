@@ -14,18 +14,48 @@
  * placed by hand, and is counted installed from the model tree rather than
  * from a catalogue that cannot know.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useServerCapabilities } from '../../lib/capabilities'
 import { bytesText, fetchCatalog, fetchPlan, forgetCatalog, type CatalogFamily, type CatalogPlan } from '../../lib/catalog'
 import { cancelPlan, forgetPlan, startPlan, useDownloads } from '../../lib/downloads'
 import { modelFiles } from '../../lib/hardware'
-import { FAMILIES, modelsOf, type FamilyDef } from '../../lib/workflows'
+import { FAMILIES, modelsOf, sidecarsOf, type FamilyDef } from '../../lib/workflows'
 import { Meter } from '../loras/bits'
 import { Caution, Head, Link, Note } from './bits'
 
-type Row = { def: FamilyDef; cat: CatalogFamily | null; installed: boolean }
+/** What a family still lacks: main weights with no usable one on disk, and the other files its graph loads. */
+type Lack = { mains: string[]; files: string[] }
+
+type Row = { def: FamilyDef; cat: CatalogFamily | null; installed: boolean; lack: Lack }
 
 const base = (file: string) => file.split('/').pop() ?? file
+
+/**
+ * What stands between a family and a render, read off the files its graph
+ * loads. The text encoders, the VAE and any add-on the graph names are all
+ * needed; of the main weights, one of the listed alternatives is enough,
+ * except in a two-model family, which loads both halves.
+ *
+ * A name on disk is not proof on its own, because aria2c writes under the
+ * final name from the first byte, so a file a fetch has not finished does not
+ * count. The catalogue's own size check is not used for this: it cannot tell
+ * a partial from a different quant saved under the same name, and calls a
+ * complete mixed fp8 qwen_3_4b.safetensors short of the bf16 file's size.
+ */
+function lackOf(def: FamilyDef, onDisk: ReadonlySet<string>, unfinished: ReadonlySet<string>): Lack {
+  const whole = (file: string) => onDisk.has(base(file)) && !unfinished.has(base(file))
+  const { clip, vae } = sidecarsOf(def)
+  const addOns = Object.values(def.graph)
+    .map((n) => n.inputs['lora_name'])
+    .filter((l): l is string => typeof l === 'string')
+  const files = [...new Set([...clip, ...(vae ? [vae] : []), ...addOns])].filter((f) => !whole(f))
+  const mains = def.dualModel
+    ? def.models.filter((m) => !whole(m))
+    : def.models.some(whole)
+      ? []
+      : def.models
+  return { mains, files }
+}
 
 /**
  * The catalogue entry for a registry family: the same id, or failing that
@@ -63,6 +93,21 @@ export function CataloguePanel({
   const [onDisk, setOnDisk] = useState<ReadonlySet<string> | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [plans, setPlans] = useState<Record<string, CatalogPlan | 'loading' | undefined>>({})
+  const mounted = useRef(false)
+  const installedRef = useRef(onInstalled)
+  /** Catalogue ids whose landing is being re-read, so it is handled once. */
+  const settling = useRef(new Set<string>())
+
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    installedRef.current = onInstalled
+  })
 
   useEffect(() => {
     if (!caps?.downloads) return
@@ -88,18 +133,68 @@ export function CataloguePanel({
 
   const { rows, unmatchedTotal } = useMemo(() => {
     if (!catalog) return { rows: [] as Row[], unmatchedTotal: 0 }
+    // Files a run in the store set out to fetch and has not finished: the one
+    // being written now, the ones queued behind it, and the one a failed run
+    // stopped on, which the server keeps so the next fetch can resume it.
+    const unfinished = new Set<string>()
+    for (const run of runs.values()) {
+      if (run.state === 'done') continue
+      for (const f of run.files) if (!run.finished.includes(f.filename)) unfinished.add(base(f.filename))
+    }
     const matchedIds = new Set<string>()
     const all = FAMILIES.map((def) => {
       const cat = matchCatalogue(def, catalog.families)
       if (cat) matchedIds.add(cat.id)
-      const installed = onDisk ? def.models.some((m) => onDisk.has(base(m))) : cat?.installed.ready ?? false
-      return { def, cat, installed }
+      const lack = onDisk ? lackOf(def, onDisk, unfinished) : { mains: def.models, files: [] }
+      const installed = onDisk ? !lack.mains.length && !lack.files.length : cat?.installed.ready ?? false
+      return { def, cat, installed, lack }
     })
     return {
       rows: all.filter((r) => modes.includes(r.def.mode)),
       unmatchedTotal: catalog.total - matchedIds.size,
     }
-  }, [catalog, onDisk, modes])
+  }, [catalog, onDisk, modes, runs])
+
+  /** Ask the server again what is in the catalogue and on disk. Never rejects; a failure is said in the panel. */
+  const reread = useCallback(async () => {
+    forgetCatalog()
+    await Promise.all([
+      fetchCatalog(true).then(
+        (c) => {
+          if (mounted.current) setCatalog({ families: c.families, total: c.counts.families })
+        },
+        (e: unknown) => {
+          if (mounted.current) setError(e instanceof Error ? e.message : String(e))
+        },
+      ),
+      modelFiles().then(
+        (m) => {
+          if (mounted.current) setOnDisk(new Set([...m.keys()].map(base)))
+        },
+        () => {},
+      ),
+    ])
+  }, [])
+
+  // A family on this desk landed. The run lives in the store, so this may be
+  // the panel that started it or a later one, mounted after the reader left
+  // and came back: either way, re-read what is installed, tell the desk that
+  // is on screen now, and only then forget the run, so its row says it landed
+  // until the fresh reading takes its place.
+  useEffect(() => {
+    for (const row of rows) {
+      const id = row.cat?.id
+      if (!id || runs.get(id)?.state !== 'done' || settling.current.has(id)) continue
+      settling.current.add(id)
+      void reread().then(() => {
+        settling.current.delete(id)
+        if (!mounted.current) return
+        setPlans((p) => ({ ...p, [id]: undefined }))
+        forgetPlan(id)
+        installedRef.current()
+      })
+    }
+  }, [rows, runs, reread])
 
   if (!caps) return null
   if (!caps.downloads) {
@@ -115,20 +210,15 @@ export function CataloguePanel({
   }
 
   const installedCount = rows.filter((r) => r.installed).length
-  const fetchable = rows.filter((r) => r.cat && !r.installed)
-  const byHand = rows.filter((r) => !r.cat && !r.installed)
-
-  const refresh = () => {
-    forgetCatalog()
-    void fetchCatalog(true).then((c) => setCatalog({ families: c.families, total: c.counts.families }))
-    void modelFiles().then((m) => setOnDisk(new Set([...m.keys()].map(base)))).catch(() => {})
-  }
-
-  const finished = (catId: string) => {
-    refresh()
-    setPlans((p) => ({ ...p, [catId]: undefined }))
-    onInstalled()
-  }
+  // A row with a run in the store stays on screen whatever the files say, so
+  // its progress and its Stop link cannot vanish mid-fetch. Otherwise a row
+  // is offered for fetching when the catalogue has something to fetch or
+  // names what it cannot; a family lacking only files the catalogue does not
+  // list for it is left to be placed by hand.
+  const fetchable = rows.filter(
+    (r) => r.cat && (runs.has(r.cat.id) || (!r.installed && (r.cat.installed.missing.length || r.cat.incomplete?.length))),
+  )
+  const byHand = rows.filter((r) => !r.installed && !fetchable.includes(r))
 
   const ask = (row: Row) => {
     const cat = row.cat!
@@ -138,7 +228,7 @@ export function CataloguePanel({
         setPlans((p) => ({ ...p, [cat.id]: plan }))
         // Fits, and nothing gated is missing a token: go without another question.
         if (plan.fits && !(plan.gated.files.length && !plan.gated.tokenPresent)) {
-          startPlan({ family: cat.id, model: plan.chosenModel }, () => finished(cat.id))
+          startPlan({ family: cat.id, model: plan.chosenModel })
         }
       })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
@@ -178,10 +268,12 @@ export function CataloguePanel({
                   {gated ? ' · gated' : ''}
                 </span>
               </div>
-              <p className="mt-0.5 text-caption text-grey-700">
-                Needs {files.join(', ')}.
-                {cat.incomplete?.length ? ` No verified download exists for ${cat.incomplete.join(', ')}; that file has to be placed by hand.` : ''}
-              </p>
+              {files.length || cat.incomplete?.length ? (
+                <p className="mt-0.5 text-caption text-grey-700">
+                  {files.length ? `Needs ${files.join(', ')}.` : ''}
+                  {cat.incomplete?.length ? ` No verified download exists for ${cat.incomplete.join(', ')}; that file has to be placed by hand.` : ''}
+                </p>
+              ) : null}
 
               {run && (run.state === 'starting' || run.state === 'running') ? (
                 <div className="mt-1">
@@ -222,7 +314,7 @@ export function CataloguePanel({
                       <Link
                         onClick={() => {
                           if (window.confirm(`The server says this will not fit. Fetch ${row.def.label} anyway?`)) {
-                            startPlan({ family: id, model: plan.chosenModel, force: true }, () => finished(id))
+                            startPlan({ family: id, model: plan.chosenModel, force: true })
                           }
                         }}
                       >
@@ -254,13 +346,32 @@ export function CataloguePanel({
           <ul className="mt-1 space-y-0.5 text-caption text-grey-700">
             {byHand.map((r) => (
               <li key={r.def.id}>
-                {r.def.label}: <code>{r.def.models[0]}</code>
-                {r.def.models.length > 1 ? ` or ${r.def.models.length - 1} other file${r.def.models.length > 2 ? 's' : ''} the registry names` : ''}
+                {r.def.label}: <Needs def={r.def} lack={r.lack} />
               </li>
             ))}
           </ul>
         </div>
       ) : null}
     </section>
+  )
+}
+
+/** The files a family lacks, named for placing by hand. */
+function Needs({ def, lack }: { def: FamilyDef; lack: Lack }) {
+  // One of several alternative main weights will do, so name the first and
+  // count the rest; a two-model family names each half it lacks.
+  const oneOf = !def.dualModel && lack.mains.length > 1
+  const named = oneOf ? lack.mains.slice(0, 1) : lack.mains
+  const others = lack.mains.length - 1
+  return (
+    <>
+      {[...named, ...lack.files].map((f, i) => (
+        <Fragment key={f}>
+          {i ? ', ' : ''}
+          <code>{f}</code>
+          {oneOf && i === 0 ? ` or ${others} other file${others > 1 ? 's' : ''} the registry names` : ''}
+        </Fragment>
+      ))}
+    </>
   )
 }

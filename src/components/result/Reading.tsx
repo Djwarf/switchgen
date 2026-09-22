@@ -77,25 +77,11 @@ function factsSentence(facts: ImageFacts | null): string | null {
   return `The detector found ${part(facts.face, 'face')}; ${part(facts.hand, 'hand')}; ${facts.person.length} ${facts.person.length === 1 ? 'person' : 'people'}.`
 }
 
-export function Reading({
-  source,
-  cacheKey,
-  arch = null,
-  anatomy,
-  onAnatomy,
-  onAddOn,
-  onUseWords,
-  onRead,
-  known = null,
-  compact = false,
-}: ReadingProps) {
+export function Reading(props: ReadingProps) {
+  const { source, cacheKey, compact = false } = props
   const [caps, setCaps] = useState<VisionCapabilities | null>(null)
-  const [report, setReport] = useState<VisionReport | null>(() => readings.get(cacheKey) ?? null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const [installing, setInstalling] = useState<FetchProgress | null>(null)
-  const [added, setAdded] = useState<ReadonlySet<string>>(() => new Set())
-  const [shownFor, setShownFor] = useState(cacheKey)
+  const [installError, setInstallError] = useState<string | null>(null)
 
   useEffect(() => {
     let live = true
@@ -107,41 +93,17 @@ export function Reading({
     }
   }, [])
 
-  // A different picture is a different reading. Adjusted during render, the
-  // way React asks for state that follows a prop, so no stale reading is ever
-  // painted for the new picture. The cache answers when it can.
-  if (shownFor !== cacheKey) {
-    setShownFor(cacheKey)
-    setReport(readings.get(cacheKey) ?? null)
-    setError(null)
-    setAdded(new Set())
-  }
-
   if (!source || !caps) return null
-
-  const read = () => {
-    setBusy(true)
-    setError(null)
-    const bases = arch && INDEXED.has(arch) ? [arch as IndexedBase] : undefined
-    void inspectImage(source, { bases, limit: 4 })
-      .then((r) => {
-        readings.set(cacheKey, r)
-        setReport(r)
-        if (!r.unavailable) onRead?.(r)
-        else setError(r.unavailable)
-      })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setBusy(false))
-  }
 
   const install = () => {
     if (!caps.install) return
     const files = caps.install.files.filter((f) => caps.install!.missing.includes(f.filename))
+    setInstallError(null)
     setInstalling({ state: 'starting', pct: 0, done: 0, total: 0, speed: 0, etaSec: null, error: null })
     void installFiles(files.length ? files : caps.install.files, setInstalling)
       .then(() => refreshCapabilities())
       .then((c) => setCaps(c))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setInstallError(e instanceof Error ? e.message : String(e)))
       .finally(() => setInstalling(null))
   }
 
@@ -167,11 +129,51 @@ export function Reading({
               HuggingFace. It reads pictures on the CPU and does not touch the card.
             </p>
           )}
-          {error ? <p className="mt-1 text-ink-error">{error}</p> : null}
+          {installError ? <p className="mt-1 text-ink-error">{installError}</p> : null}
         </div>
       )
     }
     return <p className={`${text} italic text-grey-500`}>{caps.reason ?? 'No image reading is installed on the server.'}</p>
+  }
+
+  // One picture's reading lives and dies with that picture. Keyed, so a read
+  // still in flight when the picture changes lands in an instance that is no
+  // longer shown, never under the next picture. It still reaches the cache,
+  // and the onRead of the picture it was asked for.
+  return <PictureReading key={cacheKey} {...props} source={source} text={text} />
+}
+
+function PictureReading({
+  source,
+  cacheKey,
+  arch = null,
+  anatomy,
+  onAnatomy,
+  onAddOn,
+  onUseWords,
+  onRead,
+  known = null,
+  compact = false,
+  text,
+}: ReadingProps & { source: ImageSource; text: string }) {
+  const [report, setReport] = useState<VisionReport | null>(() => readings.get(cacheKey) ?? null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [added, setAdded] = useState<ReadonlySet<string>>(() => new Set())
+
+  const read = () => {
+    setBusy(true)
+    setError(null)
+    const bases = arch && INDEXED.has(arch) ? [arch as IndexedBase] : undefined
+    void inspectImage(source, { bases, limit: 4 })
+      .then((r) => {
+        readings.set(cacheKey, r)
+        setReport(r)
+        if (!r.unavailable) onRead?.(r)
+        else setError(r.unavailable)
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false))
   }
 
   if (!report) {

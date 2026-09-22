@@ -6,6 +6,7 @@
  * only what can actually run here once fetched. Every verdict about fit
  * (RAM, disk, a gated file) is the server's, quoting the numbers it used.
  */
+import { onPlanLanded } from './downloads'
 
 export type CatalogFile = {
   filename: string
@@ -95,6 +96,10 @@ export function fetchCatalog(fresh = false): Promise<Catalog> {
 export function forgetCatalog(): void {
   cache = null
 }
+
+// A family landing changes what the catalogue calls installed, whether or not
+// a panel is open to re-read it, so the next reader asks the server again.
+onPlanLanded(() => forgetCatalog())
 
 /** The server's plan for one family: what to fetch, how big, and whether it fits. */
 export function fetchPlan(family: string, model?: string | null): Promise<CatalogPlan> {
