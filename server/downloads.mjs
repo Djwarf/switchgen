@@ -900,8 +900,16 @@ export const downloadsMiddleware = async (req, res, next) => {
         if (!f.url) return send(res, 409, { error: `no verified URL for ${f.filename}; it must be placed by hand` })
       }
 
-      // Nobody is listening any more; do not start fetching for them.
-      if (plan.cancelled) return
+      // Nobody is listening any more; do not start fetching for them. The
+      // 'close' listener above has usually said so already, through the plan;
+      // the socket's own state is asked as well, so a hang-up is honoured here
+      // whether or not that event has been delivered yet.
+      if (plan.cancelled || res.destroyed) return
+      // Asked again, because the checks above wait on the network and the
+      // disk, and another fetch can take the last slot in the meantime.
+      if (activePlans >= MAX_ACTIVE_PLANS) {
+        return send(res, 429, { error: `${MAX_ACTIVE_PLANS} downloads are already running; wait for one to finish` })
+      }
 
       sseOpen(res)
       sse(res, 'plan', { family: familyId, files: queue.map(f => ({ filename: f.filename, dest: f.dest, sizeBytes: f.sizeBytes, gated: f.gated })) })

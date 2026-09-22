@@ -14,6 +14,7 @@ import os from 'node:os'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { confineReal, guardMutation, readBody, reqUrl, safely, send, tools } from './guard.mjs'
+import { forgetThumbs } from './thumbs.mjs'
 
 const run = promisify(execFile)
 
@@ -24,13 +25,27 @@ const WEIGHTS = /\.(safetensors|gguf|ckpt|pt|pth|sft|bin)$/i
 /** Longest a probe of the machine may hang before we give up on it. */
 const PROBE_MS = 5000
 
+/**
+ * Every weight file under the models root that is whole.
+ *
+ * A file aria2c has not finished is left out. Its control file, `<name>.aria2`,
+ * sits beside it until the last byte lands, and that is the only sign of a
+ * partial that an earlier session left behind (a dropped connection, a closed
+ * tab). Size cannot tell: a complete file of another precision under the same
+ * name reads short too. Every reader of this list takes a listed file as one
+ * ComfyUI can load, so a partial is not flagged for each of them to skip; it
+ * is not listed. The downloader walks the tree for itself and still sees it,
+ * which is how the next fetch resumes it.
+ */
 async function walk(dir, root = dir, out = []) {
   let entries
   try { entries = await fs.readdir(dir, { withFileTypes: true }) } catch { return out }
+  const names = new Set(entries.map(e => e.name))
   for (const e of entries) {
     const full = path.join(dir, e.name)
     if (e.isDirectory()) await walk(full, root, out)
     else if (WEIGHTS.test(e.name)) {
+      if (names.has(e.name + '.aria2')) continue
       try {
         const st = await fs.stat(full)
         out.push({
@@ -126,6 +141,78 @@ async function snapshot() {
   }
 }
 
+// ------------------------------------------------------------ live status --
+
+/**
+ * Viewers of /api/hardware/stream, each with the pace it asked for.
+ *
+ * Each viewer used to run a timer of its own, so every open tab cost another
+ * nvidia-smi and df a second. Their samples also shared the one CPU delta,
+ * so each tab read the load since whichever sample came last, not over its
+ * own second. One sampler now serves every viewer: it starts with the first,
+ * runs at the pace the most eager one asked for, and stops with the last.
+ */
+const viewers = new Map()
+let sampler = null
+let sampling = false
+/** The newest frame, so a viewer who joins a running sampler sees figures at once. */
+let lastFrame = null
+
+async function sampleOnce() {
+  if (sampling) return
+  sampling = true
+  try {
+    const data = await snapshot()
+    const line = `data: ${JSON.stringify(data)}\n\n`
+    lastFrame = { t: data.t, line }
+    for (const [res, v] of viewers) {
+      if (res.writableEnded) { leave(res); continue }
+      // A viewer who asked for a slower pace than the sampler's skips frames
+      // until its own interval has passed. The tenth of slack keeps a frame
+      // that lands a little early, because nvidia-smi took a little less time
+      // than last round, from pushing that viewer back a whole interval.
+      if (v.last && data.t - v.last < v.everyMs * 0.9) continue
+      v.last = data.t
+      try { res.write(line) } catch { leave(res) }
+    }
+  } catch { /* one lost sample; the next tick takes another */ } finally {
+    sampling = false
+  }
+}
+
+/** Start, re-pace or stop the sampler to suit whoever is watching now. */
+function retime() {
+  if (!viewers.size) {
+    if (sampler) clearInterval(sampler.timer)
+    sampler = null
+    lastFrame = null
+    return
+  }
+  const everyMs = Math.min(...[...viewers.values()].map(v => v.everyMs))
+  if (sampler?.everyMs === everyMs) return
+  if (sampler) clearInterval(sampler.timer)
+  sampler = { everyMs, timer: setInterval(sampleOnce, everyMs) }
+}
+
+function join(res, everyMs) {
+  const first = !sampler
+  viewers.set(res, { everyMs, last: 0 })
+  retime()
+  if (first) {
+    cpuSample() // prime the delta so the first real sample is meaningful
+    void sampleOnce()
+  } else if (lastFrame) {
+    viewers.get(res).last = lastFrame.t
+    try { res.write(lastFrame.line) } catch { leave(res) }
+  }
+}
+
+function leave(res) {
+  if (!viewers.delete(res)) return
+  try { res.end() } catch { /* already gone */ }
+  retime()
+}
+
 /**
  * What this server can do, for a client deciding whether to offer a feature.
  *
@@ -196,45 +283,31 @@ export function switchgenApi() {
         })
       }
 
-      // Real-time device status. One SSE stream per viewer, torn down on
-      // disconnect so a closed tab cannot leave nvidia-smi polling forever.
+      // Real-time device status. One SSE stream per viewer, all fed by the
+      // one sampler above, and each taken off it on disconnect so a closed tab
+      // cannot leave nvidia-smi polling forever.
       //
       // The teardown listens on the response, not the request. An
       // IncomingMessage is destroyed once its message is complete, which for a
       // bodyless GET can be immediately: its 'close' is not the client going
       // away. The response stays open until we end it, so its 'close' is.
       if (url.pathname === '/api/hardware/stream' && req.method === 'GET') {
+        if (res.destroyed) return
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
           'X-Accel-Buffering': 'no',
         })
-        cpuSample() // prime the delta so the first real sample is meaningful
-        let closed = false
-        let inFlight = false
-        const tick = async () => {
-          if (closed || inFlight) return
-          inFlight = true
-          try {
-            const data = await snapshot()
-            if (closed || res.writableEnded) return
-            res.write(`data: ${JSON.stringify(data)}\n\n`)
-          } catch { stop() } finally { inFlight = false }
-        }
         const everyMs = Math.min(5000, Math.max(250, Number(url.searchParams.get('ms')) || 1000))
-        const timer = setInterval(tick, everyMs)
         const stop = () => {
-          if (closed) return
-          closed = true
-          clearInterval(timer)
           res.off('close', stop)
           res.off('error', stop)
-          try { res.end() } catch { /* already gone */ }
+          leave(res)
         }
         res.on('close', stop)
         res.on('error', stop)
-        void tick()
+        join(res, everyMs)
         return
       }
 
@@ -261,9 +334,13 @@ export function switchgenApi() {
         try { st = await fs.lstat(full) } catch { return send(res, 404, { error: 'not found' }) }
         if (!st.isFile()) return send(res, 400, { error: 'not a regular file' })
         await fs.unlink(full)
+        const deleted = path.relative(path.resolve(root), full)
+        // Its thumbnails go with it. Left behind, they would only take disk:
+        // a new file under the same name is thumbnailed afresh anyway.
+        if (kind === 'output') void forgetThumbs(deleted)
         // Report what was actually removed. If `rel` named a link, the file
         // that went is the one it pointed at, and saying so is the honest answer.
-        return send(res, 200, { deleted: path.relative(path.resolve(root), full), requested: rel, freed: st.size })
+        return send(res, 200, { deleted, requested: rel, freed: st.size })
       }
 
       // Unknown paths inside our own namespace answer JSON, not Vite's SPA

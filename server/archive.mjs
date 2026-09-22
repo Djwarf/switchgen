@@ -32,7 +32,7 @@
 import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { guardMutation, readBody, send } from './guard.mjs'
+import { guardMutation, readBody, reqUrl, safely, send } from './guard.mjs'
 
 const OUTPUTS = process.env.SWITCHGEN_OUTPUTS ?? '/mnt/storage/ai/outputs'
 const ARCHIVE = process.env.SWITCHGEN_ARCHIVE ?? path.join(OUTPUTS, '.switchgen', 'archive.json')
@@ -303,7 +303,11 @@ const METHODS = new Map([
 
 export function switchgenArchive() {
   const handler = async (req, res, next) => {
-    const url = new URL(req.url, 'http://local')
+    // Parsed the way every other server here parses it. switchgenApi answers
+    // an unreadable path before this runs, but only because it is mounted
+    // first; this handler must not depend on the order of the plugin list.
+    const url = reqUrl(req)
+    if (!url) return send(res, 400, { error: 'the request path is not a valid URL' })
     const p = url.pathname
     if (!p.startsWith('/api/archive') && p !== '/api/outputs') return next()
 
@@ -376,7 +380,7 @@ export function switchgenArchive() {
 
   return {
     name: 'switchgen-archive',
-    configureServer(server) { server.middlewares.use(handler) },
-    configurePreviewServer(server) { server.middlewares.use(handler) },
+    configureServer(server) { server.middlewares.use(safely(handler)) },
+    configurePreviewServer(server) { server.middlewares.use(safely(handler)) },
   }
 }

@@ -22,15 +22,60 @@ import path from 'node:path'
 import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { gzipSync } from 'node:zlib'
 
 const run = promisify(execFile)
 
 // ---------------------------------------------------------------- plumbing --
 
+/** Below this a body is not worth the compressor's time or the header bytes. */
+const GZIP_MIN = 1024
+
+/**
+ * Does the client take gzip? `gzip;q=0` is a refusal, not an offer, and `*`
+ * offers every coding the header does not name.
+ */
+function takesGzip(req) {
+  const accept = String(req?.headers?.['accept-encoding'] ?? '').toLowerCase()
+  let star = false
+  for (const part of accept.split(',')) {
+    const [name, ...params] = part.split(';').map(s => s.trim())
+    const q = params.find(p => p.startsWith('q='))
+    const offered = q === undefined || Number(q.slice(2)) > 0
+    if (name === 'gzip' || name === 'x-gzip') return offered
+    if (name === '*') star = offered
+  }
+  return star
+}
+
+/**
+ * Answer with JSON, gzipped when it is big enough to matter and the client
+ * takes it.
+ *
+ * Vite compresses what it serves itself, but these routes answer before its
+ * compressor is mounted, so a whole-archive pull went out as plain text: on a
+ * phone over Tailscale, every byte of it. The archive file here, 126,517 B
+ * when this was written, packed to 18,638 B in about 1.3 ms.
+ */
 export function send(res, code, body) {
+  const json = JSON.stringify(body) ?? ''
   res.statusCode = code
   res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify(body))
+  if (json.length < GZIP_MIN) {
+    res.end(json)
+    return
+  }
+  // An answer this size differs by what the client accepts, so anything that
+  // caches it between here and the browser has to key on that.
+  res.setHeader('Vary', 'Accept-Encoding')
+  if (!takesGzip(res.req)) {
+    res.end(json)
+    return
+  }
+  const packed = gzipSync(json)
+  res.setHeader('Content-Encoding', 'gzip')
+  res.setHeader('Content-Length', packed.length)
+  res.end(packed)
 }
 
 /**

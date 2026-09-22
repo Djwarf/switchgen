@@ -1,19 +1,25 @@
 /**
  * Poster frames for the archive.
  *
+ * A card shows a thumbnail the server made (see src/lib/thumbs.ts), not the
+ * original: a render is often a megabyte or more, and a card draws it a few
+ * hundred pixels wide. A clip's thumbnail is its first frame.
+ *
  * A grid of clips must never be a grid of `<video>` elements: fifty of them
  * decoding at once will stall a machine that is already giving its card to a
- * generation. So a clip's first frame is grabbed once, into a small JPEG, by a
- * detached video element that is never added to the document, and the grid
- * renders that image.
+ * generation. So when the server cannot make a clip's frame (no ffmpeg there,
+ * or a file it cannot read), the frame is grabbed here instead, once, into a
+ * small JPEG, by a detached video element that is never added to the
+ * document. A picture the server cannot shrink is shown as it is.
  *
- * The cache lives for the tab. Captures are limited to two at a time and are
- * only started when a card is actually near the viewport, so scrolling past a
- * thousand records costs nothing.
+ * The grabbed frames live for the tab. Captures are limited to two at a time
+ * and are only started when a card is actually near the viewport, so
+ * scrolling past a thousand records costs nothing.
  */
 import { useEffect, useRef, useState } from 'react'
 import { fileUrl, relPath, type FileRef } from '../../lib/comfy'
 import type { HistoryEntry } from '../../lib/history'
+import { hasThumb, thumbSrcSet, thumbUrl } from '../../lib/thumbs'
 import { clipSlug } from './query'
 
 type State = 'idle' | 'working' | 'ready' | 'failed'
@@ -25,9 +31,12 @@ const MAX_CACHED = 240
 const MAX_PARALLEL = 2
 let running = 0
 
-/** The poster for a clip, if one has already been grabbed. */
+/**
+ * The poster for a clip: the frame grabbed in this tab if there is one, which
+ * means the server could not make it, and otherwise the server's.
+ */
 export function posterUrl(file: FileRef): string | undefined {
-  return cache.get(relPath(file))
+  return cache.get(relPath(file)) ?? (hasThumb(file) ? thumbUrl(file, 1024) : undefined)
 }
 
 function remember(key: string, url: string): void {
@@ -143,6 +152,12 @@ function request(file: FileRef): Promise<string> {
   })
 }
 
+/**
+ * How wide a grid card is drawn, for the browser to pick a thumbnail width by:
+ * the grid's columns at each of its breakpoints (Grid.tsx).
+ */
+const GRID_SIZES = '(min-width: 1400px) 25vw, (min-width: 1100px) 33vw, (min-width: 780px) 50vw, 100vw'
+
 type Props = {
   entry: HistoryEntry
   /** Extra classes for the frame. The frame is always a 1 px grey rule. */
@@ -151,33 +166,44 @@ type Props = {
   fit?: 'cover' | 'contain'
   /** Grab the poster immediately rather than waiting for the card to be seen. */
   eager?: boolean
+  /** How wide the frame is drawn, as an <img sizes>. A grid card's by default. */
+  sizes?: string
 }
 
 /**
  * One archive thumbnail: a picture, or a clip's first frame with its length in
  * the corner. Never a `<video>`.
  */
-export function Poster({ entry, className = '', fit = 'cover', eager = false }: Props) {
+export function Poster({ entry, className = '', fit = 'cover', eager = false, sizes = GRID_SIZES }: Props) {
   const key = relPath(entry.file)
   const isVideo = entry.kind === 'video'
-  /** A picture is its own thumbnail; a clip's has to be grabbed. */
-  const held = isVideo ? cache.get(key) : fileUrl(entry.file)
 
-  // Keyed, so a poster grabbed for the record that used to be here is never
-  // shown against a different one.
+  // Each keyed, so what happened to the record that used to be here is never
+  // held against a different one: the server's thumbnail failing, a grabbed
+  // poster, the last fallback failing too.
+  const [noThumb, setNoThumb] = useState<string | null>(null)
   const [got, setGot] = useState<{ key: string; url: string | null } | null>(null)
   const [broken, setBroken] = useState<string | null>(null)
   const frame = useRef<HTMLDivElement | null>(null)
+
+  /** A frame grabbed earlier in this tab, because the server could not make one then. */
+  const grabbedBefore = isVideo ? cache.get(key) : undefined
+  /** The server's thumbnail, until it has failed for this record. */
+  const fromServer = !grabbedBefore && hasThumb(entry.file) && noThumb !== key
+  /** Without it, a picture is shown as it is; a clip's frame has to be grabbed. */
+  const grabbing = isVideo && !fromServer
+  const held = fromServer ? thumbUrl(entry.file, 512) : isVideo ? grabbedBefore : fileUrl(entry.file)
 
   const grabbed = got && got.key === key ? got.url : undefined
   const url = held ?? grabbed ?? undefined
   const failed =
     broken === key ||
-    (isVideo && (entry.missing === true || failures.has(key) || grabbed === null))
+    (isVideo && entry.missing === true) ||
+    (grabbing && (failures.has(key) || grabbed === null))
   const state: State = failed ? 'failed' : url ? 'ready' : 'working'
 
   useEffect(() => {
-    if (!isVideo || cache.has(key) || failures.has(key) || entry.missing) return
+    if (!grabbing || cache.has(key) || failures.has(key) || entry.missing) return
 
     let live = true
     const begin = () => {
@@ -215,7 +241,7 @@ export function Poster({ entry, className = '', fit = 'cover', eager = false }: 
       live = false
       io.disconnect()
     }
-  }, [key, isVideo, entry.file, entry.missing, eager])
+  }, [key, grabbing, entry.file, entry.missing, eager])
 
   const slug = isVideo ? clipSlug(entry.length, entry.fps) : null
 
@@ -226,11 +252,16 @@ export function Poster({ entry, className = '', fit = 'cover', eager = false }: 
     >
       {url && !failed ? (
         <img
+          // A new element for a new source, so a fallback never inherits the
+          // failed thumbnail's srcSet or its pending error.
+          key={url}
           src={url}
+          srcSet={fromServer ? thumbSrcSet(entry.file) : undefined}
+          sizes={fromServer ? sizes : undefined}
           alt={entry.prompt ? `Frame from: ${entry.prompt}` : 'Archive thumbnail'}
           loading={eager ? 'eager' : 'lazy'}
           decoding="async"
-          onError={() => setBroken(key)}
+          onError={() => (fromServer ? setNoThumb(key) : setBroken(key))}
           className={`h-full w-full ${fit === 'cover' ? 'object-cover' : 'object-contain'}`}
         />
       ) : (
