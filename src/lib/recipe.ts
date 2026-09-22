@@ -49,6 +49,19 @@ import {
   type LoraStack,
   type LoraTarget,
 } from './loras'
+import { suggest as suggestLoras } from './suggest'
+import { byFilename as indexedLora } from './loraIndex'
+
+/**
+ * The token a suggested LoRA answers to, read from its own training captions.
+ * Only 'strong' and 'likely' are used: a guessed trigger is worse than none,
+ * because it puts a word in the prompt the model was never taught.
+ */
+function indexedTrigger(file: string): string | null {
+  const e = indexedLora(file)
+  if (!e || !e.triggerPhrase) return null
+  return e.confidence === 'strong' || e.confidence === 'likely' ? e.triggerPhrase : null
+}
 import { canTakeLoras, capabilitiesOf, withLoras, type Capabilities, type DerivedDef } from './refine'
 import { FAMILIES, defaultsFor, deriveImg2Img, IMG2IMG, type FamilyDef, type Params } from './workflows'
 
@@ -332,6 +345,13 @@ function wantedFor(level: AnatomyLevel): MeasuredStack | null {
   return null
 }
 
+/**
+ * The architecture the measured stack was measured on. MEASURED_ON names the
+ * checkpoint; this is its arch, used to break ties between booru carriers so
+ * the printed figure describes the stack that actually runs.
+ */
+const MEASURED_ARCH = 'pony' as const
+
 /** True when this checkpoint can carry the anatomy LoRAs at all. */
 function carriesAnatomy(def: FamilyDef, model: string): boolean {
   return canTakeLoras(def) && BOORU.has(archFor(def, model))
@@ -442,7 +462,14 @@ export function decide(input: RecipeInput): Recipe {
   // help, a base that can carry it beats one that cannot, and the base that was
   // displaced is named rather than quietly dropped.
   if (anatomy !== 'off') {
-    const carrier = pool.find(r => carriesAnatomy(r.def, r.model))
+    // Prefer the base the stack was MEASURED on. anatomy-helper and
+    // add-micro-details are catalogued as Pony files, so on an Illustrious
+    // carrier resolveStack drops them and the figure printed on screen
+    // describes a stack that is not running. Any booru base still beats a
+    // non-booru one; this only orders the booru candidates.
+    const carriers = pool.filter(r => carriesAnatomy(r.def, r.model))
+    const carrier =
+      carriers.find(r => archFor(r.def, r.model) === MEASURED_ARCH) ?? carriers[0]
     if (carrier && carrier !== pick) {
       notes.push(
         note(
@@ -592,7 +619,52 @@ export function decide(input: RecipeInput): Recipe {
   const per = (baseDef.perModel?.[model] ?? {}) as Record<string, unknown>
   const prefix = prefixFor(baseDef, model)
   const lower = prompt.toLowerCase()
-  const triggers = triggersFor(stack, lib, target).filter(t => !lower.includes(t.toLowerCase()))
+  const resolvedFiles = loras.map(l => l.file)
+  // THE PROMPT GETS A VOTE.
+  //
+  // The anatomy level alone cannot know that 'anime screencap, 90s retro'
+  // wants the 90s aesthetic LoRA, or that 'freckles, natural skin texture'
+  // wants the skin one. suggest() scores the prompt against each LoRA's real
+  // training vocabulary and returns picks with their triggers.
+  //
+  // It is additive and capped: the measured anatomy stack stays exactly as it
+  // was, so the figure printed on screen still describes what runs. Anything
+  // the prompt suggests on top is marked measured:false, because no run
+  // measured it.
+  let promptPicks: { file: string; strength: number; why: string }[] = []
+  try {
+    const sug = suggestLoras({
+      prompt, model, installed: lib.byFile ? [...lib.byFile.keys()] : [], anatomy,
+      already: resolvedFiles,
+    } as never) as { stack?: { file: string; strength: number; why?: string }[] }
+    promptPicks = (sug.stack ?? [])
+      .filter(s => !resolvedFiles.includes(s.file))
+      .slice(0, 2)
+      .map(s => ({ file: s.file, strength: s.strength, why: s.why ?? 'Suggested by your prompt.' }))
+  } catch {
+    // suggestion is a bonus, never a dependency: a failure here must not stop a render
+    promptPicks = []
+  }
+  for (const pick of promptPicks) {
+    loras.push({ file: pick.file, label: labelOf(lib, pick.file), strength: pick.strength,
+      measured: false, why: pick.why })
+  }
+  if (promptPicks.length) {
+    notes.push(note('prompt', `Your wording also suggested ${promptPicks.length} LoRA` +
+      `${promptPicks.length === 1 ? '' : 's'}: ${promptPicks.map(p => labelOf(lib, p.file)).join(', ')}. ` +
+      `Those are matched from training vocabulary, not measured.`))
+  }
+
+  // Suggested LoRAs need their triggers as much as measured ones do. An
+  // untriggered stack measured 0.786x of base, ie worse than using none, so
+  // adding a LoRA without its token actively harms the picture.
+  const suggestedTriggers = promptPicks.flatMap(pick => {
+    const e = indexedTrigger(pick.file)
+    return e ? [e] : []
+  })
+  const triggers = [...triggersFor(stack, lib, target), ...suggestedTriggers]
+    .filter((t, n, a) => a.indexOf(t) === n)
+    .filter(t => !lower.includes(t.toLowerCase()))
   if (prefix.tokens.length) notes.push(note('prompt', prefix.why))
   if (triggers.length) {
     notes.push(note('prompt', `Trigger tokens added for the LoRAs applied: ${triggers.join(', ')}.`))

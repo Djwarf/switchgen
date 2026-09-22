@@ -64,6 +64,29 @@
  * A file on disk with no catalogue row is still offered. It is simply marked as
  * having no verified base, which is the truth.
  */
+import { byFilename as indexedLora } from './loraIndex'
+
+/**
+ * The trigger a LoRA actually answers to.
+ *
+ * loras.ts carries a hand-written catalogue. loraIndex.ts carries what each
+ * file's own training captions say. Where the file speaks, the file wins: the
+ * catalogue had `rnat` for a LoRA whose 26 training images all say `rnct`, and
+ * a wrong trigger is not a small error. A LoRA running without its trigger
+ * measured BELOW using no LoRA at all (0.786x mean over three seeds), so a
+ * wrong token is worse than an empty one.
+ *
+ * The catalogue still answers for the 22 files that carry no tag data, and for
+ * anything the index rates below `likely`.
+ */
+function bestTrigger(file: string, handWritten: string): string {
+  const e = indexedLora(file)
+  if (e && (e.confidence === 'strong' || e.confidence === 'likely') && e.triggerPhrase) {
+    return e.triggerPhrase
+  }
+  return handWritten
+}
+
 import type { LoraSpec } from './refine'
 import type { FamilyDef } from './registry'
 
@@ -1744,7 +1767,7 @@ export function triggersFor(stack: LoraStack, lib: LoraLibrary, target?: LoraTar
     const info = lib.byFile.get(e.file)
     if (!info || !info.installed) continue
     if (target && fitFor(info, target).level === 'mismatch') continue
-    const t = info.trigger.trim()
+    const t = bestTrigger(e.file, info.trigger).trim()
     if (t) seen.add(t)
   }
   return [...seen]
