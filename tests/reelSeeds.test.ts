@@ -107,6 +107,52 @@ describe('a fixed reel through a cut', () => {
   })
 })
 
+describe('a new seed on a fixed reel', () => {
+  // Typing a reel seed, or the dice, reads every take made with the old one as
+  // changed. The next cut kept each take's old seed all the same, so the strip
+  // read current again and the new seed was never rendered.
+  it('keeps no take made with the old seed, so the cut leaves every shot due', async () => {
+    m.run.mockImplementation(finishes)
+    const shots = ['a', 'b', 'c', 'd'].map((p) => store.newShot(p))
+    engine.reelRun.renderAll(shots.map((s) => s.id), planOf(shots, true, 500), ctx)
+    await settled()
+    const states = engine.reelRun.snapshot().states
+
+    const keep = store.seedsToKeep(shots, states, 900)
+    expect(keep.size).toBe(0)
+    const rest = shots.slice(1).map((s) => (keep.has(s.id) ? { ...s, keptSeed: keep.get(s.id)! } : s))
+    expect(engine.shotsToRender(rest.map((s) => s.id), planOf(rest, true, 900), states)).toEqual([0, 1, 2])
+
+    // At the seed the takes were made with, all of them are kept, as before.
+    expect(store.seedsToKeep(shots, states, 500).size).toBe(4)
+  })
+
+  it('keeps no take for a shot whose own seed was cleared, and keeps the ladder shot after it', async () => {
+    m.run.mockImplementation(finishes)
+    const shots = [{ ...store.newShot('a'), seed: 7 }, store.newShot('b')]
+    engine.reelRun.renderAll(shots.map((s) => s.id), planOf(shots, true, 500), ctx)
+    await settled()
+    const states = engine.reelRun.snapshot().states
+
+    const cleared = [{ ...shots[0]!, seed: null, keptSeed: null }, shots[1]!]
+    const keep = store.seedsToKeep(cleared, states, 500)
+    expect(keep.has(shots[0]!.id)).toBe(false)
+    expect(keep.get(shots[1]!.id)).toBe(501)
+  })
+
+  it('keeps every take of a Random pass when it is fixed, and none against another seed', async () => {
+    m.run.mockImplementation(finishes)
+    const shots = ['a', 'b'].map((p) => store.newShot(p))
+    // Random draws the reel's seed at the press; this pass drew 300.
+    engine.reelRun.renderAll(shots.map((s) => s.id), planOf(shots, false, 300), ctx)
+    await settled()
+    const states = engine.reelRun.snapshot().states
+
+    expect(shots.map((s) => store.seedsToKeep(shots, states).get(s.id))).toEqual([300, 301])
+    expect(store.seedsToKeep(shots, states, 999).size).toBe(0)
+  })
+})
+
 describe('Random lets kept seeds go', () => {
   it('ignores a kept seed on Random, so the press draws fresh ones, and never a typed one', () => {
     const s = { ...store.newShot('a'), keptSeed: 777 }

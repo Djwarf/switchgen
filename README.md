@@ -80,11 +80,20 @@ fails every region refine check with `"model_name"="4x-UltraSharp.pth" not in
 
 Start ComfyUI with `--output-directory` pointing at the folder the app should
 file outputs from. `contrib/comfyui.service` is a systemd user unit that does
-this, which lets the launcher start ComfyUI on demand:
+this, which lets the launcher start ComfyUI on demand. First copy it:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp contrib/comfyui.service ~/.config/systemd/user/   # then edit the two paths
+cp contrib/comfyui.service ~/.config/systemd/user/
+```
+
+Then, in `~/.config/systemd/user/comfyui.service`, change `%h/ComfyUI` to the
+folder ComfyUI is in and `%h/ai/outputs` to the folder `SWITCHGEN_OUTPUTS`
+names. Only after that, enable it. Enabled with paths that are wrong for this
+machine, the unit fails to start, and `Restart=always` tries again every five
+seconds for as long as it is enabled.
+
+```bash
 systemctl --user daemon-reload && systemctl --user enable --now comfyui
 ```
 
@@ -133,6 +142,25 @@ screen: it installs as an app, and the archive is the same on every device.
 | Reel | `#/reel` | A list of shots rendered in order, each opening on the last frame of the one before, joined by the server into one file. |
 | Archive | `#/archive` | Every picture and clip, searchable, with the settings that made it. One archive for every device. |
 
+The 14B text-to-video pair has been killed for memory when models from
+earlier runs were still loaded, so a clip on either 14B pair waits until
+ComfyUI has nothing queued or running, has ComfyUI release its cached models,
+and only then is sent.
+Until it is sent, nothing on the server knows about it. The clips waiting in
+that lane are kept in the tab's own session storage: a reload of the tab
+picks them up again in order, and closing the tab loses them, which the desk
+says while any are waiting. A copied tab, or a page that crashed, does not
+send what it finds on a guess; the desk lists those clips and asks whether to
+send them from here or forget them. Stop, on the desk or in the section bar,
+calls a waiting clip off before it is ever sent, and on the Pictures desk it
+stops the rest of the batch as well as the picture in hand.
+
+One tab renders a reel at a time. Another tab open on the same reel shows the
+shots as they land and which one is on the press, and sends nothing of its
+own until that tab is done, so no shot is rendered twice. A reload hands the
+shot on the press to the next page at once; a tab that closed or crashed is
+taken over once it has been quiet for a few minutes.
+
 ## Architecture
 
 ```
@@ -155,9 +183,21 @@ Six Vite middlewares in `server/` mount under `/api` in both `vite dev` and
 `vite preview`. Every mutating route runs the same-origin guard in
 `server/guard.mjs`: the browser's `Sec-Fetch-Site` verdict when present, else
 `Origin` must match `Host`, and the body must be the type the route reads. A
-request with neither header (curl, a script) is allowed. `GET /api/capabilities`
-probes the binaries below and reports what actually runs. A JSON answer of
-1 KB or more is gzipped when the browser accepts it.
+request with neither header (curl, a script) is allowed. Writes bound for
+ComfyUI through `/comfy` (queueing a prompt, freeing memory, stopping a job,
+uploading a picture) are held to the same origin rule before the proxy
+forwards them, because the proxy rewrites `Origin` to ComfyUI's own and
+ComfyUI's check can no longer see which page sent them. The WebSocket
+handshake on `/comfy-ws` is checked for host and origin the same way. CORS
+is off in both servers, so a page on another port of this machine cannot
+read what either answers. `GET /api/capabilities` probes the binaries below
+and reports what actually runs. A JSON answer of 1 KB or more is gzipped
+when the browser accepts it.
+
+ComfyUI sends the files behind `/view` with no `Cache-Control`, and it gives a
+deleted file's name to the next render, so the proxy marks those answers
+`no-cache`: the browser keeps its copy but asks before it plays or shows it
+again, and an unchanged file costs a 304.
 
 | Route | Server | Purpose |
 |---|---|---|
@@ -261,7 +301,11 @@ add-on chains for the two-model Wan pairs. All of it is validated by
 entry in it, matched by the files they load rather than by name. The
 catalogue panel behind More lists the ones not installed, what each is
 missing, how big that is, and the server's fit verdict, with one link to
-fetch. The nine with no catalogue entry (the SDXL, Anima and Krea finetunes,
+fetch. A file where the catalogue would put one, under its name but shorter
+than the catalogue lists, and not a fetch that stopped part way, is taken to
+be another build of it: it is kept and used as it is, never fetched over, and
+the verdict says the family's files are on disk rather than that it is ready
+to run. The nine with no catalogue entry (the SDXL, Anima and Krea finetunes,
 Z-Image, the Wan 2.2 families, VACE 1.3B and LTX 0.9.6) are named with the
 file to place by hand. The 98 catalogue families with no graph here are not
 offered.
@@ -285,9 +329,22 @@ Records live beside the files, in `<outputs>/.switchgen/archive.json`, served
 as a revision log. Every browser keeps localStorage as a cache: it pulls on
 start, pushes what the server has never seen (which is how an archive that
 predates the server migrates), and follows the server's event stream. A
-removal is a tombstone, so a device that was offline learns of it. Files no
-record describes are filed from the outputs folder, with settings read back
-out of ComfyUI's own history where the graph survives.
+removal is a tombstone, so a device that was offline learns of it. The log
+names itself and each start of the server, so when the archive is started
+again, or the server stopped before it saved changes it had already answered
+for, a browser notices and sends back what the new log lacks.
+
+Files no record describes are filed from the outputs folder, with settings
+read back out of ComfyUI's own history where the graph survives. One job is
+filed once: two tabs following the same shot, or the recovery pass finding a
+file its desk is about to file, make one record, and the desk's account
+replaces the bare one the recovery pass made. A removed record stays removed.
+Its file stays on disk and is remembered as dismissed; the recovery pass
+leaves it out and says so, and files it again only when the reader asks. The
+server holds that line itself: a record filed after the fact for a dismissed
+file is refused unless it says it was asked for, so an older copy of the app
+still cached in some browser cannot bring it back. A file written at that
+path after the removal is a new file, and is filed as usual.
 
 ## Reading a picture
 
@@ -305,7 +362,7 @@ page says so and offers to fetch it.
 | `npm run dev` / `build` / `preview` | Vite |
 | `npm start` | `bin/switchgen start` |
 | `npm run lint` | oxlint |
-| `npm test` | Vitest: the pure modules under `src/lib`, the reel engine with ComfyUI stood in, and the server middlewares against temporary folders. Needs no ComfyUI, no models and no running app |
+| `npm test` | Vitest: the pure modules under `src/lib`, the desks' job engines and the press ledger with ComfyUI stood in, a few components rendered to a string, the service worker, the Vite config, the launcher's install advice, and the server middlewares against temporary folders. Needs no ComfyUI, no models, no running app and no LoRA index of your own |
 | `npm run validate` | Every node class the graphs use, naming a missing node pack, then every base graph, image-to-image variant, quality derivation, continuation derivation and video add-on chain, checked node by node against ComfyUI's live `/object_info`. Exits 1 when anything fails and 2 when ComfyUI cannot be reached |
 | `npm run index-loras` | Reads every safetensors header in the LoRA folder and writes `src/lib/loraIndex.ts`: bases, triggers and training vocabulary, with no network calls |
 | `npx tsx scripts/chain-e2e.ts` | A live two-shot reel on the 5B family, end to end, against the GPU |
@@ -324,8 +381,10 @@ missing stands down with a sentence rather than failing later.
 Vite binds every interface and allows this machine's hostname and addresses
 and the tailnet, so the app is reachable from a phone. There is no login. The
 same-origin guard stops a page on another origin from driving the write
-routes from a browser, and every file path is confined to its root after
-`realpath`. That is the whole of it: keep the server on a private network.
+routes from a browser, its own and ComfyUI's through the proxy alike, CORS is
+off so such a page cannot read the answers either, and every file path is
+confined to its root after `realpath`. That is the whole of it: keep the
+server on a private network.
 
 ## License
 

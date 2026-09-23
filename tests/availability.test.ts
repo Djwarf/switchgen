@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { availabilityOf, inventoryFrom, missingFilesFor, passBlocks } from '../src/lib/availability'
+import { availabilityOf, inventoryFrom, missingFilesFor, missingWhy, passBlocks } from '../src/lib/availability'
 import { feasibility, modelGraph, type Hardware, type ModelFile } from '../src/lib/hardware'
 import { intentReport } from '../src/lib/intent'
 import { DETECTORS, UPSCALE_MODEL } from '../src/lib/refine'
@@ -112,6 +112,39 @@ describe('a family whose files only the GGUF node pack can list', () => {
       expect(a.why).toContain('ComfyUI-GGUF node pack')
       expect(a.why).not.toMatch(/[\w-]\.gguf/)
     }
+  })
+
+  const onDisk = (names: string[]) =>
+    new Map(names.map((name): [string, ModelFile] => [name, { name, rel: name, folder: 'x', size: 1, mtime: 0 }]))
+  const t2v = family('wan22-14b-t2v')
+  const ggufs = missingFilesFor(t2v, inventoryFrom({})).filter((f) => /\.gguf$/i.test(f))
+
+  it('names a .gguf file the disk listing does not have as well as the pack', () => {
+    // Told of the pack alone, a reader would install it and then find the
+    // encoder missing too.
+    const a = availabilityOf(t2v, withoutPack('wan22-14b-t2v'), null, onDisk(['wan_2.1_vae.safetensors']))
+    expect(a.ok).toBe(false)
+    if (a.ok) return
+    expect(a.why).toContain('ComfyUI-GGUF node pack')
+    expect(a.why).toContain('umt5-xxl-encoder-Q4_K_M.gguf')
+  })
+
+  it('names only the pack when every .gguf file is on disk', () => {
+    expect(ggufs.length).toBeGreaterThan(0)
+    const a = availabilityOf(t2v, withoutPack('wan22-14b-t2v'), null, onDisk(['wan_2.1_vae.safetensors', ...ggufs]))
+    expect(a.ok).toBe(false)
+    if (a.ok) return
+    expect(a.why).toContain('ComfyUI-GGUF node pack')
+    expect(a.why).not.toMatch(/[\w-]\.gguf/)
+  })
+})
+
+describe('the sentence for missing files', () => {
+  it('lists them plainly, with no "and" between every one', () => {
+    const inv = inventoryFrom({ KSampler: { input: { required: {} } } })
+    expect(missingWhy(['a.safetensors', 'b.safetensors', 'c.safetensors'], inv, new Map())).toBe(
+      'needs a.safetensors, b.safetensors, c.safetensors',
+    )
   })
 })
 

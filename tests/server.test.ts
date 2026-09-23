@@ -172,6 +172,69 @@ describe('a removed record\'s file', () => {
     utimesSync(path.join(outputs, 'dismiss-b.png'), later, later)
     expect((await listed('dismiss-b.png'))?.dismissed).toBeUndefined()
   })
+
+  // The mark is enforced here too, not only by a client that reads it: an
+  // older bundle still in a browser's cache files every unnamed file it finds.
+  const recovered = (id: string, filename: string, extra: Record<string, unknown> = {}) => ({ ...recordFor(id, filename), recovered: true, ...extra })
+  const removedOnce = async (id: string, filename: string) => {
+    aged(filename, 60)
+    await post('/api/archive/upsert', { records: [recordFor(id, filename)] })
+    await post('/api/archive/remove', { ids: [id] })
+  }
+  const ids = (a: { id: string }[]) => a.map((x) => x.id)
+
+  it('refuses a record filed after the fact for it, and the removal stands', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    await removedOnce('RF1', 'refile-1.png')
+    const r = (await post('/api/archive/upsert', { records: [recovered('OLD1', 'refile-1.png')] })).json()
+    expect(r.refused).toEqual(['OLD1'])
+    expect(r.assigned).toEqual([])
+    expect((await listed('refile-1.png'))?.dismissed).toBe(true)
+  })
+
+  it('takes one the reader asked for, marked as refiled', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    await removedOnce('RF2', 'refile-2.png')
+    const r = (await post('/api/archive/upsert', { records: [recovered('NEW2', 'refile-2.png', { refiled: true })] })).json()
+    expect(ids(r.assigned)).toEqual(['NEW2'])
+    expect(r.refused).toEqual([])
+    expect((await listed('refile-2.png'))?.filed).toBe(true)
+  })
+
+  it('takes one sent through the restore route, which is always asked for', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    await removedOnce('RF3', 'refile-3.png')
+    const r = (await post('/api/archive/restore', { records: [recovered('NEW3', 'refile-3.png')] })).json()
+    expect(ids(r.assigned)).toEqual(['NEW3'])
+  })
+
+  it('takes back a recovered record removed here, sent back by an undo', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    aged('refile-4.png', 60)
+    await post('/api/archive/upsert', { records: [recovered('R4', 'refile-4.png')] })
+    await post('/api/archive/remove', { ids: ['R4'] })
+    // Its tombstone is still here, so this is the removed record coming back.
+    const r = (await post('/api/archive/upsert', { records: [recovered('R4', 'refile-4.png')] })).json()
+    expect(ids(r.assigned)).toEqual(['R4'])
+  })
+
+  it('takes one for a file written at that path since the removal', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    await removedOnce('RF5', 'refile-5.png')
+    const later = Date.now() / 1000 + 2
+    writeFileSync(path.join(outputs, 'refile-5.png'), 'y')
+    utimesSync(path.join(outputs, 'refile-5.png'), later, later)
+    const r = (await post('/api/archive/upsert', { records: [recovered('NEW5', 'refile-5.png')] })).json()
+    expect(ids(r.assigned)).toEqual(['NEW5'])
+  })
+
+  it('refuses one for a file that has gone from disk since, so the removal stands', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    await removedOnce('RF6', 'refile-6.png')
+    rmSync(path.join(outputs, 'refile-6.png'))
+    const r = (await post('/api/archive/upsert', { records: [recovered('NEW6', 'refile-6.png')] })).json()
+    expect(r.refused).toEqual(['NEW6'])
+  })
 })
 
 describe('where the archive\'s log stands', () => {
@@ -248,5 +311,117 @@ setTimeout(() => process.exit(9), 3000)
     const r = endWith('SIGINT')
     expect(r.status).toBe(130)
     expect(Object.keys(r.saved?.records ?? {})).toEqual(['kept'])
+  })
+})
+
+describe('the archive loaded again in one process', () => {
+  // Vite loads server/archive.mjs afresh each time its config reloads, in the
+  // same process. Each load keeps its own copy of the archive, and only the
+  // newest may write it at exit: an older load holds the archive as it stood
+  // before, and every load kept on the list was one more copy in memory.
+  const ARCHIVE_MJS = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server', 'archive.mjs')).href
+  const CHILD = `
+import { EventEmitter } from 'node:events'
+import { chmodSync, mkdirSync } from 'node:fs'
+import { Readable } from 'node:stream'
+const [how, dir] = process.argv.slice(2)
+process.env.SWITCHGEN_OUTPUTS = dir
+process.env.SWITCHGEN_ARCHIVE = dir + '/.switchgen/archive.json'
+const KEY = Symbol.for('switchgen.archive.flush')
+const report = (o) => console.log('REPORT ' + JSON.stringify(o))
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const loadNo = async (n) => {
+  const { switchgenArchive } = await import(${JSON.stringify(ARCHIVE_MJS)} + '?load=' + n)
+  let handler
+  switchgenArchive().configurePreviewServer({ middlewares: { use: (fn) => { handler = fn } } })
+  return (id) => {
+    const body = JSON.stringify({ records: [{ id, at: 1, file: { filename: id + '.png', subfolder: '', type: 'output' } }] })
+    const req = Object.assign(Readable.from([Buffer.from(body)]), { method: 'POST', url: '/api/archive/upsert', headers: { 'content-type': 'application/json' } })
+    return new Promise((resolve) => {
+      const res = Object.assign(new EventEmitter(), { req, statusCode: 200, headersSent: false, setHeader() {}, writeHead() {}, write() {}, end: resolve })
+      handler(req, res, resolve)
+    })
+  }
+}
+
+if (how === 'twice') {
+  await loadNo(1)
+  await loadNo(2)
+  const list = globalThis[KEY]
+  report({ map: list instanceof Map, size: list?.size })
+  process.exit(0)
+}
+
+if (how === 'handover') {
+  // What a build before this one left behind: a Set of flushes, and exit
+  // hooks that call everything in it.
+  const old = new Set([() => console.log('OLD FLUSH CALLED')])
+  globalThis[KEY] = old
+  process.once('exit', () => { for (const fn of old) fn() })
+  await loadNo(1)
+  report({ oldSize: old.size, map: globalThis[KEY] instanceof Map })
+  process.exit(0)
+}
+
+// 'exit' or 'SIGINT': an older load whose last write failed, then a newer one.
+const one = await loadNo(1)
+await one('x')
+await wait(500)
+const folder = dir + '/.switchgen'
+chmodSync(folder, 0o500)
+await one('stale')
+await wait(500)
+chmodSync(folder, 0o700)
+const two = await loadNo(2)
+await two('fresh')
+await wait(500)
+if (how === 'exit') process.exit(0)
+if (how === 'SIGINT') process.kill(process.pid, 'SIGINT')
+setTimeout(() => process.exit(9), 3000)
+`
+  let dir = ''
+  let script = ''
+  beforeAll(() => {
+    dir = path.join(root, 'reload')
+    mkdirSync(dir, { recursive: true })
+    script = path.join(dir, 'child.mjs')
+    writeFileSync(script, CHILD)
+  })
+  const runChild = (how: string) => {
+    const out = path.join(dir, how)
+    mkdirSync(out, { recursive: true })
+    const r = spawnSync(process.execPath, [script, how, out], { timeout: 15_000, encoding: 'utf8' })
+    const line = /^REPORT (.*)$/m.exec(r.stdout ?? '')?.[1]
+    const file = path.join(out, '.switchgen', 'archive.json')
+    return {
+      status: r.status,
+      stdout: r.stdout ?? '',
+      report: line ? JSON.parse(line) : null,
+      saved: existsSync(file) ? Object.keys(JSON.parse(readFileSync(file, 'utf8')).records ?? {}).sort() : null,
+    }
+  }
+
+  it('keeps one flush per archive file, however many times it is loaded', () => {
+    const r = runChild('twice')
+    expect(r.status).toBe(0)
+    expect(r.report).toEqual({ map: true, size: 1 })
+  })
+
+  // A folder made read-only does not stop root, so the failed write this
+  // needs cannot be staged when the suite runs as root.
+  const asRoot = process.getuid?.() === 0
+  it.skipIf(asRoot)('lets only the newest load write at exit, not an older one whose last write failed', () => {
+    for (const how of ['exit', 'SIGINT']) {
+      const r = runChild(how)
+      expect(r.status, how).toBe(how === 'exit' ? 0 : 130)
+      expect(r.saved, how).toEqual(['fresh', 'x'])
+    }
+  })
+
+  it('takes over from the list an older build left, which then calls nothing', () => {
+    const r = runChild('handover')
+    expect(r.status).toBe(0)
+    expect(r.report).toEqual({ oldSize: 0, map: true })
+    expect(r.stdout).not.toContain('OLD FLUSH CALLED')
   })
 })

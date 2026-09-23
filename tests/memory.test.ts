@@ -83,6 +83,23 @@ describe('clipMemory: the image-to-video pair against its own record', () => {
   it('refuses the size that came through once when add-ons are chained on top', () => {
     expect(clipMemory(pair, at(49), MEASURED_MACHINE, 1).level).toBe('refuse')
   })
+
+  it('claims no count of runs the record does not give, and names the size as the pair\'s default', () => {
+    // The registry lists one result per setting, by length and add-on count,
+    // and gives no size for them.
+    for (const frames of [81, 49]) {
+      for (const addOns of [0, 1]) {
+        for (const ram of [31, 64]) {
+          const reason = clipMemory(pair, at(frames), machine(ram), addOns).reason ?? ''
+          expect(reason, `${frames} frames, ${addOns} add-ons, ${ram} GB`).not.toMatch(/three times|out of three/)
+        }
+      }
+    }
+    const refused = clipMemory(pair, at(81), MEASURED_MACHINE).reason!
+    expect(refused).toContain('killed at 81 frames')
+    expect(refused).toContain("the pair's default size")
+    expect(refused).not.toContain('81 frames at 832 × 480 was killed')
+  })
 })
 
 describe('clipMemory: add-ons on the text-to-video pair', () => {

@@ -298,3 +298,68 @@ describe('a server that lost part of its log', () => {
     expect(stored()?.sync?.epoch).toBe('E1')
   })
 })
+
+describe('one job filed by two writers', () => {
+  // Two tabs following one shot, a page taking up a job the page before it
+  // left, or the recovery pass finding a file its desk is about to file.
+  it('files it once: the second call gets the first record back', () => {
+    const a = h.add(record(1))
+    const b = h.add(record(1))
+    expect(b.id).toBe(a.id)
+    expect(h.all()).toHaveLength(1)
+  })
+
+  it('files a new job under a reused name as a record of its own', () => {
+    // ComfyUI hands a deleted file's name to the next render.
+    h.add(record(1))
+    h.add({ ...record(1), promptId: 'another-job' })
+    expect(h.all()).toHaveLength(2)
+  })
+
+  it('gives the desk\'s account to a record the recovery pass filed first, keeping its identity and the reader\'s star', () => {
+    const [first] = h.addMany([{ ...record(2), recovered: true, promptId: '' }])
+    h.star(first!.id)
+    h.applyServerMeta([{ id: first!.id, no: first!.no, rev: 9 }])
+    const desk = h.add(record(2))
+    expect(desk.id).toBe(first!.id)
+    expect(desk.no).toBe(first!.no)
+    const now = h.get(first!.id)!
+    expect(now.recovered).toBeUndefined()
+    expect(now.starred).toBe(true)
+    expect(now.rev).toBe(9)
+    // The server has the minimal copy, so the desk's has to be sent.
+    expect(now.pending).toBe(true)
+    expect(now.prompt).toBe('p2')
+    expect(now.promptId).toBe('pid2')
+    expect(h.all()).toHaveLength(1)
+  })
+
+  it('files nothing twice from one recovery batch, and returns only what it made', () => {
+    h.add(record(3))
+    const made = h.addMany([
+      { ...record(3), recovered: true },
+      { ...record(4), recovered: true },
+      { ...record(4), recovered: true },
+    ])
+    expect(made.map((e) => e.file.filename)).toEqual(['f4.png'])
+    expect(h.all()).toHaveLength(2)
+  })
+})
+
+describe('a record filed again on request', () => {
+  it('keeps its refiled mark through a save and a fresh load, and nothing that is not a plain true', async () => {
+    const a = h.add({ ...record(5), recovered: true, refiled: true })
+    const b = h.add({ ...record(6), recovered: true })
+    h.flush()
+    const env = stored()
+    expect(env.entries.find((e: { id: string }) => e.id === a.id)?.refiled).toBe(true)
+    // The server takes a removed file back on this mark alone, so only a
+    // true sent on purpose may carry it.
+    env.entries.find((e: { id: string }) => e.id === b.id).refiled = 'yes'
+    disk.set(KEY, JSON.stringify(env))
+    vi.resetModules()
+    h = await import('../src/lib/history')
+    expect(h.get(a.id)?.refiled).toBe(true)
+    expect(h.get(b.id)?.refiled).toBeUndefined()
+  })
+})

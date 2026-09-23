@@ -1,12 +1,14 @@
+import { EventEmitter } from 'node:events'
 import { rmSync } from 'node:fs'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { tempRoots } from './http'
 
 type Plugin = { name?: string; configureServer?: unknown; configurePreviewServer?: unknown }
+type Proxy = Record<string, { configure?: (proxy: EventEmitter, options: unknown) => void }>
 type Config = {
   plugins: unknown[]
-  server: { cors?: unknown }
-  preview: { cors?: unknown }
+  server: { cors?: unknown; proxy: Proxy }
+  preview: { cors?: unknown; proxy: Proxy }
 }
 
 let config: Config
@@ -37,5 +39,19 @@ describe('the Vite config', () => {
     // A plugin's middleware runs in the order the plugins are listed, and the
     // proxy runs after all of them.
     expect(plugins[0]).toBe(guard)
+  })
+
+  it('has the ComfyUI proxy mark generated files to be checked before reuse, in both servers', () => {
+    // ComfyUI sends /view with no Cache-Control; see revalidateFiles in
+    // server/guard.mjs. What matters here is that the proxy calls it.
+    for (const proxy of [config.server.proxy, config.preview.proxy]) {
+      const configure = proxy['/comfy']?.configure
+      expect(typeof configure).toBe('function')
+      const emitter = new EventEmitter()
+      configure!(emitter, {})
+      const answer = { headers: {} as Record<string, string> }
+      emitter.emit('proxyRes', answer, { url: '/view?filename=c.webm' })
+      expect(answer.headers['cache-control']).toBe('no-cache')
+    }
   })
 })

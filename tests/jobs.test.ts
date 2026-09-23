@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as Comfy from '../src/lib/comfy'
 import type * as Faults from '../src/lib/faults'
 import type * as Jobs from '../src/components/shell/jobs'
+import type * as Mirror from '../src/components/shell/mirror'
 import type * as Notice from '../src/components/shell/Notice'
 
 /**
@@ -51,6 +52,7 @@ let comfy: typeof Comfy
 let faults: typeof Faults
 let jobs: typeof Jobs.jobs
 let notice: typeof Notice
+let mirror: typeof Mirror.mirror
 let prompts = 0
 
 const graph = { '8': { class_type: 'VAEDecode', inputs: {} } } as unknown as Comfy.ApiWorkflow
@@ -86,6 +88,7 @@ beforeEach(async () => {
   faults = await import('../src/lib/faults')
   jobs = (await import('../src/components/shell/jobs')).jobs
   notice = await import('../src/components/shell/Notice')
+  mirror = (await import('../src/components/shell/mirror')).mirror
 })
 
 afterEach(() => {
@@ -272,6 +275,171 @@ describe('stopping a job', () => {
     expect(j.status).toBe('done')
     expect(j.error).toBeNull()
     expect(j.finishedAt).toBeGreaterThanOrEqual(at)
+  })
+
+  const rail = () => renderToString(createElement(notice.NoticeRail))
+
+  it('gives Stop back and says so when steps keep coming well after an accepted stop', async () => {
+    vi.useFakeTimers()
+    const id = jobs.start({ desk: 'images', kind: 'image', label: 'Krea', prompt: '', promptId: 'r1' })
+    jobs.apply(id, { phase: 'running', node: null, value: 3, max: 20 })
+    await jobs.cancel(id)
+    await vi.advanceTimersByTimeAsync(5000)
+    // Early steps are the stop still on its way.
+    jobs.apply(id, { phase: 'running', node: null, value: 4, max: 20 })
+    expect(jobs.get(id)?.cancelling).toBe(true)
+    await vi.advanceTimersByTimeAsync(11_000)
+    // A node starting proves nothing: ComfyUI announces it before it notices the stop.
+    jobs.apply(id, { phase: 'running', node: '9', value: 0, max: 1 })
+    expect(jobs.get(id)?.cancelling).toBe(true)
+    jobs.apply(id, { phase: 'running', node: null, value: 5, max: 20 })
+    expect(jobs.get(id)?.cancelling).toBe(false)
+    expect(rail()).toContain('That job has not stopped yet')
+    expect(rail()).toContain('ComfyUI is still working on it')
+
+    // Stop can be held again, and asking again takes the notice away.
+    const before = calls.filter((c) => c === 'POST /comfy/api/jobs/r1/cancel').length
+    await jobs.cancel(id)
+    expect(calls.filter((c) => c === 'POST /comfy/api/jobs/r1/cancel').length).toBe(before + 1)
+    expect(rail()).not.toContain('That job has not stopped yet')
+  })
+
+  it('keeps a running job that shows nothing either way as stopping', async () => {
+    vi.useFakeTimers()
+    const id = jobs.start({ desk: 'images', kind: 'image', label: 'Krea', prompt: '', promptId: 'r6' })
+    jobs.apply(id, { phase: 'running', node: null, value: 3, max: 20 })
+    await jobs.cancel(id)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(jobs.get(id)?.cancelling).toBe(true)
+  })
+
+  it('gives Stop back when a stop did not take a job ComfyUI still has waiting', async () => {
+    vi.useFakeTimers()
+    routes.unshift((url) => (url === '/comfy/api/jobs/q1' ? json({ id: 'q1', status: 'pending' }) : undefined))
+    // A desk whose own stop went nowhere.
+    const id = jobs.start({ desk: 'video', kind: 'video', label: 'Wan', prompt: '', promptId: 'q1', stop: () => {} })
+    await jobs.cancel(id)
+    await vi.advanceTimersByTimeAsync(14_000)
+    expect(jobs.get(id)?.cancelling).toBe(true)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(jobs.get(id)?.cancelling).toBe(false)
+    expect(rail()).toContain('ComfyUI still has it waiting in its queue')
+  })
+
+  it('keeps it stopping when ComfyUI no longer lists it: the stop took', async () => {
+    vi.useFakeTimers()
+    routes.unshift((url) => (url === '/comfy/api/jobs/q2' ? json({ error: 'no such job' }, 404) : undefined))
+    const id = jobs.start({ desk: 'video', kind: 'video', label: 'Wan', prompt: '', promptId: 'q2', stop: () => {} })
+    await jobs.cancel(id)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(jobs.get(id)?.cancelling).toBe(true)
+    expect(rail()).not.toContain('That job has not stopped yet')
+  })
+
+  it('takes a failed stop\'s notice away once the job ends, however it ends', async () => {
+    reply = () => json({ error: 'boom' }, 500)
+    const endings: [string, (id: string) => void][] = [
+      ['succeeded', (id) => jobs.succeed(id)],
+      ['failed', (id) => jobs.fail(id, 'broke')],
+      ['stopped', (id) => jobs.fail(id, 'Stopped.', { cancelled: true })],
+      ['finished on the socket', (id) => jobs.apply(id, { phase: 'done', files: [] })],
+      ['dismissed', (id) => jobs.dismiss(id)],
+    ]
+    for (const [how, end] of endings) {
+      const id = jobs.start({ desk: 'images', kind: 'image', label: 'Krea', prompt: '', promptId: `e-${how}` })
+      await jobs.cancel(id)
+      expect(rail(), how).toContain('Could not stop that job')
+      end(id)
+      expect(rail(), how).not.toContain('Could not stop that job')
+    }
+  })
+})
+
+describe('the mirror between a desk and the ledger', () => {
+  type Row = Mirror.Reported
+  const row = (over: Partial<Row> & { key: string }): Row => ({
+    status: 'running',
+    promptId: null,
+    label: 'Wan',
+    prompt: 'a shot',
+    value: 0,
+    max: 0,
+    entryId: null,
+    error: null,
+    ...over,
+  })
+  /** A desk whose rows a test sets, and whose own stop records what it was asked. */
+  const desk = () => {
+    let rows: Row[] = []
+    const heard = new Set<() => void>()
+    const stopped: string[] = []
+    const bridge: Mirror.Bridge = {
+      desk: 'reel',
+      kind: 'video',
+      subscribe: (fn) => {
+        heard.add(fn)
+        return () => void heard.delete(fn)
+      },
+      read: () => rows,
+      stop: (key) => void stopped.push(key),
+      seen: new Map(),
+    }
+    const report = (...next: Row[]) => {
+      rows = next
+      for (const fn of heard) fn()
+    }
+    return { bridge, report, stopped }
+  }
+
+  it('keeps a stopped shot stopped when the reel puts its earlier clip back as done', () => {
+    const d = desk()
+    const stop = mirror(d.bridge)
+    d.report(row({ key: 'k1', status: 'running', promptId: 'p-k1', value: 2, max: 8 }))
+    const id = d.bridge.seen.get('k1')!
+    expect(jobs.get(id)?.status).toBe('running')
+    d.report(row({ key: 'k1', status: 'cancelled', promptId: 'p-k1' }))
+    expect(jobs.get(id)?.status).toBe('cancelled')
+    // The pass ends and the shot shows the clip it had before.
+    d.report(row({ key: 'k1', status: 'done', promptId: 'p-k1', entryId: 'old-clip' }))
+    expect(jobs.get(id)).toMatchObject({ status: 'cancelled', entryId: null })
+    stop()
+  })
+
+  it('still takes a later verdict over a failure, and a record named after the ending', () => {
+    const d = desk()
+    const stop = mirror(d.bridge)
+    d.report(row({ key: 'k2', status: 'running', promptId: 'p-k2' }))
+    const id = d.bridge.seen.get('k2')!
+    d.report(row({ key: 'k2', status: 'error', promptId: 'p-k2', error: 'lost' }))
+    expect(jobs.get(id)?.status).toBe('error')
+    d.report(row({ key: 'k2', status: 'done', promptId: 'p-k2' }))
+    expect(jobs.get(id)?.status).toBe('done')
+    d.report(row({ key: 'k2', status: 'done', promptId: 'p-k2', entryId: 'e2' }))
+    expect(jobs.get(id)).toMatchObject({ status: 'done', entryId: 'e2' })
+    stop()
+  })
+
+  it('sends Stop to the desk\'s own stop, even before the job has a prompt', async () => {
+    const d = desk()
+    const stop = mirror(d.bridge)
+    d.report(row({ key: 'clip-7', status: 'submitting' }))
+    const id = d.bridge.seen.get('clip-7')!
+    await jobs.cancel(id)
+    expect(d.stopped).toEqual(['clip-7'])
+    expect(calls.some((c) => c.endsWith('/cancel'))).toBe(false)
+    expect(jobs.get(id)?.cancelling).toBe(true)
+    stop()
+  })
+})
+
+describe('the options a node offers', () => {
+  it('reads both shapes ComfyUI sends a list in, and nothing else', () => {
+    expect(comfy.optionsFor({ A: { input: { required: { f: [['a', 'b'], {}] } } } }, 'A', 'f')).toEqual(['a', 'b'])
+    // UpscaleModelLoader already sends the newer shape.
+    expect(comfy.optionsFor({ B: { input: { required: { model_name: ['COMBO', { options: ['4x.pth'] }] } } } }, 'B', 'model_name')).toEqual(['4x.pth'])
+    expect(comfy.optionsFor({ C: { input: { optional: { o: ['COMBO', { options: ['x', 3, 'y'] }] } } } }, 'C', 'o')).toEqual(['x', 'y'])
+    expect(comfy.optionsFor({ D: { input: { required: { n: ['INT', { default: 1 }] } } } }, 'D', 'n')).toEqual([])
+    expect(comfy.optionsFor({}, 'Nothing', 'f')).toEqual([])
   })
 })
 

@@ -101,6 +101,8 @@ beforeAll(async () => {
       dep('s2.bin', 3000, 2500),
       dep('a3.bin', 400, 600),
       dep('s3.bin', 3000, 3000),
+      dep('e.bin', 10),
+      { ...dep('n.bin', 0), sizeBytes: null },
     ],
     families: [
       family('C', ['c.bin', 'd.bin']),
@@ -110,6 +112,8 @@ beforeAll(async () => {
       family('B2', ['s2.bin']),
       family('A3', ['a3.bin', 's3.bin']),
       family('B3', ['s3.bin']),
+      family('E', ['e.bin']),
+      family('N', ['n.bin']),
     ],
   }
   process.env.SWITCHGEN_CATALOG = path.join(root, 'catalog.json')
@@ -124,6 +128,8 @@ beforeAll(async () => {
   mkdirSync(path.join(models, 'test'), { recursive: true })
   // Another file under c.bin's name, at its destination, with no control file.
   writeFileSync(path.join(models, 'test', 'c.bin'), Buffer.alloc(500, 99))
+  // The catalogue's own file, at the size it lists.
+  writeFileSync(path.join(models, 'test', 'e.bin'), Buffer.alloc(10, 101))
 
   h = mounted((await import('../server/downloads.mjs')).switchgenDownloads())
 })
@@ -152,6 +158,18 @@ describe('a file under the catalogue\'s name that is not the catalogue\'s', () =
     expect(cat.families.find((f: { id: string }) => f.id === 'C').installed.missing).toEqual(['d.bin'])
   })
 
+  it('is marked as a conflict in the slim catalogue the panel reads, and counted as installed', async () => {
+    // CatalogFile.conflict in src/lib/catalog.ts: the panel tells such a file
+    // apart from the catalogue's own by this flag.
+    const cat = (await call(h, { url: '/api/catalog?slim=1' })).json()
+    const installed = cat.families.find((f: { id: string }) => f.id === 'C').installed
+    const c = installed.files.find((f: { filename: string }) => f.filename === 'c.bin')
+    expect(c).toMatchObject({ conflict: true, installed: true, partial: false })
+    expect(installed.missing).not.toContain('c.bin')
+    const d = installed.files.find((f: { filename: string }) => f.filename === 'd.bin')
+    expect(d).toMatchObject({ conflict: false, installed: false })
+  })
+
   it('is left alone by a fetch, which fetches the rest', async () => {
     const r = await call(h, { method: 'POST', url: '/api/download', body: { family: 'C', force: true } })
     const sse = events(r)
@@ -159,6 +177,39 @@ describe('a file under the catalogue\'s name that is not the catalogue\'s', () =
     expect(sse.at(-1)?.event).toBe('done')
     expect(readFileSync(file('c.bin'))).toEqual(Buffer.alloc(500, 99))
     expect(statSync(file('d.bin')).size).toBe(300)
+  })
+
+  it('leaves nothing to fetch, but is not called ready to run', async () => {
+    // d.bin has landed, so c.bin is all that stands between the family and
+    // complete, and it is not the catalogue's file. Nothing has loaded it.
+    const plan = (await call(h, { url: '/api/catalog/plan?family=C' })).json()
+    expect(plan.download).toEqual([])
+    expect(plan.asIs).toEqual(['c.bin'])
+    expect(plan.verdict.startsWith('Every file is on disk, but 1 of them is not the size the catalogue lists.')).toBe(true)
+    expect(plan.verdict).not.toContain('Ready to run')
+    expect(plan.reasons).not.toContain('Every file this family needs is already on disk.')
+
+    const cat = (await call(h, { url: '/api/catalog' })).json()
+    const installed = cat.families.find((f: { id: string }) => f.id === 'C').installed
+    expect(installed.asIs).toEqual(['c.bin'])
+    expect(installed.ready).toBe(true)
+  })
+})
+
+describe('the verdict on a family with nothing to fetch', () => {
+  it('says ready to run when every file is the catalogue\'s own', async () => {
+    const plan = (await call(h, { url: '/api/catalog/plan?family=E' })).json()
+    expect(plan.asIs).toEqual([])
+    expect(plan.verdict.startsWith('Ready to run: every file is already installed.')).toBe(true)
+    expect(plan.reasons).toContain('Every file this family needs is already on disk.')
+  })
+
+  it('does not count a missing file the catalogue has no size for as on disk, or as 0 B', async () => {
+    const plan = (await call(h, { url: '/api/catalog/plan?family=N' })).json()
+    expect(plan.download.map((f: { filename: string }) => f.filename)).toEqual(['n.bin'])
+    expect(plan.reasons).not.toContain('Every file this family needs is already on disk.')
+    expect(plan.verdict.startsWith('Fits this machine. 1 file to fetch, size not listed.')).toBe(true)
+    expect(plan.verdict).not.toContain('0 B')
   })
 })
 

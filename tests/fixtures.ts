@@ -96,6 +96,14 @@ export const FIXTURE_INDEX: LoraIndexEntry[] = [
   }),
 ]
 
+/** One caption index row for `file`, with everything a test does not care about filled in. */
+export function indexRow(
+  file: string,
+  e: Pick<LoraIndexEntry, 'base' | 'imageCount' | 'confidence' | 'promptTags' | 'triggers' | 'concepts'>,
+): LoraIndexEntry {
+  return entry(file, e)
+}
+
 function entry(
   file: string,
   e: Pick<LoraIndexEntry, 'base' | 'imageCount' | 'confidence' | 'promptTags' | 'triggers' | 'concepts'>,

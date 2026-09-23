@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
-import { confineReal, guardMutation, guardOrigin, hostAllowed, proxyWriteGuard, safely, sameOrigin, upgradeAllowed } from '../server/guard.mjs'
+import { confineReal, guardMutation, guardOrigin, hostAllowed, proxyWriteGuard, revalidateFiles, safely, sameOrigin, upgradeAllowed } from '../server/guard.mjs'
 import { call } from './http'
 
 const req = (headers: Record<string, string>, method = 'POST') => ({ headers, method })
@@ -181,5 +181,33 @@ describe('writes bound for ComfyUI through the proxy', () => {
     expect(guardMutation(req({ 'sec-fetch-site': 'same-site', 'content-type': 'application/json' }), m)).toBe(false)
     expect(m.statusCode).toBe(403)
     expect(JSON.parse(m.body).error).toMatch(/cross-site request refused/)
+  })
+})
+
+describe('generated files coming back through the proxy', () => {
+  // ComfyUI sends /view with an ETag and a date but no Cache-Control, which
+  // lets a browser reuse its copy without asking. A deleted clip's name is
+  // handed to the next render, so that copy could be the wrong clip; the
+  // service worker leaves a clip's ranged requests alone, so the answer
+  // itself has to say "ask first".
+  const answer = (url: string, headers: Record<string, string> = {}) => {
+    const proxyRes = { headers: { ...headers } }
+    revalidateFiles(proxyRes, { url })
+    return proxyRes.headers as Record<string, string>
+  }
+
+  it('marks a file ComfyUI serves to be checked before it is reused', () => {
+    expect(answer('/view?filename=c.webm&type=output')['cache-control']).toBe('no-cache')
+    expect(answer('/api/view?filename=a.png')['cache-control']).toBe('no-cache')
+  })
+
+  it('keeps what ComfyUI already said about a file', () => {
+    expect(answer('/view?filename=a.svg', { 'cache-control': 'no-store' })['cache-control']).toBe('no-store')
+  })
+
+  it('leaves every other answer alone', () => {
+    expect(answer('/history')).toEqual({})
+    expect(answer('/viewer')).toEqual({})
+    expect(answer('/view_metadata/x')).toEqual({})
   })
 })
