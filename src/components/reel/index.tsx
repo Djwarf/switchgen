@@ -26,6 +26,7 @@ export {
 } from './bits'
 
 export { Bench, type BenchProps, type NumSpec, type ReelFamily, type Shape } from './Bench'
+export { lengthsFor, type LengthChoice } from './lengths'
 export { Strip, type StripProps } from './Strip'
 export { EmptyStrip } from './EmptyStrip'
 export { ReelProgress, measuredFor, type Measured, type ReelProgressProps } from './Progress'
@@ -54,6 +55,7 @@ export {
   shotsToRender,
   useReelRun,
   type Currency,
+  type Elsewhere,
   type Made,
   type RunContext,
   type RunState,

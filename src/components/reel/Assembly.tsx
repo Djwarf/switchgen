@@ -65,7 +65,10 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   // be remounted for it) lost the finished reel's link and summary and let
   // the button send a second cut the server was still busy with.
   const [made, setMade] = useState<{ cut: Cut; strip: string } | null>(null)
-  const [failed, setFailed] = useState<string | null>(null)
+  // A failure is kept with its strip for the same reason, and so that once
+  // the strip has moved on it is not read as the verdict on the strip as it
+  // stands, which nobody has tried to cut.
+  const [failed, setFailed] = useState<{ message: string; strip: string } | null>(null)
   const caps = useServerCapabilities()
   /** Null until the server answers; false when ffmpeg is not there to run. */
   const canCut = caps === null ? null : caps.stitch
@@ -89,6 +92,8 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   const cut = made?.cut ?? null
   /** True when the strip has changed since the reel on show was cut. */
   const earlier = made !== null && made.strip !== strip
+  /** True when the strip has changed since the cut on show failed. */
+  const failedEarlier = failed !== null && failed.strip !== strip
 
   const copy = () => {
     void navigator.clipboard
@@ -120,7 +125,7 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
         if (!r.ok) throw new Error(String(body.error ?? `HTTP ${r.status}`))
         setMade({ cut: body as unknown as Cut, strip: from })
       })
-      .catch((e: unknown) => setFailed(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setFailed({ message: e instanceof Error ? e.message : String(e), strip: from }))
       .finally(() => setCutting(false))
   }
 
@@ -171,7 +176,14 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
             </span>
           </p>
         ) : failed ? (
-          <p className="text-caption text-ink-warning">{failed}</p>
+          <p className="text-caption text-ink-warning">
+            {failedEarlier ? (
+              <span className="mr-1 italic">
+                This cut failed before the strip last changed. The strip as it stands has not been cut.
+              </span>
+            ) : null}
+            {failed.message}
+          </p>
         ) : (
           <p className="text-caption italic text-grey-500">
             The server does the joining. Nothing touches the card.

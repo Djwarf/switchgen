@@ -20,6 +20,7 @@ import { fileUrl } from '../../lib/comfy'
 import { clipFrames, type ShotJob } from '../../lib/continuation'
 import { Chips, Mark, Quiet, RING, duration, seconds } from './bits'
 import type { Currency, RunState, ShotState } from './engine'
+import { lengthChips, type LengthChoice } from './lengths'
 import type { ReelShot } from './store'
 
 export type StripProps = {
@@ -29,8 +30,8 @@ export type StripProps = {
   fps: number
   /** The reel's own frame count, which a shot follows unless it overrides it. */
   reelLength: number
-  /** Frame lengths offered as chips, already snapped to what the node accepts. */
-  lengthOptions: readonly number[]
+  /** Frame lengths offered as chips, already snapped to what the node accepts, with any the desk would refuse. */
+  lengthOptions: readonly LengthChoice[]
   expert: boolean
   busy: boolean
   /** Per shot, in strip order: whether its clip still matches its line (engine currencyOf). */
@@ -39,6 +40,8 @@ export type StripProps = {
   refused: readonly boolean[]
   /** Null when this family can pin a closing frame, otherwise the reason it cannot. */
   bookendBlocked: string | null
+  /** The shot another tab has on the press, if any (RunState.elsewhere). */
+  elsewhere: string | null
   onEdit: (id: string, patch: Partial<ReelShot>) => void
   onMove: (id: string, delta: number) => void
   onRemove: (id: string) => void
@@ -81,6 +84,7 @@ export function Strip(props: StripProps) {
               !['done', 'error', 'stopped'].includes(run.states[shot.id]?.status ?? '')
             }
             live={run.currentShotId === shot.id}
+            away={props.elsewhere === shot.id}
             registerField={(el) => {
               if (el) fields.current.set(shot.id, el)
               else fields.current.delete(shot.id)
@@ -121,6 +125,8 @@ type RowProps = StripProps & {
    */
   locked: boolean
   live: boolean
+  /** True when another tab has this shot on the press. */
+  away: boolean
   first: boolean
   last: boolean
   registerField: (el: HTMLTextAreaElement | null) => void
@@ -142,9 +148,9 @@ function ShotRow(p: RowProps) {
           {String(index + 1).padStart(2, '0')}
         </span>
         <span className="mt-2 flex items-center gap-1.5 lg:mt-3">
-          <Mark state={markFor(status, p.live)} />
+          <Mark state={p.away ? 'live' : markFor(status, p.live)} />
           <span className="text-[0.625rem] uppercase tracking-[0.14em] text-grey-500">
-            {stateWord(state, p.live, currencyNow)}
+            {p.away ? 'in another tab' : stateWord(state, p.live, currencyNow)}
           </span>
         </span>
         {job && job.hops > 0 ? (
@@ -295,7 +301,7 @@ function ShotRow(p: RowProps) {
             onChange={(v) => p.onEdit(shot.id, { length: v === 0 ? null : v })}
             options={[
               { value: 0, label: 'Reel', title: `Follow the reel: ${reelLength} frames` },
-              ...p.lengthOptions.map((n) => ({ value: n, label: seconds(n, fps), title: `${n} frames` })),
+              ...lengthChips(p.lengthOptions, fps),
             ]}
           />
         </div>

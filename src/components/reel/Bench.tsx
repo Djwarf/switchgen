@@ -14,6 +14,7 @@
 import type { FamilyDef } from '../../lib/workflows'
 import type { ShotPlan } from '../../lib/continuation'
 import { Caution, Chips, Field, Head, Kicker, Leader, NumberField, Quiet, RING, grouped, seconds, times } from './bits'
+import { lengthChips, type LengthChoice } from './lengths'
 import type { ReelDraft } from './store'
 
 export type NumSpec = { min: number; max: number; step: number }
@@ -40,7 +41,7 @@ export type BenchProps = {
   family: ReelFamily | null
   blocked: readonly { label: string; why: string }[]
   shapes: readonly Shape[]
-  lengthOptions: readonly number[]
+  lengthOptions: readonly LengthChoice[]
   samplers: readonly string[]
   schedulers: readonly string[]
   houseNegative: string
@@ -59,6 +60,7 @@ export function Bench(p: BenchProps) {
   // the finished clips beside settings they were never made with. So the whole
   // bench holds still until the queue stops, not only the style.
   const held = p.busy
+  const refusedLengths = p.lengthOptions.filter((c) => c.refused !== null)
 
   return (
     <aside className="lg:sticky lg:top-4 lg:self-start">
@@ -109,9 +111,16 @@ export function Bench(p: BenchProps) {
           ariaLabel="How long each shot runs"
           value={draft.length}
           disabled={held}
-          options={p.lengthOptions.map((n) => ({ value: n, label: seconds(n, draft.fps), title: `${n} frames` }))}
+          options={lengthChips(p.lengthOptions, draft.fps)}
           onChange={(v) => p.onPatch({ length: v })}
         />
+        {refusedLengths.length ? (
+          <p className="mt-1 text-caption italic text-grey-500">
+            {refusedLengths.length === 1 ? 'A shot' : 'Shots'} of{' '}
+            {listed(refusedLengths.map((c) => seconds(c.frames, draft.fps)))} {refusedLengths.length === 1 ? 'is' : 'are'}{' '}
+            refused at this shape. {refusedLengths[0]?.refused}
+          </p>
+        ) : null}
         <p className="mt-1 text-caption italic text-grey-500">
           Fewer, longer shots look better than more, shorter ones. Length costs memory once. Every join costs quality
           for the rest of the reel.
@@ -204,7 +213,8 @@ export function Bench(p: BenchProps) {
         <p className="mt-1 text-caption italic text-grey-500">
           Shot 1 takes this seed, shot 2 takes the next, and so on up the reel. On Random, every render draws a new
           one, so rendering a shot again gives a different take. Fix it and the same reel comes back the same way,
-          and a rendered shot keeps its seed when shots around it are cut, added or moved.
+          and a rendered shot keeps its seed when shots around it are cut, added or moved. A new seed typed here is
+          for every shot, rendered or not.
         </p>
       </Field>
 
@@ -378,6 +388,12 @@ export function Bench(p: BenchProps) {
       ) : null}
     </aside>
   )
+}
+
+/** "5 s", "5 s and 7 s", "3 s, 5 s and 7 s". */
+function listed(words: readonly string[]): string {
+  if (words.length < 2) return words[0] ?? ''
+  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
 }
 
 function snap(value: number, spec: NumSpec): number {

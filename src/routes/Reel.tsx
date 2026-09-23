@@ -51,7 +51,6 @@ import {
   deriveContinuation,
   explainUnavailable,
   shotPlan,
-  snapLength,
   type ShotJob,
   type ShotPlan,
   type ShotSpec,
@@ -71,6 +70,7 @@ import {
   Strip,
   currencyOf,
   grouped,
+  lengthsFor,
   recipeFor,
   reel,
   reelRun,
@@ -82,7 +82,9 @@ import {
   useReel,
   type AssemblyClip,
   type Currency,
+  type Elsewhere,
   type KeyframeTarget,
+  type LengthChoice,
   type NumSpec,
   type PinnedFrame,
   type ReelDraft,
@@ -275,16 +277,6 @@ function shapeChoices(family: ReelFamily): Shape[] {
   return out
 }
 
-/** A handful of legal shot lengths around the durations people actually cut to. */
-function lengthChoices(fps: number, spec: NumSpec): number[] {
-  const out: number[] = []
-  for (const s of [2, 3, 5, 7]) {
-    const n = snapLength(Math.round(s * Math.max(1, fps)))
-    if (n >= spec.min && n <= spec.max && !out.includes(n)) out.push(n)
-  }
-  return out.sort((a, b) => a - b)
-}
-
 /** "Shot 3" or "Shots 2, 4 and 5". */
 function shotsWord(numbers: readonly number[]): string {
   if (numbers.length === 1) return `Shot ${numbers[0]}`
@@ -304,6 +296,31 @@ function byReason(verdicts: readonly (ClipMemory | null)[], level: ClipMemory['l
   })
   return [...shots].map(([reason, numbers]) =>
     numbers.length === verdicts.length ? reason : `${shotsWord(numbers)}: ${reason}`,
+  )
+}
+
+/**
+ * Another tab's hold on the reel, said where this tab's band would be. The
+ * band, and the Stop on it, are in the tab doing the rendering.
+ */
+function HeldElsewhere({ elsewhere, order }: { elsewhere: Elsewhere; order: readonly string[] }) {
+  const at = elsewhere.shotId ? order.indexOf(elsewhere.shotId) : -1
+  const shot = at >= 0 ? `Shot ${at + 1}` : null
+  return (
+    <p className="notice notice-info mb-5 text-small">
+      {elsewhere.left ? (
+        <>
+          <strong>{shot ?? 'A shot'} is on the press, and the page that sent it has gone.</strong> This tab takes it
+          over once that page has been quiet for a few minutes, and sends nothing of its own until then.
+        </>
+      ) : (
+        <>
+          <strong>Another tab has this reel on the press.</strong> {shot ? `${shot} is on the press there. ` : ''}Its
+          clips show here as they land. This tab sends nothing until that tab is done, so no shot is rendered twice. To
+          stop it, use that tab. If that tab has gone, this one carries on once it has been quiet for a few minutes.
+        </>
+      )}
+    </p>
   )
 }
 
@@ -347,10 +364,16 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
    * strip then called those takes changed, and rendering what was missing
    * replaced each one with a different take. Read from the stores rather
    * than this render, so it is right however soon after an edit it runs.
+   *
+   * Only a take made with the seed its shot is planned with now keeps it, so
+   * a new reel seed, or a shot's own seed cleared, stays asked for through
+   * the edit (see seedsToKeep). `adoptAll` keeps every take's seed, for a
+   * Random reel being fixed.
    */
-  const keepTakes = useCallback(() => {
-    if (!reel.get().seedLocked) return
-    reel.keepSeeds(seedsToKeep(reel.get().shots, reelRun.snapshot().states))
+  const keepTakes = useCallback((adoptAll = false) => {
+    const now = reel.get()
+    if (!now.seedLocked) return
+    reel.keepSeeds(seedsToKeep(now.shots, reelRun.snapshot().states, adoptAll ? undefined : now.seed))
   }, [])
 
   /** A cut shot is offered back for twelve seconds, then it is simply gone. */
@@ -366,8 +389,16 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     [keepTakes],
   )
 
-  const busy = run.status === 'running'
-  const now = useNow(busy)
+  const running = run.status === 'running'
+  /**
+   * What another tab has on the press. This tab only mirrors that run, so it
+   * is held as if it were running: before, it read as idle, and a press here
+   * queued the other tab's shot a second time, a whole render of the same
+   * shot again, while the two tabs' saves overwrote each other's.
+   */
+  const elsewhere = run.elsewhere
+  const busy = running || elsewhere !== null
+  const now = useNow(running)
 
   /**
    * Leaving the reel. The shell lends a navigator when it has one; without it
@@ -458,11 +489,18 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
 
   const houseNegative = family ? defaultsFor(family.def, family.model).negative : ''
   const shapes = useMemo(() => (family ? shapeChoices(family) : []), [family])
-  const lengthOptions = useMemo(() => {
-    if (!family) return []
-    const list = lengthChoices(draft.fps, family.frames)
-    return list.includes(draft.length) ? list : [...list, draft.length].sort((a, b) => a - b)
-  }, [family, draft.fps, draft.length])
+  /**
+   * The lengths offered, each with the memory verdict a shot that long gets
+   * at the reel's size, against the same reading the plan is priced with
+   * below, so a chip the desk would refuse says so (see lengths.ts).
+   */
+  const lengthOptions = useMemo<LengthChoice[]>(
+    () =>
+      family
+        ? lengthsFor(family, { fps: draft.fps, length: draft.length, width: draft.width, height: draft.height }, hardware)
+        : [],
+    [family, draft.fps, draft.length, draft.width, draft.height, hardware],
+  )
 
   const bookendBlocked = useMemo(
     () => (family ? explainUnavailable(family.def, 'bookend') : 'No video family is installed.'),
@@ -645,7 +683,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
       if (typed || (p.seedLocked === false && draft.seedLocked)) reel.releaseSeeds()
       reel.patch(p)
       // After the patch, because keepTakes keeps seeds only on a fixed reel.
-      if (p.seedLocked === true && !draft.seedLocked && !typed) keepTakes()
+      if (p.seedLocked === true && !draft.seedLocked && !typed) keepTakes(true)
     },
     [families, draft.familyId, draft.seed, draft.seedLocked, keepTakes],
   )
@@ -796,6 +834,8 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
         onStop={() => reelRun.stop()}
       />
 
+      {elsewhere ? <HeldElsewhere elsewhere={elsewhere} order={order} /> : null}
+
       {shown && renderPlayer ? (
         <section className="mb-6">
           <div className="mb-2 flex items-baseline justify-between gap-3">
@@ -887,6 +927,7 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               currency={currency}
               refused={refused}
               bookendBlocked={bookendBlocked}
+              elsewhere={elsewhere?.shotId ?? null}
               onEdit={(id, patch) => reel.setShot(id, patch)}
               onMove={(id, delta) => {
                 keepTakes()
@@ -959,7 +1000,13 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                 }
                 onClick={() => renderAll()}
               >
-                {busy ? 'On the press' : clips.length ? 'Render what is missing' : 'Render the reel'}
+                {elsewhere
+                  ? 'On the press in another tab'
+                  : busy
+                    ? 'On the press'
+                    : clips.length
+                      ? 'Render what is missing'
+                      : 'Render the reel'}
               </button>
 
               {clips.length && !busy ? (
@@ -976,15 +1023,17 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                   ? blanks.length === 1
                     ? `Shot ${blanks[0]} has no line yet.`
                     : `Shots ${blanks.join(', ')} have no lines yet.`
-                  : busy
-                    ? 'One shot at a time, in order.'
-                    : refusals.length
-                      ? 'Nothing is sent while the note above stands.'
-                      : !missing.length
-                        ? 'Every shot is rendered and matches its line.'
-                        : missing.length === 1
-                          ? 'One generation of several minutes. Control and Enter starts it.'
-                          : `${missing.length} generations of several minutes each. Control and Enter starts them.`}
+                  : elsewhere
+                    ? 'This tab sends nothing until the other one is done.'
+                    : busy
+                      ? 'One shot at a time, in order.'
+                      : refusals.length
+                        ? 'Nothing is sent while the note above stands.'
+                        : !missing.length
+                          ? 'Every shot is rendered and matches its line.'
+                          : missing.length === 1
+                            ? 'One generation of several minutes. Control and Enter starts it.'
+                            : `${missing.length} generations of several minutes each. Control and Enter starts them.`}
               </span>
             </div>
 

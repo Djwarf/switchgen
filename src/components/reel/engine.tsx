@@ -103,6 +103,18 @@ export type ShotState = {
 
 export type RunStatus = 'idle' | 'running' | 'done' | 'stopped' | 'error'
 
+/** What another open tab has on the press. This tab sends nothing while it does. */
+export type Elsewhere = {
+  /** The shot on the press there, or null between two of its shots. */
+  shotId: string | null
+  /**
+   * True when the page that had the shot went away (closed, reloaded or
+   * crashed) and left it for another page to follow, which this tab does
+   * once that page has been quiet long enough.
+   */
+  left: boolean
+}
+
 export type RunState = {
   id: string
   status: RunStatus
@@ -120,6 +132,13 @@ export type RunState = {
   stopRequested: boolean
   /** One line about why the queue stopped where it did. */
   note: string | null
+  /**
+   * Set while another tab renders this reel. This tab only mirrors that run,
+   * so it must not start a pass of its own: it would queue the shot that tab
+   * has on the press a second time, and the two tabs' saves would overwrite
+   * each other's shots and the one saved shot on the press.
+   */
+  elsewhere: Elsewhere | null
 }
 
 /** Everything the engine needs from the desk to file a finished clip. */
@@ -170,6 +189,7 @@ const IDLE: RunState = {
   queue: [],
   stopRequested: false,
   note: null,
+  elsewhere: null,
 }
 
 let state: RunState = IDLE
@@ -287,11 +307,12 @@ const RUN_KEY = 'switchgen.reelrun.v1'
 
 /**
  * Every open tab loads this engine, and they share one saved run. So the shot
- * on the press is saved with the tab that is following it, and that tab says
- * it is still there every few seconds. Another tab leaves a shot alone while
- * its follower is alive: two tabs following one prompt could file its clip
- * twice, and whichever finished second wrote back a strip that was out of
- * date, without the next shot on the press.
+ * on the press, and the pass it belongs to, are saved with the tab that is
+ * following them, and that tab says it is still there every few seconds.
+ * Another tab leaves them alone while their follower is alive, and sends
+ * nothing of its own meanwhile (RunState.elsewhere): two tabs following one
+ * prompt could file its clip twice, and whichever finished second wrote back
+ * a strip that was out of date, without the next shot on the press.
  *
  * The allowance is long because browsers slow the timers of a tab nobody is
  * looking at (Chrome to once a minute, after five minutes hidden), and that
@@ -330,6 +351,17 @@ type Stamp = {
 
 type StoredPending = Pending & Stamp
 
+/**
+ * The pass a tab is walking, saved beside the shot on the press. The shot
+ * alone left gaps: between two shots, and while a shot waits for ComfyUI's
+ * queue to empty before its memory release, no shot is saved, and another
+ * tab read the reel as free and could start a pass over the same shots.
+ */
+type StoredPress = Stamp & {
+  /** The shot the pass is on. Null before it reaches one. */
+  shotId: string | null
+}
+
 type SavedShot = Pick<
   ShotState,
   'shotId' | 'clip' | 'frame' | 'files' | 'entryId' | 'durationMs' | 'finishedAt' | 'made'
@@ -337,20 +369,54 @@ type SavedShot = Pick<
 
 /** The shot this tab is following, if any. */
 let pending: Pending | null = null
+/**
+ * This tab's hold on what it is rendering: the pass it walks, or the shot it
+ * picked up. Aborted when the page comes back from the browser's back and
+ * forward cache to find that another page took over while it was away (see
+ * pageshow), which ends the pass here without sending or filing anything more.
+ */
+let claim: AbortController | null = null
 let beatTimer: ReturnType<typeof setInterval> | null = null
 let watchTimer: ReturnType<typeof setTimeout> | null = null
 /** The saved shots this tab last wrote or took in, as written. */
 let mirrored = ''
 
-/** Set or clear the shot this tab follows, keep its heartbeat going while there is one, and save. */
-function setPending(p: Pending | null): void {
-  pending = p
-  if (p && !beatTimer) beatTimer = setInterval(() => persist(), BEAT_MS)
-  if (!p && beatTimer) {
+/** True while this tab holds a pass or a shot that no other page has taken over. */
+function holding(): boolean {
+  return claim !== null && !claim.signal.aborted
+}
+
+/** Keep the heartbeat going while this tab holds a pass or a shot, and only then. */
+function keepBeat(): void {
+  const on = holding()
+  if (on && !beatTimer) beatTimer = setInterval(() => persist(), BEAT_MS)
+  if (!on && beatTimer) {
     clearInterval(beatTimer)
     beatTimer = null
   }
+}
+
+/** Set or clear the shot this tab follows, and save. */
+function setPending(p: Pending | null): void {
+  pending = p
+  keepBeat()
   persist()
+}
+
+/** Take the press for a pass or a picked-up shot. Returns the signal that says another page took it over. */
+function startWalking(): AbortSignal {
+  claim = new AbortController()
+  walking = true
+  holdUnload(true)
+  keepBeat()
+  return claim.signal
+}
+
+function stopWalking(): void {
+  claim = null
+  walking = false
+  holdUnload(false)
+  keepBeat()
 }
 
 /**
@@ -360,17 +426,20 @@ function setPending(p: Pending | null): void {
  * on the heartbeat, and the moment it matters is the moment before the page
  * goes.
  *
- * A shot another tab is following is written back as it was found. This tab's
- * view of the run can be behind that tab's, and leaving the entry out would
- * forget the shot if that tab then closed.
+ * A shot or a pass another tab is following is written back as it was found.
+ * This tab's view of the run can be behind that tab's, and leaving the entry
+ * out would forget the shot if that tab then closed.
  */
 function persist(opts: { released?: boolean } = {}): void {
+  const beat = Date.now()
+  const released = opts.released ?? false
+  const stored = pending && walking ? null : readStored(kv.get(RUN_KEY))
   let entry: StoredPending | null = null
-  if (pending) entry = { ...pending, owner: TAB, beat: Date.now(), released: opts.released ?? false }
-  else {
-    const theirs = readStored(kv.get(RUN_KEY))?.pending ?? null
-    if (theirs && theirs.owner !== TAB) entry = theirs
-  }
+  if (pending) entry = { ...pending, owner: TAB, beat, released }
+  else if (stored?.pending && stored.pending.owner !== TAB) entry = stored.pending
+  let press: StoredPress | null = null
+  if (walking) press = { owner: TAB, beat, released, shotId: state.currentShotId }
+  else if (stored?.press && stored.press.owner !== TAB) press = stored.press
 
   const shots: SavedShot[] = []
   for (const s of Object.values(state.states)) {
@@ -388,8 +457,8 @@ function persist(opts: { released?: boolean } = {}): void {
   }
   mirrored = JSON.stringify(shots)
   try {
-    if (!shots.length && !entry) kv.remove(RUN_KEY)
-    else kv.set(RUN_KEY, JSON.stringify({ shots, pending: entry }))
+    if (!shots.length && !entry && !press) kv.remove(RUN_KEY)
+    else kv.set(RUN_KEY, JSON.stringify({ shots, pending: entry, press }))
   } catch {
     // A full quota costs the saved copy, never the run on screen.
   }
@@ -459,9 +528,20 @@ function readPending(v: unknown): StoredPending | null {
   }
 }
 
+function readPress(v: unknown): StoredPress | null {
+  if (!isObject(v) || !isString(v.owner) || !isNumber(v.beat)) return null
+  return {
+    owner: v.owner,
+    beat: v.beat,
+    released: v.released === true,
+    shotId: isString(v.shotId) ? v.shotId : null,
+  }
+}
+
 type Saved = {
   states: Record<string, ShotState>
   pending: StoredPending | null
+  press: StoredPress | null
   /** The saved shots as written, to tell a write that changed them from a heartbeat. */
   shotsKey: string
 }
@@ -481,7 +561,7 @@ function readStored(raw: string | null): Saved | null {
     const shot = readSaved(s)
     if (shot) states[shot.shotId] = shot
   }
-  return { states, pending: readPending(v.pending), shotsKey: JSON.stringify(list) }
+  return { states, pending: readPending(v.pending), press: readPress(v.press), shotsKey: JSON.stringify(list) }
 }
 
 /** File a finished clip, unless the archive already holds that exact file. */
@@ -536,15 +616,19 @@ const POLL_GIVE_UP = 15
  * socket that would have reported it belonged to that page, so the shot is
  * followed through ComfyUI's job list instead, and filed when it lands.
  * `kept` is the clip the shot had before, which comes back if this one does
- * not arrive.
+ * not arrive. `lost` says another page has taken the shot over.
  */
-async function resume(p: Pending, kept: ShotState | null): Promise<void> {
+async function resume(p: Pending, kept: ShotState | null, lost: AbortSignal): Promise<void> {
   let verdict: RunStatus = 'error'
   let note: string | null = null
   try {
-    ;[verdict, note] = await follow(p)
+    ;[verdict, note] = await follow(p, lost)
   } catch {
     note = `${p.label} was left on the press by the page before this one, and following it failed. If it finishes, the Archive's recover action files it.`
+  }
+  if (lost.aborted) {
+    handedOver()
+    return
   }
 
   if (verdict !== 'done') {
@@ -559,24 +643,30 @@ async function resume(p: Pending, kept: ShotState | null): Promise<void> {
     }
   }
 
-  walking = false
-  holdUnload(false)
+  stopWalking()
   setRun({ status: verdict, finishedAt: Date.now(), currentShotId: null, stopRequested: false, note })
   setPending(null)
 }
 
-/** Poll one job to its end, and file its clip if it lands. */
-async function follow(p: Pending): Promise<[RunStatus, string]> {
+/**
+ * Poll one job to its end, and file its clip if it lands. Once `lost` is
+ * aborted another page follows the job, so this one touches nothing more and
+ * returns; resume hands over.
+ */
+async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string]> {
   const left = `${p.label} was left on the press by the page before this one`
+  const gone: [RunStatus, string] = ['stopped', '']
   let misses = 0
   let historyMisses = 0
   for (;;) {
+    if (lost.aborted) return gone
     let job: ServerJob | null | undefined
     try {
       job = await getJob(p.promptId)
     } catch {
       job = undefined
     }
+    if (lost.aborted) return gone
     if (job === undefined) {
       if (++misses < POLL_GIVE_UP) {
         await delay(POLL_MS)
@@ -610,6 +700,7 @@ async function follow(p: Pending): Promise<[RunStatus, string]> {
     let past: PastRun | null
     try {
       past = await fetchPastRun(p.promptId)
+      if (lost.aborted) return gone
     } catch {
       // Could not ask, which is not the same as no record.
       if (++historyMisses < POLL_GIVE_UP) {
@@ -658,6 +749,7 @@ function restore(): void {
   mirrored = saved.shotsKey
   if (Object.keys(saved.states).length) state = { ...IDLE, states: saved.states }
   pickUp(saved.pending, true)
+  lookElsewhere(saved)
 }
 
 /**
@@ -699,12 +791,11 @@ function pickUp(p: StoredPending | null, atLoad: boolean): void {
     },
     currentShotId: p.shotId,
   }
-  walking = true
-  holdUnload(true)
+  const lost = startWalking()
   // Claimed before anything else runs, so another tab reading now sees it taken.
   setPending(p)
   emit()
-  void resume(p, kept)
+  void resume(p, kept, lost)
 }
 
 /** Look again shortly at a shot another tab is following, and pick it up if that tab has gone. */
@@ -715,7 +806,85 @@ function watchPress(): void {
     const saved = readStored(kv.get(RUN_KEY))
     if (!walking) mirror(saved)
     pickUp(saved?.pending ?? null, false)
+    lookElsewhere(saved)
   }, WATCH_MS)
+}
+
+/**
+ * What another tab has on the press, as saved: the shot it follows, or the
+ * pass it walks between two shots. A shot is held whoever saved it, even one
+ * whose page went away, because this tab takes that one over itself (see
+ * pickUp). A pass whose page went away is over, and one whose tab has not
+ * written for the quiet time is taken to have crashed.
+ */
+function heldBy(saved: Saved | null): Elsewhere | null {
+  const p = saved?.pending
+  if (p && p.owner !== TAB) return { shotId: p.shotId, left: p.released || Date.now() - p.beat >= STALE_MS }
+  const w = saved?.press
+  if (w && w.owner !== TAB && !w.released && Date.now() - w.beat < STALE_MS) return { shotId: w.shotId, left: false }
+  return null
+}
+
+/**
+ * Note what another tab has on the press, so the desk holds its own press, and
+ * keep looking until it has nothing there. A tab that is walking has already
+ * got the press, and notes nothing.
+ */
+function lookElsewhere(saved: Saved | null): void {
+  const next = walking ? null : heldBy(saved)
+  const was = state.elsewhere
+  if (next?.shotId !== was?.shotId || next?.left !== was?.left) {
+    state = { ...state, elsewhere: next }
+    emit()
+  }
+  if (next) watchPress()
+}
+
+/**
+ * End this tab's pass after another page took the reel over while this one
+ * was away, and show that page's run instead. Nothing is saved from here:
+ * this page's view is older than the saved one, and writing it would put back
+ * a strip without the other page's shots and drop its shot on the press.
+ */
+function handedOver(): void {
+  pending = null
+  stopWalking()
+  const saved = readStored(kv.get(RUN_KEY))
+  mirrored = saved?.shotsKey ?? ''
+  state = {
+    ...state,
+    status: 'stopped',
+    finishedAt: Date.now(),
+    currentShotId: null,
+    stopRequested: false,
+    states: saved?.states ?? {},
+    note: 'While this page was away, another tab took the reel over, so this page stopped following it. The clips that tab makes show here as they land.',
+  }
+  emit()
+  lookElsewhere(saved)
+}
+
+/**
+ * True when nothing saved while this page was away says another page has
+ * taken its shot or its pass. The page's own entries are still there, marked
+ * released on the way out, unless a page that loaded since took them.
+ */
+function stillMine(saved: Saved | null): boolean {
+  const p = saved?.pending ?? null
+  if (pending ? p?.owner !== TAB || p.promptId !== pending.promptId : p !== null && p.owner !== TAB) return false
+  return saved?.press?.owner === TAB
+}
+
+/**
+ * Let go of the pass or shot this page held, after it came back to find
+ * another page following it. The walk or the follow sees the abort, sends
+ * and files nothing more, and hands over.
+ */
+function letGo(): void {
+  pending = null
+  claim?.abort()
+  keepBeat()
+  waiting?.abort()
 }
 
 /**
@@ -781,10 +950,21 @@ type ShotRun = {
   release: boolean
   label: string
   order: string[]
+  /** Aborted when another page has taken this pass over (see letGo). */
+  lost: AbortSignal
 }
 
-async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 'stopped'> {
-  const { shotId, job, previous, ctx } = r
+/** Rejects once `lost` aborts, so a shot stops waiting on a job another page now follows. */
+function whenLost(lost: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    const give = () => reject(new Error('Another page took this shot over.'))
+    if (lost.aborted) give()
+    else lost.addEventListener('abort', give, { once: true })
+  })
+}
+
+async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 'stopped' | 'handed'> {
+  const { shotId, job, previous, ctx, lost } = r
   let workflow
   try {
     workflow = instantiateShot(job, previous)
@@ -831,14 +1011,18 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
       }),
     )
     waiting = null
+    if (lost.aborted) return 'handed'
     if (!idle || state.stopRequested) return stopped()
     setShot(shotId, { stage: 'Freeing memory first' })
     await releaseComfyMemory()
+    if (lost.aborted) return 'handed'
     if (state.stopRequested) return stopped()
     setShot(shotId, { stage: 'Sending it to the press' })
   }
 
   const onEvent = (e: ProgressEvent) => {
+    // Another page follows the job now, and its events are that page's to report.
+    if (lost.aborted) return
     if (e.phase === 'queued') {
       setShot(shotId, { promptId: e.promptId, stage: 'Queued' })
       let entry: Pending | null = null
@@ -868,7 +1052,8 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
   }
 
   try {
-    const files = await run(workflow, onEvent)
+    const files = await Promise.race([run(workflow, onEvent), whenLost(lost)])
+    if (lost.aborted) return 'handed'
     const finishedAt = Date.now()
     const clip = files.find((f) => f.kind === 'video') ?? null
     const frame = chainFrameOf(files)
@@ -901,6 +1086,7 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
     setPending(null)
     return filed.unchanged ? 'unchanged' : 'done'
   } catch (err) {
+    if (lost.aborted) return 'handed'
     const f = faultOf(err)
     const finishedAt = Date.now()
     setShot(shotId, {
@@ -938,8 +1124,10 @@ function shotsWord(numbers: readonly number[]): string {
 }
 
 async function walk(pass: Pass): Promise<void> {
-  walking = true
-  holdUnload(true)
+  const lost = startWalking()
+  // Saved at once, so another tab holds its press from the first moment, even
+  // while this pass waits for ComfyUI's queue to empty before its first shot.
+  persist()
   const { order, jobs, ctx, indices, before } = pass
   let verdict: RunStatus = 'done'
   let note: string | null = null
@@ -962,6 +1150,7 @@ async function walk(pass: Pass): Promise<void> {
   const restLine = (position: number) => (position + 1 < indices.length ? ', so the rest of this pass was not sent.' : '.')
 
   for (const [position, index] of indices.entries()) {
+    if (lost.aborted) break
     if (state.stopRequested) {
       verdict = 'stopped'
       note = `Stopped before shot ${index + 1}.${finishedLine()}`
@@ -973,6 +1162,8 @@ async function walk(pass: Pass): Promise<void> {
     reached.add(shotId)
 
     setRun({ currentShotId: shotId })
+    // The saved pass names its shot, for another tab to show where it is.
+    persist()
 
     // The desk refuses these before the press, and this is the last place
     // before the server, so the same two checks stand here too.
@@ -1019,8 +1210,10 @@ async function walk(pass: Pass): Promise<void> {
       release: memory?.release ?? false,
       label: `Shot ${index + 1}`,
       order,
+      lost,
     })
 
+    if (result === 'handed') break
     if (result === 'done' || result === 'unchanged') {
       finished.push(index + 1)
       if (result === 'unchanged') unchanged.push(index + 1)
@@ -1048,6 +1241,10 @@ async function walk(pass: Pass): Promise<void> {
   // re-queue it. Whether it still matches the strip is worked out as always.
   // Anything else left on "queued" goes back to waiting rather than read as
   // work in progress.
+  if (lost.aborted) {
+    handedOver()
+    return
+  }
   const states = { ...state.states }
   for (const shotId of order) {
     const shot = states[shotId]
@@ -1066,8 +1263,7 @@ async function walk(pass: Pass): Promise<void> {
     note = `${shotsWord(unchanged)} came back as the ${one ? 'clip' : 'clips'} already on disk. Nothing that decides ${one ? 'it' : 'them'} had changed, the seed included, so ComfyUI handed back what it had already made. Change the shot, or set the seed to Random, for a different take.`
   }
 
-  walking = false
-  holdUnload(false)
+  stopWalking()
   setRun({
     status: verdict,
     finishedAt: Date.now(),
@@ -1115,6 +1311,7 @@ function startPass(
     queue: indices.map((i) => order[i]).filter((id): id is string => id !== undefined),
     stopRequested: false,
     note: null,
+    elsewhere: null,
   }
   emit()
   void walk({ order, jobs, ctx, indices, before })
@@ -1134,10 +1331,11 @@ export const reelRun = {
 
   /**
    * Render the whole reel, skipping shots that are already done and still
-   * current. Pass `force` to render every shot again from the top.
+   * current. Pass `force` to render every shot again from the top. Nothing
+   * starts while another tab has the reel on the press (RunState.elsewhere).
    */
   renderAll(order: string[], jobs: readonly ShotJob[], ctx: RunContext, opts: { force?: boolean } = {}): void {
-    if (walking) return
+    if (walking || state.elsewhere) return
     const states = adopt(order, jobs)
     const queue = shotsToRender(order, jobs, states, opts.force)
     if (!queue.length) return
@@ -1146,7 +1344,7 @@ export const reelRun = {
 
   /** Render one shot, leaving every other shot exactly as it stands. */
   renderOne(index: number, order: string[], jobs: readonly ShotJob[], ctx: RunContext): void {
-    if (walking || !order[index]) return
+    if (walking || state.elsewhere || !order[index]) return
     startPass(order, jobs, ctx, [index], adopt(order, jobs))
   },
 
@@ -1168,9 +1366,13 @@ export const reelRun = {
     if (state.note) setRun({ note: null })
   },
 
-  /** Forget every rendered shot. The files stay on disk and in the archive. */
+  /**
+   * Forget every rendered shot. The files stay on disk and in the archive.
+   * Not while another tab renders: that tab's next save would bring them all
+   * back, and this one's would wipe its shots from the saved run meanwhile.
+   */
   clear(): void {
-    if (walking) return
+    if (walking || state.elsewhere) return
     state = IDLE
     setPending(null)
     emit()
@@ -1183,22 +1385,29 @@ export function useReelRun(): RunState {
 
 if (typeof window !== 'undefined') {
   // A reload or a close hands the shot on the press to the next page at once,
-  // rather than after the quiet time another tab waits.
+  // rather than after the quiet time another tab waits, and frees the press
+  // for other tabs: the rest of the pass goes with the page.
   window.addEventListener('pagehide', () => {
-    if (pending) persist({ released: true })
+    if (holding()) persist({ released: true })
   })
+  // A page the browser kept whole comes back with its pass still walking. It
+  // takes the press back only if nothing was saved in the meantime by a page
+  // that took it over. A page that loaded since takes a released shot at once
+  // (pickUp), and two pages following one prompt could file its clip twice.
   window.addEventListener('pageshow', (e) => {
-    if (e.persisted && pending) persist()
+    if (!e.persisted || !holding()) return
+    if (stillMine(readStored(kv.get(RUN_KEY)))) persist()
+    else letGo()
   })
 }
 
 // Another tab saved the run. While this one renders nothing it takes in that
-// tab's strip, and keeps an eye on that tab's shot on the press.
+// tab's strip, and keeps an eye on what that tab has on the press.
 onStorage(RUN_KEY, (value) => {
   if (walking) return
   const saved = readStored(value)
   mirror(saved)
-  if (saved?.pending && saved.pending.owner !== TAB) watchPress()
+  lookElsewhere(saved)
 })
 
 // Last, so everything it calls is defined.

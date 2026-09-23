@@ -112,16 +112,32 @@ export function shotSeed(shot: ReelShot, seedLocked: boolean): number | undefine
  * The seeds to keep before the strip is rearranged on a fixed reel: for every
  * shot that follows the ladder and has a rendered take, the seed that take was
  * made with.
+ *
+ * `reelSeed` is the fixed reel's seed as it stands, and with it a take is kept
+ * only when its seed is the one its shot is planned with now: the seed kept
+ * from before, or else the ladder's rung at the shot's place (shotPlan gives
+ * shot i the reel's seed plus i). Keeping every take undid a new seed. A
+ * typed seed, or a shot's own seed cleared to follow the ladder, reads every
+ * take made with the old one as changed, and the next cut, move or added shot
+ * wrote the old seeds back, so the strip read current again and the new seed
+ * was never rendered.
+ *
+ * Left out, every take keeps its seed whatever the reel's seed is. That is
+ * for fixing a Random reel, whose takes were each made with a seed drawn at
+ * its own press and which should all stay as they are.
  */
 export function seedsToKeep(
   shots: readonly ReelShot[],
   states: Readonly<Record<string, ShotState>>,
+  reelSeed?: number,
 ): Map<string, number> {
   const keep = new Map<string, number>()
-  for (const shot of shots) {
+  shots.forEach((shot, i) => {
     const made = states[shot.id]?.status === 'done' ? states[shot.id]?.made : null
-    if (shot.seed === null && made) keep.set(shot.id, made.seed)
-  }
+    if (shot.seed !== null || !made) return
+    const planned = reelSeed === undefined ? made.seed : (shot.keptSeed ?? Math.floor(reelSeed) + i)
+    if (made.seed === planned) keep.set(shot.id, made.seed)
+  })
   return keep
 }
 
