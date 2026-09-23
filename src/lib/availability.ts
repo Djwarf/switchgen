@@ -9,6 +9,7 @@
  * on every desk with the file sitting installed. The validator already knew
  * that; this module makes the desks know it too.
  */
+import { optionsFor } from './comfy'
 import { feasibility, modelGraph, type Hardware, type ModelFile, type Verdict } from './hardware'
 import { DETECTORS, UPSCALE_MODEL } from './refine'
 import { modelsOf, sidecarsOf, type FamilyDef } from './workflows'
@@ -39,14 +40,7 @@ export type Inventory = {
  * a machine that has the upscaler.
  */
 function listed(info: Record<string, unknown>, node: string, field: string): string[] {
-  const input = (info?.[node] as { input?: Record<string, Record<string, unknown[]>> } | undefined)?.input
-  const spec = input?.required?.[field] ?? input?.optional?.[field]
-  if (!Array.isArray(spec)) return []
-  const [head, extra] = spec
-  if (Array.isArray(head)) return head.filter((v): v is string => typeof v === 'string')
-  const options = (extra as { options?: unknown } | undefined)?.options
-  if (head === 'COMBO' && Array.isArray(options)) return options.filter((v): v is string => typeof v === 'string')
-  return []
+  return optionsFor(info, node, field)
 }
 
 const many = (info: Record<string, unknown>, pairs: readonly [string, string][]) =>
@@ -124,20 +118,38 @@ export function missingFilesFor(def: FamilyDef, inv: Inventory): string[] {
   return [...new Set(missing)]
 }
 
+/** Whether the disk listing holds this file, under its own name or its path. */
+function onDiskHas(onDisk: ReadonlyMap<string, unknown>, file: string): boolean {
+  return onDisk.has(file) || onDisk.has(file.split(/[\\/]/).pop() ?? file)
+}
+
 /**
  * Why these files cannot be loaded, starting "needs". A file whose node pack is
- * missing is put down to the pack, once, and only the rest are named as files.
+ * missing is put down to the pack, once. It is left at the pack only when the
+ * disk listing shows the file is there: without the pack ComfyUI cannot list
+ * it either way, so its absence from ComfyUI says nothing, and the Video and
+ * Reel desks ask this of every family whether or not its files were ever
+ * fetched. A reader told only to install the pack would install it and then
+ * find the file missing too. An empty listing is no evidence of anything, the
+ * same as an empty /object_info, and a file is not named on the strength of it.
+ *
+ * The files are listed plainly, comma by comma; ", and" joins only the pack
+ * to the files.
  */
-export function missingWhy(missing: readonly string[], inv: Inventory): string {
+export function missingWhy(
+  missing: readonly string[],
+  inv: Inventory,
+  onDisk: ReadonlyMap<string, unknown>,
+): string {
   const packs = new Set<string>()
   const files: string[] = []
   for (const file of missing) {
     const pack = packNeededFor(file, inv)
     if (pack) packs.add(pack)
-    else files.push(file)
+    if (!pack || (onDisk.size > 0 && !onDiskHas(onDisk, file))) files.push(file)
   }
-  const parts = [...[...packs].map((p) => `${p} to read its .gguf files`), ...files]
-  return `needs ${parts.join(', and ')}`
+  const install = [...packs].map((p) => `${p} to read its .gguf files`).join(', and ')
+  return `needs ${[install, files.join(', ')].filter(Boolean).join(', and ')}`
 }
 
 export type Availability =
@@ -163,7 +175,7 @@ export function availabilityOf(
   model?: string,
 ): Availability {
   const missing = missingFilesFor(def, inv)
-  if (missing.length) return { ok: false, why: missingWhy(missing, inv) }
+  if (missing.length) return { ok: false, why: missingWhy(missing, inv, sizes) }
   const graph = model ? modelGraph(def, model) : def.graph
   const verdict = hardware ? feasibility(def, sizes, hardware, graph) : null
   if (verdict && !verdict.selectable) return { ok: false, why: verdict.reason }

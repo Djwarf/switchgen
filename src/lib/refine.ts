@@ -1012,7 +1012,7 @@ export function withLoras(def: FamilyDef | DerivedDef, loras: LoraSpec[]): Deriv
   const derived = base
   if (!derived.kinds.includes('loras')) derived.kinds.push('loras')
   derived.loraNodes = added
-  derived.note = `${added.length} LoRA${added.length === 1 ? '' : 's'} applied to the model${checkpoint ? ' and text encoder' : ''}.`
+  derived.note = `${added.length} add-on${added.length === 1 ? '' : 's'} applied to the model${checkpoint ? ' and text encoder' : ''}.`
 
   return {
     ...def,
@@ -1264,6 +1264,45 @@ export function regionOrigin(
   if (src?.ref) return { kind: 'output', ref: src.ref, fromEntryId }
   if (src?.name) return { kind: 'input', name: src.name, fromEntryId }
   return { kind: 'gone' }
+}
+
+/**
+ * The picture a region pass was drawn on, as the record the Pictures desk
+ * opens its region bench on, carrying the pass's own words: the same three
+ * places the desk's "Make another like this" looks. Null when that picture is
+ * no longer anywhere.
+ *
+ * Only a record crosses from the Archive to the Pictures desk, so a picture known only
+ * by its file is handed over as a record of that file, claiming no maker. It
+ * goes as the picture to paint on, never as a pass: a region pass drawn on
+ * another region pass is painted on that one, not traced back past it.
+ */
+export function regionPicture(entry: HistoryEntry, origin: RegionOrigin): HistoryEntry | null {
+  if (origin.kind === 'gone') return null
+  if (origin.kind === 'record') return { ...origin.entry, prompt: entry.prompt, variant: null }
+  const file =
+    origin.kind === 'output'
+      ? origin.ref
+      : {
+          filename: origin.name.slice(origin.name.lastIndexOf('/') + 1),
+          subfolder: origin.name.includes('/') ? origin.name.slice(0, origin.name.lastIndexOf('/')) : '',
+          type: 'input',
+        }
+  return {
+    ...entry,
+    id: origin.fromEntryId ?? '',
+    file,
+    files: undefined,
+    variant: null,
+    source: undefined,
+    width: null,
+    height: null,
+    model: '',
+    modelLabel: '',
+    familyId: '',
+    familyLabel: '',
+    missing: undefined,
+  }
 }
 
 /**

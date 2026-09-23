@@ -176,7 +176,7 @@ const STAPLES: { file: string; bases: IndexedBase[]; why: string }[] = [
     file: MEASURED_TRIGGER.file,
     bases: ['pony', 'illustrious', 'sdxl'],
     why:
-      'Measured on Pony V6 at strength 0.6: 2.132x base sharpness with its word in the prompt, 1.625x without it. It is the only add-on here measured both ways.',
+      'Measured on Pony V6 at strength 0.6: 2.132x as sharp as the same picture with no add-ons when its word is in the prompt, 1.625x without it. It is the only add-on here measured both ways.',
   },
 ]
 
@@ -658,7 +658,7 @@ export function suggest(input: SuggestInput): SuggestResult {
     forced.set('anatomy-helper.safetensors', {
       reason: 'anatomy-level',
       why:
-        'Asked for by the anatomy setting. In the measured pair of add-ons it held 1.14x base sharpness alongside add-micro-details, and on its own it costs sharpness at every strength tried, which is why it is capped at 0.4. Both runs were made without the add-ons’ words in the prompt, so both are floors.',
+        'Asked for by the anatomy setting. Measured as a pair with add-micro-details, the two came out 1.14x as sharp as the same picture with no add-ons, and on its own it costs sharpness at every strength tried, which is why it is capped at 0.4. Both runs were made without the add-ons’ words in the prompt, so both are floors.',
       score: STAPLE_SCORE * 0.9,
     })
   }

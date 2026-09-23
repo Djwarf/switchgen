@@ -109,7 +109,7 @@ export const TAG_STYLE_NOTE: Record<TagStyle, string> = {
   'score-tags':
     'Write comma separated booru tags and keep the score prefix this file was trained with. Without it the output collapses towards the low quality end of its training set.',
   natural:
-    'Write a plain sentence or two describing the picture. Tag soup underperforms here: these bases were captioned in full sentences.',
+    'Write a plain sentence or two describing the picture. Tag soup underperforms here: these models were trained on pictures captioned in full sentences.',
   instruction:
     'Write the change you want, not a description of the finished picture. "Remove her shirt" beats a full scene description.',
 }
@@ -155,12 +155,12 @@ const PROFILES: Record<string, ModelProfile> = {
     anatomy: 9,
     craft: 7,
     anatomyReason:
-      'It has seen nipples, vulvas and penises in training, which the other photoreal bases here have not, so it renders them instead of smoothing them into a mannequin.',
+      'It has seen nipples, vulvas and penises in training, which the other photoreal models here have not, so it renders them instead of smoothing them into a mannequin.',
     caveat:
-      'It runs with real CFG rather than a distilled shortcut, so it wants more steps than the 8 step bases and costs more per picture.',
+      'It runs with real CFG rather than a distilled shortcut, so it wants more steps than the 8 step models and costs more per picture.',
     styleNotes: {
       illustration:
-        'Painterly and editorial styles come out well, though a booru trained base will beat it on anime line work.',
+        'Painterly and editorial styles come out well, though a booru trained model will beat it on anime line work.',
     },
   },
 
@@ -215,12 +215,12 @@ const PROFILES: Record<string, ModelProfile> = {
     arch: 'flux',
     tags: 'natural',
     lineage: 'Community mix on the Krea lineage, quantised, distilled to few steps.',
-    best: 'a softer, warmer photoreal aesthetic than the stock bases',
+    best: 'a softer, warmer photoreal aesthetic than the stock models',
     style: { photoreal: 8, anime: 4, cartoon: 4, illustration: 6 },
     anatomy: 5,
     craft: 7,
     anatomyReason:
-      'A community mix, so its dataset is partly unfiltered: better at nudity than stock Flux, still well short of Chroma or the booru bases at genital detail.',
+      'A community mix, so its dataset is partly unfiltered: better at nudity than stock Flux, still well short of Chroma or the booru models at genital detail.',
     caveat: 'Mix provenance is not documented, so treat the anatomy score as an observation rather than a specification.',
   },
 
@@ -229,12 +229,12 @@ const PROFILES: Record<string, ModelProfile> = {
     arch: 'anima',
     tags: 'natural',
     lineage: 'Anima DiT finetune aimed at realistic skin rather than cel shading.',
-    best: 'realistic skin on an uncensored base, the middle ground between Chroma and the anime bases',
+    best: 'realistic skin from an uncensored model, the middle ground between Chroma and the anime models',
     style: { photoreal: 7, anime: 7, cartoon: 5, illustration: 6 },
     anatomy: 9,
     craft: 6,
     anatomyReason: 'Uncensored training set, with explicit anatomy present and tagged.',
-    caveat: 'Skin realism is good, scene realism is not: backgrounds and hands lag the dedicated photoreal bases.',
+    caveat: 'Skin realism is good, scene realism is not: backgrounds and hands lag the dedicated photoreal models.',
   },
   'miaomiaoHarem_29BBETA10.safetensors': {
     arch: 'anima',
@@ -244,8 +244,8 @@ const PROFILES: Record<string, ModelProfile> = {
     style: { photoreal: 3, anime: 9, cartoon: 6, illustration: 7 },
     anatomy: 9,
     craft: 6,
-    anatomyReason: 'Uncensored training set. Explicit anatomy renders without fighting the base.',
-    caveat: 'Beta weights. Expect more run to run variance than the SDXL anime bases.',
+    anatomyReason: 'Uncensored training set. Explicit anatomy renders without fighting the model.',
+    caveat: 'Beta weights. Expect more run to run variance than the SDXL anime models.',
   },
   'oneObsession_anima29BV1.safetensors': {
     arch: 'anima',
@@ -272,7 +272,7 @@ const PROFILES: Record<string, ModelProfile> = {
     caveat:
       'Weak at hands, faces at distance and text, and it cannot do photoreal at all. Pair it with a face pass and a hand pass.',
     styleNotes: {
-      cartoon: 'The best cartoon base here by a wide margin: western toon and furry art are a large part of what it was trained on.',
+      cartoon: 'The best cartoon model here by a wide margin: western toon and furry art are a large part of what it was trained on.',
       photoreal: 'Do not use this for photoreal. It pulls every subject towards illustration.',
     },
   },
@@ -321,7 +321,7 @@ const PROFILES: Record<string, ModelProfile> = {
     anatomy: 2,
     craft: 9,
     anatomyReason:
-      'It follows the instruction and then renders anatomy it was never trained on, which is why undressing a subject produces a smooth featureless body. The fix is not a better instruction: mask the region and run a refine pass on an anatomy capable base.',
+      'It follows the instruction and then renders anatomy it was never trained on, which is why undressing a subject produces a smooth featureless body. The fix is not a better instruction: mask the region and run a refine pass on a model that can draw anatomy.',
     caveat:
       'Q4 quantisation costs fine texture. Small structures degrade first, and small structures are the ones people complain about.',
   },
@@ -525,7 +525,7 @@ const BAND = (n: number, intent: Intent): string => {
   if (n >= 9) return `The strongest option installed for ${what}.`
   if (n >= 7) return `Strong at ${what}.`
   if (n >= 5) return `Workable for ${what} without being its strength.`
-  return `Not what this base is for: ${what} fights it.`
+  return `Not what this model is for: ${what} fights it.`
 }
 
 function justify(p: ModelProfile, brief: Brief): string {
@@ -540,7 +540,7 @@ function justify(p: ModelProfile, brief: Brief): string {
 function warnAbout(p: ModelProfile, brief: Brief, label: string): string | null {
   if (!brief.explicit) return null
   if (p.anatomy >= 6) return null
-  return `${label} was not trained on explicit anatomy in any quantity. Nipples, vulvas and penises will come out smooth, merged or invented, and prompt wording will not change that. A masked refine pass on one of the booru trained bases is the fix.`
+  return `${label} was not trained on explicit anatomy in any quantity. Nipples, vulvas and penises will come out smooth, merged or invented, and prompt wording will not change that. A masked refine pass on one of the booru trained models is the fix.`
 }
 
 // ---------------------------------------------------------------------------
@@ -674,7 +674,7 @@ function anatomyNote(brief: Brief): string {
   if (!brief.explicit) {
     return 'Faces and hands have detectors, so they can be detailed automatically. Everything else needs a drawn mask and a refine pass.'
   }
-  return `Choosing the base fixes anatomy at large scale only. At small scale the region simply does not have the latent cells to be correct, whichever base renders it. Draw a mask over ${regions} and run a refine pass: the crop is upscaled to full working resolution and re rendered alone, which is the only thing that adds real detail. There is no detector for these regions, so the mask has to be drawn. Budget one full generation per pass.`
+  return `Choosing the model fixes anatomy at large scale only. At small scale the region simply does not have the latent cells to be correct, whichever model renders it. Draw a mask over ${regions} and run a refine pass: the crop is upscaled to full working resolution and re rendered alone, which is the only thing that adds real detail. There is no detector for these regions, so the mask has to be drawn. Budget one full generation per pass.`
 }
 
 // ---------------------------------------------------------------------------

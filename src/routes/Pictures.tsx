@@ -34,6 +34,7 @@ import {
   NO_PASS_BLOCKS,
   availabilityOf,
   inventoryFrom,
+  missingFilesFor,
   missingWhy,
   packNeededFor,
   passBlocks,
@@ -389,13 +390,16 @@ async function readCatalogue(): Promise<Catalogue> {
   // installed never reaches the loop above: it is on disk, and it looked like
   // nothing at all. The instruction editing model is a .gguf, so without the
   // GGUF node pack "Change a picture" simply vanished. It is named here with
-  // the pack it needs.
+  // the pack it needs, and with any other file of its family that is missing
+  // too: told of the pack alone, a reader would install it and only then learn
+  // that the family still lacks its encoder or its VAE.
   for (const def of FAMILIES) {
     if (def.mode !== 'image' && def.mode !== 'edit') continue
+    const others = missingFilesFor(def, inv).filter((f) => !def.models.includes(f))
     for (const model of def.models) {
       if (installed.has(model) || !sizes.has(model)) continue
       if (!packNeededFor(model, inv)) continue
-      unavailable.push({ name: model, why: missingWhy([model], inv) })
+      unavailable.push({ name: model, why: missingWhy([model, ...others], inv, sizes) })
     }
   }
 
@@ -459,7 +463,7 @@ type PressState = {
   lastMs: number | null
 }
 
-type RunPlan = {
+export type RunPlan = {
   graph: ApiWorkflow
   composition: Composition
   seed: number
@@ -515,7 +519,11 @@ function busy(state: PressState): boolean {
   return s === 'submitting' || s === 'queued' || s === 'running'
 }
 
-function startRuns(plans: RunPlan[]) {
+/**
+ * Put a batch on the press. Exported for the tests: the desk's own Run button
+ * is the only caller in the app.
+ */
+export function startRuns(plans: RunPlan[]) {
   if (driving || !plans.length) return
   queue = [...plans]
   stopped = false
@@ -672,6 +680,21 @@ async function stopRun() {
   } catch {
     /* the watcher reports the outcome; a failed cancel is not a second error */
   }
+}
+
+/**
+ * The desk's own Stop, for the section bar and the running slug.
+ *
+ * A bare cancel of the running prompt ends the batch only when it lands. One
+ * that arrives just after the picture saved finds nothing to cancel, and
+ * drive() goes on to make the rest of the batch after the reader pressed Stop.
+ * This stops the batch as the desk's own button does, whatever the picture in
+ * hand is doing. With nothing running it does nothing, so a press that arrives
+ * as the last picture finishes leaves that job reading Done, not Stopping.
+ */
+export function stopPress(): void {
+  if (!busy(press)) return
+  void stopRun()
 }
 
 /** Show a finished picture on the plate without re-running anything. */

@@ -55,6 +55,11 @@ export function PassPanel({
 
   const none = !caps.faceDetail && !caps.handDetail && !caps.hires
   const shown = face || hand || caps.hires
+  // The region note counts the rows actually drawn above. A blocked detector
+  // takes its row away, and the finished picture does not offer that pass
+  // either, so a fixed "these three" promised passes that are not coming.
+  const listed = [face, hand, caps.hires].filter(Boolean).length
+  const alongWith = ['', ', along with the pass above', ', along with these two', ', along with these three'][listed]
 
   return (
     <section className="mb-7">
@@ -123,9 +128,9 @@ export function PassPanel({
       <div className="mt-3 border-t border-grey-300 pt-2">
         <Note>
           {plan.passes.refine.available
-            ? 'A masked region re render is the fourth pass, and it is not here because there is nothing to draw a mask on yet. The finished picture offers it, along with these three.'
+            ? `A masked region re render is not here because there is nothing to draw a mask on yet. The finished picture offers it${alongWith}.`
             : caps.refine
-              ? 'A masked region re render is the fourth pass. It cannot run here until what is named above is installed.'
+              ? 'A masked region re render cannot run here until what is named above is installed.'
               : 'This family cannot carry a masked region re render, so the finished picture will not offer one.'}
         </Note>
         {p.face || p.hand || p.hires ? (
