@@ -16,7 +16,17 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useServerCapabilities } from '../../lib/capabilities'
-import { bytesText, fetchCatalog, fetchPlan, forgetCatalog, type CatalogFamily, type CatalogPlan } from '../../lib/catalog'
+import {
+  bytesText,
+  fetchCatalog,
+  fetchPlan,
+  forgetCatalog,
+  heldBack,
+  noToken,
+  type CatalogFamily,
+  type CatalogFile,
+  type CatalogPlan,
+} from '../../lib/catalog'
 import { cancelPlan, forgetPlan, startPlan, useDownloads } from '../../lib/downloads'
 import { modelFiles } from '../../lib/hardware'
 import { FAMILIES, modelsOf, sidecarsOf, type FamilyDef } from '../../lib/workflows'
@@ -57,6 +67,15 @@ function lackOf(def: FamilyDef, onDisk: ReadonlySet<string>, unfinished: Readonl
   return { mains, files }
 }
 
+/** Does this family load the file: one of its main weights, or a file its graph names? */
+function loads(def: FamilyDef, file: string): boolean {
+  const name = base(file)
+  if (def.models.some((m) => base(m) === name)) return true
+  return Object.values(def.graph).some((n) =>
+    Object.values(n.inputs).some((v) => typeof v === 'string' && base(v) === name),
+  )
+}
+
 /**
  * The catalogue entry for a registry family: the same id, or failing that
  * the entry that lists the most of the family's weight files, preferring one
@@ -91,8 +110,17 @@ export function CataloguePanel({
   const runs = useDownloads()
   const [catalog, setCatalog] = useState<{ families: CatalogFamily[]; total: number } | null>(null)
   const [onDisk, setOnDisk] = useState<ReadonlySet<string> | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  /** Reading the catalogue failed. A later read that succeeds clears it. */
+  const [catalogError, setCatalogError] = useState<string | null>(null)
   const [plans, setPlans] = useState<Record<string, CatalogPlan | 'loading' | undefined>>({})
+  /**
+   * Asking whether a family fits failed, by catalogue id. Kept apart from the
+   * catalogue's own error: a re-read runs whenever another family lands, and
+   * clearing everything then wiped the one line saying this row's question
+   * went unanswered, while the row itself was back on its Fetch link. Only
+   * asking about the same row again clears it.
+   */
+  const [askFailed, setAskFailed] = useState<Record<string, string | undefined>>({})
   const mounted = useRef(false)
   const installedRef = useRef(onInstalled)
   /** Catalogue ids whose landing is being re-read, so it is handled once. */
@@ -117,7 +145,7 @@ export function CataloguePanel({
         if (live) setCatalog({ families: c.families, total: c.counts.families })
       })
       .catch((e: unknown) => {
-        if (live) setError(e instanceof Error ? e.message : String(e))
+        if (live) setCatalogError(e instanceof Error ? e.message : String(e))
       })
     void modelFiles()
       .then((m) => {
@@ -163,10 +191,10 @@ export function CataloguePanel({
         (c) => {
           if (!mounted.current) return
           setCatalog({ families: c.families, total: c.counts.families })
-          setError(null)
+          setCatalogError(null)
         },
         (e: unknown) => {
-          if (mounted.current) setError(e instanceof Error ? e.message : String(e))
+          if (mounted.current) setCatalogError(e instanceof Error ? e.message : String(e))
         },
       ),
       modelFiles().then(
@@ -228,10 +256,25 @@ export function CataloguePanel({
     (r) => r.cat && (runs.has(r.cat.id) || (!r.installed && (r.cat.installed.missing.length || r.cat.incomplete?.length))),
   )
   const byHand = rows.filter((r) => !r.installed && !fetchable.includes(r))
+  // Files that installed families on this desk use as they are on disk,
+  // named once each however many families load them. An installed family is
+  // not listed above (unless a run keeps it there, and then its row says
+  // this), so without this nothing would say that one of its files is not
+  // the catalogue's.
+  const usedAsIs = new Map<string, { file: CatalogFile; labels: string[] }>()
+  for (const r of rows) {
+    if (!r.installed || !r.cat || fetchable.includes(r)) continue
+    for (const f of r.cat.installed.files) {
+      if (!f.conflict || !loads(r.def, f.filename)) continue
+      const seen = usedAsIs.get(f.filename)
+      if (seen) seen.labels.push(r.def.label)
+      else usedAsIs.set(f.filename, { file: f, labels: [r.def.label] })
+    }
+  }
 
   const ask = (row: Row) => {
     const cat = row.cat!
-    setError(null)
+    setAskFailed((f) => ({ ...f, [cat.id]: undefined }))
     setPlans((p) => ({ ...p, [cat.id]: 'loading' }))
     void fetchPlan(cat.id, cat.installed.chosenModel ?? null)
       .then((plan) => {
@@ -245,11 +288,10 @@ export function CataloguePanel({
         if (!mounted.current) return
         // No plan came back, so the row returns to its Fetch link and asking
         // again is one click; left on 'loading' it would wait for an answer
-        // that is not coming. The reason is said above the list, named for
-        // the row, since the row itself no longer shows that it asked.
+        // that is not coming. The reason is said on the row, above that link.
         const why = (e instanceof Error ? e.message : String(e)).replace(/\.$/, '')
         setPlans((p) => ({ ...p, [cat.id]: undefined }))
-        setError(`Could not ask the server whether ${row.def.label} fits: ${why}.`)
+        setAskFailed((f) => ({ ...f, [cat.id]: `Could not ask the server whether it fits: ${why}.` }))
       })
   }
 
@@ -264,7 +306,7 @@ export function CataloguePanel({
             : 'Reading the catalogue.'
         }
       />
-      {error ? <Caution>{error}</Caution> : null}
+      {catalogError ? <Caution>{catalogError}</Caution> : null}
 
       {catalog && !fetchable.length && !byHand.length ? (
         <Note>Every family this desk has a graph for is installed.</Note>
@@ -278,6 +320,14 @@ export function CataloguePanel({
           const plan = plans[id]
           const files = cat.installed.missing
           const gated = cat.installed.gatedMissing.length > 0
+          // A cautioned plan's verdict already names the files kept as they are.
+          const cautioned =
+            !run &&
+            plan !== undefined &&
+            plan !== 'loading' &&
+            (!plan.fits || (plan.gated.files.length > 0 && !plan.gated.tokenPresent))
+          const keptAsIs = cautioned ? [] : cat.installed.files.filter((f) => f.conflict && loads(row.def, f.filename))
+          const failed = askFailed[id]
           return (
             <li key={row.def.id} className="py-2">
               <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
@@ -293,6 +343,12 @@ export function CataloguePanel({
                   {cat.incomplete?.length ? ` No verified download exists for ${cat.incomplete.join(', ')}; that file has to be placed by hand.` : ''}
                 </p>
               ) : null}
+              {keptAsIs.map((f) => (
+                <p key={f.filename} className="mt-0.5 text-caption text-grey-700">
+                  {f.filename} is on disk {sizeAgainstCatalogue(f)}. {NOT_THE_CATALOGUES} It is used as it is, and
+                  the catalogue’s own is not fetched. {TO_FETCH_IT}
+                </p>
+              ))}
 
               {run && (run.state === 'starting' || run.state === 'running') ? (
                 <div className="mt-1">
@@ -322,17 +378,12 @@ export function CataloguePanel({
                   {plan.blockers.map((b) => (
                     <p key={b} className="text-caption text-grey-700">{b}</p>
                   ))}
-                  {plan.gated.files.length && !plan.gated.tokenPresent ? (
-                    <p className="text-caption text-grey-700">
-                      {plan.gated.files.join(', ')} {plan.gated.files.length === 1 ? 'is' : 'are'} gated on HuggingFace and no
-                      token is on the server, so the fetch would be refused.
-                    </p>
-                  ) : null}
+                  {noToken(plan) ? <p className="text-caption text-grey-700">{noToken(plan)}</p> : null}
                   {plan.incomplete.length ? null : (
                     <p className="text-caption">
                       <Link
                         onClick={() => {
-                          if (window.confirm(`The server says this will not fit. Fetch ${row.def.label} anyway?`)) {
+                          if (window.confirm(`${heldBack(plan)}\n\nFetch ${row.def.label} anyway?`)) {
                             startPlan({ family: id, model: plan.chosenModel, force: true })
                           }
                         }}
@@ -343,13 +394,16 @@ export function CataloguePanel({
                   )}
                 </div>
               ) : (
-                <p className="mt-1 text-caption">
-                  {cat.incomplete?.length ? null : (
-                    <Link onClick={() => ask(row)}>
-                      Fetch {files.length === 1 ? 'the file' : `${files.length} files`} ({bytesText(cat.installed.missingBytes)})
-                    </Link>
-                  )}
-                </p>
+                <>
+                  {failed ? <p className="mt-1 text-caption text-ink-error">{failed}</p> : null}
+                  <p className="mt-1 text-caption">
+                    {cat.incomplete?.length ? null : (
+                      <Link onClick={() => ask(row)}>
+                        Fetch {files.length === 1 ? 'the file' : `${files.length} files`} ({bytesText(cat.installed.missingBytes)})
+                      </Link>
+                    )}
+                  </p>
+                </>
               )}
             </li>
           )
@@ -371,9 +425,32 @@ export function CataloguePanel({
           </ul>
         </div>
       ) : null}
+
+      {[...usedAsIs.values()].map(({ file, labels }) => (
+        <p key={file.filename} className="mt-2 text-caption text-grey-700">
+          {labels.join(', ')} {labels.length === 1 ? 'uses' : 'use'} {file.filename} as it is on disk,{' '}
+          {sizeAgainstCatalogue(file)}. {NOT_THE_CATALOGUES} {TO_FETCH_IT}
+        </p>
+      ))}
     </section>
   )
 }
+
+// A same-name file of another size, which the server counts as installed and
+// will not fetch over. On a row it explains why the row's list and size leave
+// the file out; under the list it names what installed families load. Both
+// say the size is all that was compared: nothing here loads the file.
+
+/** `at 5.2 GB, where the catalogue lists 7.5 GB`. */
+function sizeAgainstCatalogue(f: CatalogFile): string {
+  return `at ${bytesText(f.installedBytes)}${f.sizeBytes ? `, where the catalogue lists ${bytesText(f.sizeBytes)}` : ''}`
+}
+
+const NOT_THE_CATALOGUES =
+  'It is not a fetch that stopped part way, so it is probably another build under the same name, and nothing ' +
+  'here has checked that it loads.'
+
+const TO_FETCH_IT = 'To fetch the catalogue’s own, move this file aside first.'
 
 /** The files a family lacks, named for placing by hand. */
 function Needs({ def, lack }: { def: FamilyDef; lack: Lack }) {

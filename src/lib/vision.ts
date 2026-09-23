@@ -384,15 +384,15 @@ function whyFor(entry: LoraIndexEntry, conf: SuggestionConfidence, evidence: Sug
   const defining = evidence.filter(e => e.defining).map(e => e.tag)
   const top = evidence.slice(0, 3).map(e => e.tag)
   if (conf === 'strong') {
-    return `The picture shows ${defining.slice(0, 3).join(', ')}, which is what this LoRA was trained on.`
+    return `The picture shows ${defining.slice(0, 3).join(', ')}, which is what this add-on was trained on.`
   }
   if (conf === 'likely') {
-    return `The picture shows ${defining[0]}, one of the things this LoRA was trained on.`
+    return `The picture shows ${defining[0]}, one of the things this add-on was trained on.`
   }
   if (entry.triggers.length && !defining.length) {
     // The good-hands-for-pony case. Say plainly that the overlap is not proof.
     return `Its training set overlaps this picture on ${top.join(', ')}, but those tags do not describe what ` +
-      `this LoRA is for, so treat this as a loose suggestion.`
+      `this add-on is for, so treat this as a loose suggestion.`
   }
   return `Loose overlap only, on ${top.join(', ')}.`
 }
@@ -438,7 +438,7 @@ function suggestLorasForTags(
         file: v.entry.file,
         stem: v.entry.stem,
         needed: v.defining.slice(0, 4),
-        why: `Nothing in the picture matches what this LoRA was trained on (${v.defining.slice(0, 3).join(', ')}).`,
+        why: `Nothing in the picture matches what this add-on was trained on (${v.defining.slice(0, 3).join(', ')}).`,
       })
       continue
     }
