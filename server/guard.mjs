@@ -329,6 +329,32 @@ export function proxyWriteGuard(prefix) {
   }
 }
 
+/**
+ * Make the browser ask ComfyUI before it reuses a generated file.
+ *
+ * ComfyUI answers /view with an ETag and a Last-Modified but no
+ * Cache-Control: its cache middleware looks for an image extension at the end
+ * of the path, and on /view the file's name sits in the query string. A
+ * response with a date and no Cache-Control is one a browser may reuse
+ * without asking, for a share of the file's age. A file is addressed by its
+ * name, and ComfyUI hands the name of a deleted newest file to the next
+ * render, so a clip played from that copy could be the file that was deleted.
+ * The service worker asks for pictures with `no-cache`, but it leaves a clip's
+ * ranged requests to the browser untouched, so the answer itself has to say
+ * so. `no-cache` still lets the browser keep the file: an unchanged one comes
+ * back as a 304 with no body, and ranges work as before. An answer that
+ * already says something (ComfyUI marks risky file types `no-store`) keeps
+ * what it says.
+ *
+ * A listener for the proxy's `proxyRes` event. `req.url` there is the path
+ * ComfyUI was asked for, after the proxy's rewrite took off `/comfy`.
+ */
+export function revalidateFiles(proxyRes, req) {
+  const url = String(req?.url ?? '')
+  if (!/^\/(api\/)?view(\?|$)/.test(url)) return
+  if (proxyRes.headers['cache-control'] === undefined) proxyRes.headers['cache-control'] = 'no-cache'
+}
+
 // ------------------------------------------------------------------- tools --
 
 /** The binaries the servers spawn. One definition, overridable per binary. */

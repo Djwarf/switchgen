@@ -18,7 +18,9 @@
  *                     what is on disk now. The cache keeps the archive
  *                     browsable when the connection drops. A clip a player
  *                     streams in byte ranges is left to the browser, and
- *                     is not kept.
+ *                     is not kept. The proxy marks every /view answer to be
+ *                     checked before reuse (revalidateFiles in
+ *                     server/guard.mjs), so the browser asks about a clip too.
  *   /api/thumb?...    The one /api path kept, by the same rule and for the
  *                     same reason: a thumbnail is named by its file, so the
  *                     server is asked first every time, and it answers from
@@ -102,7 +104,11 @@ self.addEventListener('fetch', (event) => {
     // cache setting below) rebuilds its headers under the no-cors rules, and
     // those drop Range: every seek fetched the whole clip again, and every
     // clip opened was kept whole in the media cache. So a ranged request, and
-    // anything a media element asks for, goes to the browser untouched.
+    // anything a media element asks for, goes to the browser untouched. The
+    // `no-cache` below is lost with it, which is why the server marks /view
+    // answers `no-cache` itself (vite.config.ts): the browser still asks
+    // before it plays a copy it holds, so a clip whose name was reused is not
+    // played from a copy of the deleted one.
     if (request.headers.has('range') || request.destination === 'video' || request.destination === 'audio') return
     const name = thumb ? THUMBS : MEDIA
     const max = thumb ? THUMBS_MAX : MEDIA_MAX

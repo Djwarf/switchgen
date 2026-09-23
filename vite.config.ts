@@ -3,7 +3,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import type { IncomingMessage } from 'node:http'
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, type HttpProxy, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { switchgenApi } from './server/api.mjs'
@@ -13,7 +13,7 @@ import { switchgenReel } from './server/reel.mjs'
 import { switchgenThumbs } from './server/thumbs.mjs'
 import { switchgenVision } from './server/vision.mjs'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
-import { proxyWriteGuard, upgradeAllowed } from './server/guard.mjs'
+import { proxyWriteGuard, revalidateFiles, upgradeAllowed } from './server/guard.mjs'
 
 // ComfyUI runs as a systemd user service on :8188.
 // Proxy through Vite so the browser sees one origin (no CORS, no mixed content).
@@ -39,9 +39,15 @@ const proxy = {
   // Writes here are checked for origin before they reach this entry, by
   // guardComfyWrites below: the Origin rewrite hides the sending page from
   // ComfyUI's own check.
+  //
+  // ComfyUI sends generated files with no Cache-Control, which lets a browser
+  // play a deleted clip back from its own copy under a name that has since
+  // been reused. The answers for files are marked to be checked with the
+  // server first (see revalidateFiles in server/guard.mjs).
   '/comfy': {
     target: COMFY, changeOrigin: true, headers,
     rewrite: (p: string) => p.replace(/^\/comfy/, ''),
+    configure: (p: HttpProxy.ProxyServer) => { p.on('proxyRes', revalidateFiles) },
   },
 }
 

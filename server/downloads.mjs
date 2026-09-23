@@ -234,6 +234,11 @@ function annotateFamily(fam, cat, index, wantModel, include = []) {
   const optional = all.filter(f => !required(f) && !models.has(f.filename))
   const missing = files.filter(f => !f.installed)
   const missingBytes = missing.reduce((a, f) => a + (f.sizeBytes ?? 0), 0)
+  // Files on disk under the catalogue's name that are not the catalogue's
+  // (see annotateDep). They count as installed, because nothing is fetched
+  // over them, but they are not known to load, so the verdict and the panel
+  // are told which they are instead of hearing the family is complete.
+  const asIs = files.filter(f => f.conflict).map(f => f.filename)
   // requiresBytes was computed by the group agents for the family's default
   // weight. Pick a different variant and that number stops being true, so fall
   // back to the real sum of the files this configuration actually loads.
@@ -252,7 +257,9 @@ function annotateFamily(fam, cat, index, wantModel, include = []) {
     fileCount: files.length,
     missing: missing.map(f => f.filename),
     missingBytes,
+    // Nothing is left to fetch. Not a promise that it runs: see asIs.
     ready: missing.length === 0 && !(fam.incomplete?.length),
+    asIs,
     gatedMissing: missing.filter(f => f.gated).map(f => f.filename),
   }
 }
@@ -292,7 +299,10 @@ function fitVerdict(fam, ann, hw) {
     } else {
       reasons.push(`Download is ${human(ann.missingBytes)} against ${human(disk.free)} free disk.`)
     }
-  } else if (!ann.missingBytes) {
+  } else if (!ann.missing.length && !ann.asIs.length) {
+    // Asked of the files, not the bytes: a file the catalogue has no size for
+    // adds nothing to missingBytes, and is still missing. With files used as
+    // they are, the verdict's opening says what is on disk instead.
     reasons.push('Every file this family needs is already on disk.')
   }
 
@@ -327,11 +337,29 @@ function fitVerdict(fam, ann, hw) {
 
   const fits = blockers.length === 0
   const gatedMissing = ann.gatedMissing.length
+  // "Ready to run" is said only when every file is the catalogue's own. A
+  // file of another size under the same name is on disk and will be loaded,
+  // but nothing here has loaded it, so the opening says so rather than
+  // leaving it to a reason further on.
+  const asIs = ann.asIs.length
+  const onDisk = asIs
+    ? `Every file is on disk, but ${asIs === 1 ? '1 of them is' : `${asIs} of them are`} not the size the ` +
+      `catalogue lists. ${asIs === 1 ? 'It is' : 'They are'} used as ${asIs === 1 ? 'it is' : 'they are'}, and ` +
+      `nothing here has checked that ${asIs === 1 ? 'it loads' : 'they load'}.`
+    : 'Ready to run: every file is already installed.'
+  // A file the catalogue has no size for adds nothing to missingBytes, so the
+  // total is said to leave it out rather than printed as if it were whole.
+  const unsized = ann.files.filter(f => !f.installed && f.sizeBytes == null).length
+  const fetchSize = !unsized
+    ? human(ann.missingBytes)
+    : ann.missingBytes
+      ? `${human(ann.missingBytes)} and ${unsized} of unlisted size`
+      : 'size not listed'
   const verdict = fits
     ? (ann.missing.length === 0
-        ? `Ready to run: every file is already installed. ${reasons.join(' ')}`
+        ? `${onDisk} ${reasons.join(' ')}`
         : `Fits this machine. ${ann.missing.length} file${ann.missing.length === 1 ? '' : 's'} to fetch, ` +
-          `${human(ann.missingBytes)}. ${reasons.join(' ')}` +
+          `${fetchSize}. ${reasons.join(' ')}` +
           (gatedMissing
             ? ` ${gatedMissing} of them ${gatedMissing === 1 ? 'is' : 'are'} gated and need${gatedMissing === 1 ? 's' : ''} a HuggingFace token.`
             : ''))
@@ -807,6 +835,8 @@ export const downloadsMiddleware = async (req, res, next) => {
         })),
         totalBytes: ann.missingBytes,
         alreadyInstalled: ann.files.filter(f => f.installed).map(f => f.filename),
+        // The ones among them that are not the catalogue's file, used as they are.
+        asIs: ann.asIs,
         incomplete: fam.incomplete ?? [],
         gated: { files: ann.gatedMissing, tokenPresent: !!token },
         hardware: {

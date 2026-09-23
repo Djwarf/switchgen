@@ -2,7 +2,12 @@
 #
 #   mkdir -p ~/.config/systemd/user
 #   cp contrib/comfyui.service ~/.config/systemd/user/
-#   edit the two paths below
+#
+# Then change the two paths below in the copy, %h/ComfyUI and %h/ai/outputs,
+# and only after that enable it. With paths that are wrong for this machine
+# it fails to start, and Restart=always tries again every five seconds for as
+# long as it is enabled.
+#
 #   systemctl --user daemon-reload && systemctl --user enable --now comfyui
 #
 # --output-directory must match SWITCHGEN_OUTPUTS, and the models root must be

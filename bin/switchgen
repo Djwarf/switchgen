@@ -59,12 +59,19 @@ ensure_comfy() {
       echo "The app will open anyway and retry every few seconds."
     fi
   else
+    # The enable step is a block of its own, after the edit. In one block
+    # with the copy, pasting it enabled the unit as shipped, and where its
+    # paths are wrong it fails to start and Restart=always tries again every
+    # five seconds.
     cat >&2 <<MSG
 ComfyUI is not answering at $COMFY_URL and there is no user service to start.
 Start it yourself (see README.md, "Install ComfyUI"), or install the sample
-unit, editing the two paths in the copy before enabling it:
+unit. First copy it:
   mkdir -p ~/.config/systemd/user
   cp "$APP/contrib/comfyui.service" ~/.config/systemd/user/
+Then, in ~/.config/systemd/user/comfyui.service, change %h/ComfyUI to the
+folder ComfyUI is in and %h/ai/outputs to the folder SWITCHGEN_OUTPUTS
+names. Only after that, enable it:
   systemctl --user daemon-reload && systemctl --user enable --now comfyui
 The app will open anyway and retry every few seconds.
 MSG
