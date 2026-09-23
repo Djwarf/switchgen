@@ -159,6 +159,22 @@ describe('waiting for an idle ComfyUI before a release', () => {
     stop.abort()
     expect(await idle).toBe(false)
   })
+
+  it('notices a stop that lands while the queue is being read, without sleeping first', async () => {
+    vi.useFakeTimers()
+    let answer: (r: Response) => void = () => {}
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { answer = resolve })))
+    const stop = new AbortController()
+    const heard: number[] = []
+    let settled: boolean | null = null
+    void waitForIdleComfy(stop.signal, (n) => heard.push(n)).then((v) => { settled = v })
+    await vi.advanceTimersByTimeAsync(0)
+    stop.abort()
+    answer(queue(1, 0))
+    await vi.advanceTimersByTimeAsync(10)
+    expect(settled).toBe(false)
+    expect(heard).toEqual([])
+  })
 })
 
 describe('feasibility: what a family costs in memory', () => {

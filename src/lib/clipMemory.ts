@@ -215,8 +215,12 @@ export async function waitForIdleComfy(
       return true
     }
     if (ahead === 0) return true
+    // A stop that landed while the queue was being read has already fired its
+    // abort event, so the sleep below would never hear it: check it here.
+    if (signal?.aborted) return false
     onWait?.(ahead)
     await new Promise<void>((resolve) => {
+      if (signal?.aborted) return resolve()
       const t = setTimeout(resolve, 2000)
       signal?.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
     })
