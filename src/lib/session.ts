@@ -108,6 +108,43 @@ export const store = {
   },
 }
 
+/**
+ * sessionStorage, with the same care as `store`.
+ *
+ * It belongs to one tab: it outlives a reload of that tab and no other tab
+ * ever reads it. That is what the Video desk needs for clips waiting to be
+ * sent (see routes/Video.tsx), which must come back after a reload and must
+ * never be sent by a second tab. There is no memory fallback, because the
+ * only point of writing here is to outlive the page, which memory cannot.
+ */
+export const tabStore = {
+  get(key: string): string | null {
+    try {
+      return sessionStorage.getItem(key)
+    } catch {
+      return null
+    }
+  },
+
+  /** @returns false when the tab would not keep it. */
+  set(key: string, value: string): boolean {
+    try {
+      sessionStorage.setItem(key, value)
+      return true
+    } catch {
+      return false
+    }
+  },
+
+  remove(key: string): void {
+    try {
+      sessionStorage.removeItem(key)
+    } catch {
+      /* nothing was kept, so nothing is left behind */
+    }
+  },
+}
+
 /** True for the several spellings browsers use for a full quota. */
 export function isQuotaError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false

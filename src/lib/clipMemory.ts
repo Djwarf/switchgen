@@ -23,13 +23,19 @@
  * no room for the clip itself.
  *
  * The image-to-video pair always loads an add-on on each half, and it is
- * worse. With both, 81 frames at 832 x 480 was killed in three runs out of
- * three, each as the decoder loaded beside the two experts, so inside the one
- * run and out of reach of any release. 49 frames came through once, and was
- * killed once with an add-on on only one half. The registry calls the pair
- * not reliable on 30 GB and names the 5B as the model for a clip from a start
- * frame. So anything larger than 49 frames at 832 x 480 is refused, and
- * anything else is cautioned, never simply let through.
+ * worse. The registry lists one result for each setting it tried, by length
+ * and add-on count and not by size: with both add-ons 81 frames was killed
+ * and 49 frames came through, and with an add-on on only one half 49 frames
+ * was killed. The kills came 11 to 12 seconds after ComfyUI began loading the
+ * decoder beside the two experts, so inside the run and out of reach of any
+ * release. It also speaks of three runs all killed, beside the one that came
+ * through, so how often 81 frames was tried is not clear: the copy gives no
+ * count and no size for those runs, and a clip is measured against the
+ * pair's default size, 832 x 480, which the copy names as such. The registry
+ * calls the pair not reliable on 30 GB, warns that the one success is no
+ * proof 49 frames is safe, and names the 5B as the model for a clip from a
+ * start frame. So anything larger than 49 frames at 832 x 480 is refused,
+ * and anything else is cautioned, never simply let through.
  *
  * Neither pair was measured with anything on the rack, and the registry says
  * of a clip already at 28.1 GB that any addition tips it. Add-ons the reader
@@ -51,7 +57,11 @@ const MEASURED_RAM_GB = 30.5
 const SURVIVED: Point = { width: 832, height: 480, frames: 49, peakGb: 20 }
 const EDGE: Point = { width: 832, height: 480, frames: 81, peakGb: 28.1 }
 
-/** The image-to-video pair, with its own add-on on each half. */
+/**
+ * The image-to-video pair, with its own add-on on each half. Only the frame
+ * counts are recorded; the size is the pair's default, which the runs are
+ * taken to have used.
+ */
 const I2V_ID = 'wan22-14b-i2v'
 const I2V_CAME_THROUGH: Point = { width: 832, height: 480, frames: 49 }
 const I2V_KILLED: Point = { width: 832, height: 480, frames: 81 }
@@ -146,27 +156,28 @@ function textToVideo(size: number, rack: boolean, roomier: number | null): ClipM
  */
 function imageToVideo(size: number, rack: boolean, roomier: number | null): ClipMemory {
   const larger = size > pixelFrames(I2V_CAME_THROUGH)
-  const record = `On a ${MEASURED_RAM_GB} GB machine this pair was killed at ${at(I2V_KILLED)} three times out of three, each as its final decode began, and ${at(I2V_CAME_THROUGH)} came through once.`
+  const killed = `${I2V_KILLED.frames} frames`
+  const cameThrough = `${I2V_CAME_THROUGH.frames} frames`
+  const record = `On a ${MEASURED_RAM_GB} GB machine this pair, with an add-on on each half, was killed at ${killed} as its final decode began, and came through once at ${cameThrough}.`
+  const largerThan = `This clip is larger than ${at(I2V_CAME_THROUGH)}, the pair's default size.`
 
   if (roomier !== null) {
     if (!larger && !rack) return { level: 'ok', reason: null, release: true }
     return caution(
-      `${record}${larger ? ' This clip is larger than that.' : ''}${rack ? ' The add-ons on the rack load on top of the one it already carries on each half.' : ''} ${unmeasured(roomier)}`,
+      `${record}${larger ? ` ${largerThan}` : ''}${rack ? ' The add-ons on the rack load on top of the one it already carries on each half.' : ''} ${unmeasured(roomier)}`,
     )
   }
 
   if (larger) {
-    return refuse(
-      `Too large for memory. ${record} This clip is larger than the one that came through. Shorten it, or use ${SAFER_I2V}.`,
-    )
+    return refuse(`Too large for memory. ${record} ${largerThan} Shorten it, or use ${SAFER_I2V}.`)
   }
   if (rack) {
     return refuse(
-      `Too much for memory with add-ons. This pair already loads an add-on on each half. With those alone it was killed at ${at(I2V_KILLED)} three times out of three, and with only one of them it was killed at ${at(I2V_CAME_THROUGH)}. Anything on the rack loads on top. Take the add-ons off, or use ${SAFER_I2V}.`,
+      `Too much for memory with add-ons. This pair already loads an add-on on each half. With those alone it was killed at ${killed}, and with only one of them it was killed at ${cameThrough}. Anything on the rack loads on top. Take the add-ons off, or use ${SAFER_I2V}.`,
     )
   }
   return caution(
-    `This pair is not reliable on a ${MEASURED_RAM_GB} GB machine. At ${at(I2V_CAME_THROUGH)} it came through once, and was killed once with an add-on on only one half. At ${at(I2V_KILLED)} it was killed three times out of three, each as its final decode began, which releasing cached models first does not prevent. For a clip from a start frame the safer choice is ${SAFER_I2V}.`,
+    `This pair is not reliable on a ${MEASURED_RAM_GB} GB machine. At ${cameThrough} it came through once, and was killed once with an add-on on only one half. At ${killed} it was killed as its final decode began, while its own two models were loaded, and a release before the run cannot unload those. For a clip from a start frame the safer choice is ${SAFER_I2V}.`,
   )
 }
 

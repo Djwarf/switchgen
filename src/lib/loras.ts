@@ -145,7 +145,7 @@ export const ARCH_LABEL: Record<LoraArch, string> = {
   'wan-1.3b': 'Wan 2.1 1.3B',
   hunyuan: 'HunyuanVideo',
   ltxv: 'LTX-Video',
-  unknown: 'no verified base',
+  unknown: 'model not known',
 }
 
 /**
@@ -207,7 +207,7 @@ export const CATEGORY_NOTE: Record<LoraCategory, string> = {
   'flux1d-no-base':
     'Trained for Flux.1 dev, which is not installed here. Listed so they are not downloaded twice by mistake.',
   other:
-    'Files somebody put in the LoRA folder by hand. No verified base, so no compatibility claim is made about them.',
+    'Files somebody put in the add-ons folder by hand. Nobody has checked which model they were made for, so no claim is made about what they fit.',
 }
 
 export type LoraUsage = 'base' | 'refine' | 'both'
@@ -510,7 +510,7 @@ const LORA_CATALOGUE: readonly CatalogueEntry[] = [
     category: "anatomy",
     priority: 3,
     bases: ["ponyDiffusionV6XL.safetensors"],
-    trigger: "## 🧠 Usage (Python)",
+    trigger: "",
     recommended: 0.65,
     slider: false,
     usage: "both",
@@ -601,7 +601,7 @@ const LORA_CATALOGUE: readonly CatalogueEntry[] = [
     priority: 3,
     bases: ["ponyDiffusionV6XL.safetensors"],
     claims: ["illustrious"],
-    trigger: "## 🧠 Usage (Python)",
+    trigger: "",
     recommended: 1.0,
     slider: true,
     usage: "both",
@@ -1068,7 +1068,7 @@ const LORA_CATALOGUE: readonly CatalogueEntry[] = [
     category: "anime",
     priority: 3,
     bases: ["semiRealIllustrious_v40", "waiMatureIllustrious_v30", "NoobAI-XL-v1.1.safetensors"],
-    trigger: "## 🧠 Usage (Python)",
+    trigger: "",
     recommended: 1.0,
     slider: true,
     usage: "both",
@@ -1083,7 +1083,7 @@ const LORA_CATALOGUE: readonly CatalogueEntry[] = [
     priority: 3,
     bases: ["semiRealIllustrious_v40", "waiMatureIllustrious_v30", "NoobAI-XL-v1.1.safetensors"],
     claims: ["pony"],
-    trigger: "## 🧠 Usage (Python)",
+    trigger: "",
     recommended: 0.6,
     slider: false,
     usage: "both",
@@ -1518,7 +1518,7 @@ function infoFromDisk(f: ModelFile): LoraInfo {
     does: read
       ? `Not in the verified catalogue. The shapes in the file's own header are ${ARCH_LABEL[read]}, so that is the only size of Wan it works on.`
       : guess === 'unknown'
-        ? 'Not in the verified catalogue, and the filename says nothing about its base. It is offered without a compatibility claim.'
+        ? 'Not in the verified catalogue, and the filename says nothing about which model it was made for. It is offered without a claim about what it fits.'
         : `Not in the verified catalogue. The filename suggests ${ARCH_LABEL[guess]}, which is a guess rather than a read of the file.`,
   }
 }
@@ -1701,9 +1701,15 @@ export function fitFor(info: LoraInfo, target: LoraTarget): Fit {
     }
   }
   if (info.claims.some(c => ARCH_ALIAS[c.toLowerCase()] === target.arch)) {
+    if (info.arch === 'unknown') {
+      return {
+        level: 'untested',
+        why: `The model card claims ${ARCH_LABEL[target.arch]}, and nobody has checked the file itself. Try it at low strength and watch one picture.`,
+      }
+    }
     return {
       level: 'untested',
-      why: `The model card also claims ${ARCH_LABEL[target.arch]}, but the file's own base tag says ${ARCH_LABEL[info.arch]}. It will load. Whether it helps here has not been checked.`,
+      why: `The model card also claims ${ARCH_LABEL[target.arch]}, but the file's own notes say it was made for ${ARCH_LABEL[info.arch]}. It will load. Whether it helps here has not been checked.`,
     }
   }
   if (SDXL_LINEAGE.has(info.arch) && SDXL_LINEAGE.has(target.arch)) {
@@ -1715,7 +1721,7 @@ export function fitFor(info: LoraInfo, target: LoraTarget): Fit {
   if (info.arch === 'unknown') {
     return {
       level: 'untested',
-      why: 'No verified base for this file. It may do nothing, or it may do damage. Try it at low strength and watch one picture.',
+      why: 'Nobody has checked which model this file was made for. It may do nothing, or it may do damage. Try it at low strength and watch one picture.',
     }
   }
   return {
@@ -1975,7 +1981,7 @@ export function resolveStack(
     const info = lib.byFile.get(e.file)
     const label = info?.label ?? titleOf(e.file)
     if (!info) {
-      dropped.push({ file: e.file, label, why: 'No longer in the LoRA folder.' })
+      dropped.push({ file: e.file, label, why: 'No longer in the add-ons folder.' })
       continue
     }
     if (!info.installed) {

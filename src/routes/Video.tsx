@@ -100,6 +100,7 @@ import {
   recordOf,
   reuseIntoDesk,
   settings,
+  tabStore,
   toParams,
   type Composition,
   type FamilyDefaults,
@@ -743,6 +744,176 @@ let releaseLane: Promise<void> = Promise.resolve()
 /** Clips still waiting their turn, so Stop can call the wait off. */
 const waiting = new Map<string, AbortController>()
 
+/**
+ * The lane, kept for this tab.
+ *
+ * A clip waiting in the lane has not reached ComfyUI, so nothing on the
+ * server knows about it. A clip in ComfyUI's queue outlives the page that
+ * sent it; one waiting here would vanish with a reload, without a trace. So
+ * from the moment a clip joins the lane until the moment before its prompt
+ * goes, it is written to this tab's session storage, with the graph as it
+ * was built and everything its record will say, and the next page in the
+ * tab puts it back in the lane in the same order.
+ *
+ * Session storage, not local storage, because it belongs to the tab: no other
+ * tab reads it, so two tabs can never both send one clip. The one way a tab
+ * gets another's copy is by being duplicated from it, while that tab is
+ * still sending. So a page takes a saved lane up by itself only when the page
+ * that wrote it said, as it went, that it was going (pagehide), or the browser
+ * discarded the tab. Anything else, such as a copied tab or a page that
+ * crashed, is shown on the desk for the reader to send or forget, never sent
+ * on a guess and never dropped without a word.
+ *
+ * Closing the tab still loses what waits, so while anything waits the page
+ * asks the browser to check with the reader before it goes (a browser may
+ * skip that on a page nobody has pressed anything on yet), and the desk says
+ * where waiting clips live.
+ */
+const LANE_KEY = 'switchgen.videolane.v1'
+/** Clips an earlier page left that this page would not send by itself. */
+const LEFT_KEY = 'switchgen.videolane.v1.left'
+/** This page, so a page back from the browser's cache can tell whether a later one took its lane. */
+const PAGE = globalThis.crypto?.randomUUID?.() ?? `page_${Date.now()}_${Math.random().toString(36).slice(2)}`
+
+/** One clip waiting in the lane, with what a later page needs to send and file it. */
+export type LaneClip = {
+  id: string
+  startedAt: number
+  composition: Composition
+  graph: ApiWorkflow
+  familyLabel: string
+  modelLabel: string
+  loras?: HistoryEntry['loras']
+}
+
+/** This page's waiting clips, oldest first. */
+let laneClips: LaneClip[] = []
+/** What an earlier page left and this one did not take up by itself. */
+let leftOver: LaneClip[] = []
+/** False when the tab would not keep the last write, so a reload would lose the lane. */
+let laneKept = true
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+function isLaneClip(v: unknown): v is LaneClip {
+  return (
+    isObj(v) &&
+    typeof v.id === 'string' &&
+    typeof v.startedAt === 'number' &&
+    isObj(v.composition) &&
+    isObj(v.graph) &&
+    typeof v.familyLabel === 'string' &&
+    typeof v.modelLabel === 'string' &&
+    (v.loras === undefined || Array.isArray(v.loras))
+  )
+}
+
+/** A saved lane as written, or null when there is none or it cannot be read. */
+function readLane(raw: string | null): { writer: string; released: boolean; clips: LaneClip[] } | null {
+  let v: unknown
+  try {
+    v = JSON.parse(raw ?? 'null')
+  } catch {
+    return null
+  }
+  if (!isObj(v) || !Array.isArray(v.clips)) return null
+  return {
+    writer: typeof v.writer === 'string' ? v.writer : '',
+    released: v.released === true,
+    clips: v.clips.filter(isLaneClip),
+  }
+}
+
+function stayPut(e: BeforeUnloadEvent): void {
+  e.preventDefault()
+}
+
+let holding = false
+function holdPage(on: boolean): void {
+  if (typeof window === 'undefined' || on === holding) return
+  holding = on
+  if (on) window.addEventListener('beforeunload', stayPut)
+  else window.removeEventListener('beforeunload', stayPut)
+}
+
+/** Write this page's lane, or clear it when nothing waits. `released` says the page is going. */
+function saveLane(released = false): void {
+  if (laneClips.length) {
+    laneKept = tabStore.set(LANE_KEY, JSON.stringify({ writer: PAGE, released, clips: laneClips }))
+  } else {
+    tabStore.remove(LANE_KEY)
+    laneKept = true
+  }
+  holdPage(laneClips.length > 0)
+}
+
+function saveLeftOver(): void {
+  if (leftOver.length) tabStore.set(LEFT_KEY, JSON.stringify({ clips: leftOver }))
+  else tabStore.remove(LEFT_KEY)
+}
+
+function joinSavedLane(clip: LaneClip): void {
+  laneClips = [...laneClips, clip]
+  saveLane()
+}
+
+/** Sent, stopped or failed: nothing is left for a later page to pick up. */
+function leaveSavedLane(id: string): void {
+  if (!laneClips.some((c) => c.id === id)) return
+  laneClips = laneClips.filter((c) => c.id !== id)
+  saveLane()
+}
+
+/** Put a saved clip back in the lane, as it was when it was made. */
+function resumeClip(c: LaneClip): void {
+  startJob({
+    id: c.id,
+    startedAt: c.startedAt,
+    composition: c.composition,
+    graph: c.graph,
+    familyLabel: c.familyLabel,
+    modelLabel: c.modelLabel,
+    loras: c.loras,
+    release: true,
+    note: 'Picked up from the page before this one.',
+  })
+}
+
+/**
+ * Take in what the last page in this tab left, once, when the module loads.
+ * The saved lane is cleared either way: taken up, it is written again as
+ * this page's own; left alone, it moves to the desk's question, so a copy
+ * that another tab is sending can never be taken up later by accident.
+ */
+function restoreLane(): void {
+  const saved = readLane(tabStore.get(LANE_KEY))
+  const left = readLane(tabStore.get(LEFT_KEY))
+  tabStore.remove(LANE_KEY)
+  leftOver = left?.clips ?? []
+  if (saved?.clips.length) {
+    const discarded =
+      typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
+    if (saved.released || discarded) for (const c of saved.clips) resumeClip(c)
+    else leftOver = [...leftOver, ...saved.clips.filter((c) => !leftOver.some((l) => l.id === c.id))]
+  }
+  saveLeftOver()
+}
+
+/** Send what an earlier page left, from this page, at the reader's word. */
+function sendLeftOver(): void {
+  const clips = leftOver
+  leftOver = []
+  saveLeftOver()
+  for (const c of clips) resumeClip(c)
+  announce()
+}
+
+function forgetLeftOver(): void {
+  leftOver = []
+  saveLeftOver()
+  announce()
+}
+
 /** Resolves true when `p` settles, or false as soon as `signal` aborts. */
 function unlessStopped(p: Promise<void>, signal: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
@@ -793,6 +964,23 @@ export const videoJobs = {
   snapshot: (): VideoJob[] => jobs,
   running: (): VideoJob | null => jobs.find((j) => j.status === 'running') ?? null,
   pending: (): VideoJob[] => jobs.filter(unfinished),
+  /** Clips an earlier page in this tab left waiting, which this page will not send by itself. */
+  leftOver: (): LaneClip[] => leftOver,
+  sendLeftOver,
+  forgetLeftOver,
+  /** False when this tab would not keep the waiting clips, so a reload would lose them. */
+  laneKept: (): boolean => laneKept,
+  /** Clips in this page's lane that have not been sent yet. */
+  waitingCount: (): number => laneClips.length,
+}
+
+/**
+ * Stop one clip from outside the desk, as the section bar does. It is the
+ * desk's own stop, so a clip still waiting in the lane is called off before
+ * it is ever sent, where cancelling a prompt could not reach it: it has none.
+ */
+export function stopVideoJob(id: string): void {
+  void stopJob(id)
 }
 
 function dismissJob(id: string): void {
@@ -829,10 +1017,15 @@ type StartOptions = {
   loras?: HistoryEntry['loras']
   /** Release ComfyUI's cached models immediately before queueing. See lib/clipMemory.ts. */
   release?: boolean
+  /** A clip put back in the lane by a later page keeps its id and the time it was made. */
+  id?: string
+  startedAt?: number
+  /** Said under the clip until its wait says something of its own. */
+  note?: string
 }
 
 function startJob(opts: StartOptions): string {
-  const id = globalThis.crypto?.randomUUID?.() ?? `job_${Date.now()}_${Math.random().toString(36).slice(2)}`
+  const id = opts.id ?? globalThis.crypto?.randomUUID?.() ?? `job_${Date.now()}_${Math.random().toString(36).slice(2)}`
   const job: VideoJob = {
     id,
     promptId: null,
@@ -844,7 +1037,7 @@ function startJob(opts: StartOptions): string {
     max: 0,
     stage: 'Sending it to the press',
     previewUrl: null,
-    startedAt: Date.now(),
+    startedAt: opts.startedAt ?? Date.now(),
     samplingAt: null,
     finishedAt: null,
     error: null,
@@ -859,8 +1052,30 @@ function startJob(opts: StartOptions): string {
     queuePos: null,
     cancelRequested: false,
     release: !!opts.release,
-    waitNote: null,
+    waitNote: opts.note ?? null,
   }
+
+  // Taken in the same tick the job is made, so clips made together keep
+  // their order in the lane, and saved for this tab before the desk hears of
+  // the clip (see LANE_KEY).
+  let leaveLane = () => {}
+  let turn: Promise<void> = Promise.resolve()
+  if (opts.release) {
+    turn = releaseLane
+    releaseLane = new Promise<void>((resolve) => {
+      leaveLane = resolve
+    })
+    joinSavedLane({
+      id,
+      startedAt: job.startedAt,
+      composition: opts.composition,
+      graph: opts.graph,
+      familyLabel: opts.familyLabel,
+      modelLabel: opts.modelLabel,
+      ...(opts.loras ? { loras: opts.loras } : {}),
+    })
+  }
+
   jobs = [job, ...jobs]
   announce()
 
@@ -896,17 +1111,6 @@ function startJob(opts: StartOptions): string {
     }
   }
 
-  // Taken in the same tick the job is made, so clips made together keep
-  // their order in the lane.
-  let leaveLane = () => {}
-  let turn: Promise<void> = Promise.resolve()
-  if (opts.release) {
-    turn = releaseLane
-    releaseLane = new Promise<void>((resolve) => {
-      leaveLane = resolve
-    })
-  }
-
   const queue = async (): Promise<OutputFile[]> => {
     if (opts.release) {
       // Its turn, then an empty queue, then the release, then the prompt, with
@@ -934,6 +1138,9 @@ function startJob(opts: StartOptions): string {
         if (stop.signal.aborted) throw stopped()
       } finally {
         waiting.delete(id)
+        // Out of the saved lane before the prompt goes, never after: a page
+        // that went away in between would otherwise send it a second time.
+        leaveSavedLane(id)
       }
       patchJob(id, { stage: 'Sending it to the press' })
     }
@@ -1070,6 +1277,35 @@ function jobsAhead(listed: readonly ServerJob[], promptId: string): number | nul
     (j) => j.id !== promptId && (j.status === 'in_progress' || (j.status === 'pending' && order(j) < order(mine))),
   ).length
 }
+
+if (typeof window !== 'undefined') {
+  // A reload or a close says it is going, so the next page in the tab takes
+  // the lane up at once instead of asking.
+  window.addEventListener('pagehide', () => {
+    if (laneClips.length) saveLane(true)
+  })
+  // Back from the browser's cache. If another page ran in this tab meanwhile,
+  // it took this lane up, may have sent some of it, and saved what is left,
+  // so this page's copy is out of date and must never be sent. The page
+  // starts again from the saved lane instead, as a reload does. Otherwise the
+  // lane is simply this page's again.
+  window.addEventListener('pageshow', (e) => {
+    if (!e.persisted || !laneClips.length) return
+    const saved = readLane(tabStore.get(LANE_KEY))
+    if (laneKept && saved?.writer !== PAGE) {
+      const stale = laneClips
+      laneClips = []
+      for (const c of stale) waiting.get(c.id)?.abort()
+      holdPage(false)
+      window.location.reload()
+      return
+    }
+    saveLane()
+  })
+}
+
+// Last in the engine, so everything it calls is defined.
+restoreLane()
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -1360,6 +1596,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const prefs = useSyncExternalStore(settings.subscribe, settings.get)
   const records = useSyncExternalStore(history.subscribe, history.all)
   const allJobs = useSyncExternalStore(videoJobs.subscribe, videoJobs.snapshot)
+  const leftOver = useSyncExternalStore(videoJobs.subscribe, videoJobs.leftOver)
 
   const [cat, setCat] = useState<Catalogue | null>(null)
   const [catError, setCatError] = useState<string | null>(null)
@@ -1500,6 +1737,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
   const myJobs = allJobs
   const live = useMemo(() => myJobs.filter(unfinished), [myJobs])
+  // Clips in the lane that ComfyUI has not been handed yet. Read from the
+  // lane itself, which a clip leaves just before its prompt goes; every change
+  // to it comes with a change to the jobs, which renders this again.
+  const waitingHere = videoJobs.waitingCount()
   // The one drawing, when one is. A heavy clip waiting for the queue to empty
   // can be older than a light clip that went straight in and is drawing now.
   const runningJob = live.find((j) => j.status === 'running') ?? live[live.length - 1] ?? null
@@ -2757,6 +2998,44 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               </button>
             ) : null}
           </Head>
+
+          {/* Clips an earlier page left, which this page will not send on a guess */}
+          {leftOver.length ? (
+            <div className="mb-4">
+              <Notice tone="warning" title={leftOver.length === 1 ? 'A clip left waiting' : 'Clips left waiting'}>
+                {leftOver.length === 1 ? 'One clip was' : `${leftOver.length} clips were`} waiting in this tab when the
+                page before this one went away without handing {leftOver.length === 1 ? 'it' : 'them'} on, as happens
+                when a page crashes or a tab is copied. If this tab was copied from one that is still open, that one
+                is sending {leftOver.length === 1 ? 'it' : 'them'}, and sending from here as well would make{' '}
+                {leftOver.length === 1 ? 'it' : 'them'} twice.
+                <ul className="my-1 list-none p-0">
+                  {leftOver.map((c) => (
+                    <li key={c.id} className="truncate italic">
+                      {c.composition.prompt || 'No words'} · {c.modelLabel || c.familyLabel}
+                    </li>
+                  ))}
+                </ul>
+                <button className="underline" onClick={() => videoJobs.sendLeftOver()}>
+                  Send {leftOver.length === 1 ? 'it' : 'them'} from here
+                </button>{' '}
+                ·{' '}
+                <button className="underline" onClick={() => videoJobs.forgetLeftOver()}>
+                  Forget {leftOver.length === 1 ? 'it' : 'them'}
+                </button>
+              </Notice>
+            </div>
+          ) : null}
+
+          {/* Where waiting clips live: nothing outside this tab knows about them yet */}
+          {waitingHere ? (
+            <p className="mb-3 text-caption italic text-grey-700">
+              {waitingHere === 1 ? 'The clip waiting its turn lives' : `The ${waitingHere} clips waiting their turn live`}{' '}
+              in this tab until {waitingHere === 1 ? 'it is' : 'they are'} sent to ComfyUI.{' '}
+              {videoJobs.laneKept()
+                ? `A reload picks ${waitingHere === 1 ? 'it' : 'them'} up again; closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`
+                : `This browser will not let the desk keep ${waitingHere === 1 ? 'it' : 'them'}, so a reload or closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`}
+            </p>
+          ) : null}
 
           {/* Running jobs */}
           {live.map((job) => (
