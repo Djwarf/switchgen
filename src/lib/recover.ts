@@ -12,7 +12,8 @@
  * A file whose record the reader removed is not unfiled: removing a record
  * keeps its file on disk by design, and filing it again on the next page load
  * would undo the removal. The server marks those, and only a reader asking for
- * them by name brings them back.
+ * them by name brings them back. A record filed for one of them says so
+ * (`refiled`), because the server refuses any other.
  *
  * For each file that really has no record, ComfyUI's own /history may still
  * hold the exact graph that produced it, and a family's bindings say which
@@ -195,19 +196,21 @@ export function recoverUnfiled(opts: { includeRemoved?: boolean } = {}): Promise
     try { runs = await pastRuns(1000) } catch { /* ComfyUI is down or has forgotten; file minimally */ }
     const byFile = new Map<string, PastRun>()
     for (const run of runs) for (const f of run.files) byFile.set(relPath(f), run)
-    let fromHistory = 0
+    const asked = new Set(opts.includeRemoved ? found.removed : [])
     // Oldest first, so edition numbers follow the order the files were made.
     // One change for the lot: filed one at a time, a folder of thousands held
     // the page for seconds.
-    const made = [...unfiled]
+    const records = [...unfiled]
       .sort((a, b) => a.mtime - b.mtime)
       .map((f) => {
         const run = byFile.get(f.rel)
-        if (run) fromHistory++
-        return run ? fromRun(run, f) : minimal(f)
+        const record = run ? fromRun(run, f) : minimal(f)
+        return asked.has(f) ? { ...record, refiled: true } : record
       })
-    history.addMany(made)
-    return { filed: unfiled.length, fromHistory, removed }
+    // Counted from what was filed. A desk can file one of these files while
+    // ComfyUI is being asked about them, and that one is not filed twice.
+    const made = history.addMany(records)
+    return { filed: made.length, fromHistory: made.filter((e) => e.promptId !== '').length, removed }
   })().finally(() => { running = null })
   return running
 }

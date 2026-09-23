@@ -32,7 +32,11 @@
  * A removed record's files are remembered as `dismissed`, with the time. The
  * files stay on disk, and without this the recovery pass would find them
  * unnamed and file them again on the next page load. A file written at that
- * path after the removal is a different file and is not dismissed.
+ * path after the removal is a different file and is not dismissed. The mark
+ * is kept here, not only in the listing: a record filed after the fact for a
+ * dismissed file is refused unless it says it was asked for, so a client that
+ * does not know the mark (an older bundle still in a browser's cache, say)
+ * cannot file the file again and take the removal back with it.
  *
  * Edition numbers are the server's. A client may propose one; if it collides
  * with a number another device already used, the server hands back the number
@@ -196,29 +200,6 @@ function flushSync() {
   }
 }
 
-// Vite loads this file afresh each time its config reloads, so the process
-// hooks are added once and call every load's flush, oldest first.
-//
-// SIGTERM, which `switchgen stop` sends, is Vite's: it closes the server and
-// calls process.exit(), and the exit hook writes. Nothing ends the process on
-// SIGINT but Node's default, which skips exit hooks, and any listener takes
-// that default away; the signal-exit handler already in a preview process
-// stands down whenever another listener is present. So the SIGINT listener
-// here writes and then ends the process itself, with the code the default
-// gives, rather than leaving it running.
-const FLUSHERS = Symbol.for('switchgen.archive.flush')
-const flushers = globalThis[FLUSHERS] ??= (() => {
-  const all = new Set()
-  const flushAll = () => { for (const fn of all) fn() }
-  process.once('exit', flushAll)
-  process.once('SIGINT', () => {
-    flushAll()
-    process.exit(130)
-  })
-  return all
-})()
-flushers.add(flushSync)
-
 // -------------------------------------------------------------- mutation --
 
 /** The least a record must carry to be stored: an identity, a time, a file. */
@@ -248,9 +229,42 @@ function fileOwners(s) {
 }
 
 /**
+ * Whether `rel` is still the file whose record was removed: it was dismissed,
+ * and it has not been written since. The listing asks the same question of
+ * the same times. A file whose time could not be read is taken to be the one
+ * removed, so the removal stands.
+ */
+function stillDismissed(s, rel, written) {
+  const removedAt = s.dismissed.get(rel)
+  if (removedAt === undefined) return false
+  const at = written.get(rel)
+  return at === undefined || at <= removedAt
+}
+
+/**
+ * When each dismissed file these records would file after the fact was last
+ * written, read from disk, for {@link upsert}. Only those are read, and only
+ * inside the outputs root.
+ */
+async function dismissedWritten(s, records) {
+  const out = new Map()
+  const root = path.resolve(OUTPUTS)
+  for (const r of records) {
+    if (!sane(r) || r.recovered !== true || r.refiled === true || s.records.has(r.id)) continue
+    for (const rel of relsOf(r)) {
+      if (!s.dismissed.has(rel) || out.has(rel)) continue
+      const full = path.resolve(root, rel)
+      if (!full.startsWith(root + path.sep)) continue
+      try { out.set(rel, (await fs.stat(full)).mtimeMs) } catch { /* not there: the removal stands */ }
+    }
+  }
+  return out
+}
+
+/**
  * Store what a client sent. Returns what was stamped and the ids refused.
  *
- * Two kinds of record are refused, and the client drops its copy of each:
+ * Three kinds of record are refused, and the client drops its copy of each:
  *   - A copy stamped before its record was removed here. That is a stale edit
  *     from a device that had not heard of the removal, and the removal is the
  *     newer act. A record with no stamp has never been here, which is how an
@@ -259,8 +273,15 @@ function fileOwners(s) {
  *   - A record filed after the fact for an output another record already
  *     names. Two tabs, or a browser holding only part of the archive, can each
  *     file the same file; the first record for it is the one kept.
+ *   - A record filed after the fact for a file whose record was removed, and
+ *     which has not been written again since (`written` says when each was
+ *     last written, read from disk). Filing it would take the removal back
+ *     with nobody having asked. The reader can ask: a record marked `refiled`
+ *     is one the reader filed again on purpose, and the restore route takes
+ *     it too. An undo sends back the record that was removed, whose tombstone
+ *     is still here, and passes as well.
  */
-function upsert(s, records, { restore = false } = {}) {
+function upsert(s, records, { restore = false, written = new Map() } = {}) {
   const assigned = []
   const refused = []
   const noOwner = new Map()
@@ -275,7 +296,12 @@ function upsert(s, records, { restore = false } = {}) {
     }
     if (r.recovered === true && !s.records.has(r.id)) {
       owners ??= fileOwners(s)
-      if (relsOf(r).some((rel) => { const o = owners.get(rel); return o !== undefined && o !== r.id })) {
+      const rels = relsOf(r)
+      if (rels.some((rel) => { const o = owners.get(rel); return o !== undefined && o !== r.id })) {
+        refused.push(r.id)
+        continue
+      }
+      if (!restore && r.refiled !== true && !tomb && rels.some((rel) => stillDismissed(s, rel, written))) {
         refused.push(r.id)
         continue
       }
@@ -350,11 +376,50 @@ function broadcast(s) {
   }
 }
 
-setInterval(() => {
+const pinger = setInterval(() => {
   for (const res of watchers) {
     try { res.write(': ping\n\n') } catch { watchers.delete(res) }
   }
-}, 25000).unref()
+}, 25000)
+pinger.unref()
+
+// ------------------------------------------------------------------- exit --
+
+// Vite loads this file afresh each time its config reloads, so the process
+// hooks are added once, and they call one flush for each archive file: the
+// newest load's. A load that has been replaced holds the archive as it stood
+// when the new load read the file. Kept on the list, every load's archive
+// stayed in memory, one more copy with each reload, and at exit the oldest
+// wrote first: one whose last write had failed put its old copy over the
+// file, and the newest, with nothing of its own unsaved, left it there. So a
+// new load takes the old one's place, and the old one stops its timer and is
+// not called again.
+//
+// SIGTERM, which `switchgen stop` sends, is Vite's: it closes the server and
+// calls process.exit(), and the exit hook writes. Nothing ends the process on
+// SIGINT but Node's default, which skips exit hooks, and any listener takes
+// that default away; the signal-exit handler already in a preview process
+// stands down whenever another listener is present. So the SIGINT listener
+// here writes and then ends the process itself, with the code the default
+// gives, rather than leaving it running.
+const FLUSHERS = Symbol.for('switchgen.archive.flush')
+let flushers = globalThis[FLUSHERS]
+if (!(flushers instanceof Map)) {
+  // A build before this one kept every load's flush in a Set under the same
+  // name, with hooks that call them all. Emptied, those hooks call nothing,
+  // and this list and its own hooks take over.
+  flushers?.clear?.()
+  flushers = globalThis[FLUSHERS] = new Map()
+  const all = flushers
+  const flushAll = () => { for (const load of all.values()) load.flush() }
+  process.once('exit', flushAll)
+  process.once('SIGINT', () => {
+    flushAll()
+    process.exit(130)
+  })
+}
+flushers.get(ARCHIVE)?.retire()
+flushers.set(ARCHIVE, { flush: flushSync, retire: () => clearInterval(pinger) })
 
 // --------------------------------------------------------------- outputs --
 
@@ -441,7 +506,9 @@ export function switchgenArchive() {
         const b = await readBody(req, BODY_MAX)
         if (!b || !Array.isArray(b.records)) return send(res, 400, { error: 'body must be JSON {records: [...]} under 2 MB' })
         const s = await load()
-        const { assigned, refused } = upsert(s, b.records, { restore: p === '/api/archive/restore' })
+        const restore = p === '/api/archive/restore'
+        const written = restore ? new Map() : await dismissedWritten(s, b.records)
+        const { assigned, refused } = upsert(s, b.records, { restore, written })
         if (assigned.length) { save(); broadcast(s) }
         return send(res, 200, { rev: s.rev, nextNo: s.nextNo, assigned, refused })
       }

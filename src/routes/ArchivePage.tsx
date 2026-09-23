@@ -13,7 +13,7 @@
  *   3. Reuse lands in the right room. A clip restores into the Video desk and
  *      a picture into Pictures, with every parameter the record carried.
  */
-import { capabilities as visionCapabilities, tagImages } from '../lib/vision'
+import { tagImages, watchCapabilities } from '../lib/vision'
 import { serverArchiveCopy, useArchiveSync } from '../lib/archiveSync'
 import { recoverUnfiled } from '../lib/recover'
 import {
@@ -48,6 +48,7 @@ import {
   update
 } from '../lib/history'
 import { modelFiles } from '../lib/hardware'
+import { regionOrigin, regionPicture } from '../lib/refine'
 import {
   adoptSource,
   requestRegionEdit,
@@ -204,13 +205,13 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const [tagging, setTagging] = useState<{ done: number; total: number } | null>(null)
   const tagStop = useRef(false)
 
+  // Asked until the server answers. A probe that failed once, while the
+  // server was restarting say, hid the tagging link until the page was
+  // opened again, although the tagger was there all along.
   useEffect(() => {
-    let live = true
-    void visionCapabilities().then((c) => {
-      if (live) setCanTag(c.tagger)
-    })
+    const stop = watchCapabilities((c) => setCanTag(c.tagger))
     return () => {
-      live = false
+      stop()
       tagStop.current = true
     }
   }, [])
@@ -413,8 +414,35 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     [onNavigate],
   )
 
+  /**
+   * "Use these settings" and "Make another" on a region pass. Its record
+   * keeps the region's words against the whole picture they were drawn on,
+   * and no mask, so loaded onto the desk it redrew that whole picture. As on
+   * the Pictures desk, the region bench opens on that picture instead, with
+   * the same words, and the reader paints the area again.
+   */
+  const regionAgain = useCallback(
+    (entry: HistoryEntry) => {
+      const origin = regionOrigin(entry, all())
+      const picture = origin ? regionPicture(entry, origin) : null
+      setOpenId(null)
+      if (!picture) {
+        setBanner({
+          variant: 'correction',
+          title: 'Correction',
+          text: `No. ${entry.no.toLocaleString('en-GB')} is one region of another picture, drawn again, and that picture is no longer here. There is nothing to draw the region on again, so it cannot be made again.`,
+        })
+        return
+      }
+      requestRegionEdit(picture)
+      goToDesk('images')
+    },
+    [goToDesk],
+  )
+
   const reuse = useCallback(
     (entry: HistoryEntry, freshSeed: boolean) => {
+      if (entry.variant === 'refine') return regionAgain(entry)
       const applyReuse = reuseIntoDesk(entry, {
         freshSeed,
         installedModels: installed.current ?? undefined,
@@ -446,7 +474,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
         ],
       })
     },
-    [goToDesk],
+    [goToDesk, regionAgain],
   )
 
   const sendAsSource = useCallback(
@@ -692,8 +720,11 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
   const actionsFor = useCallback(
     (entry: HistoryEntry): EntryActions => ({
       onOpen: () => setOpenId(entry.id),
-      onReuse: () => reuse(entry, false),
-      onAnother: () => reuse(entry, true),
+      // A region pass whose picture has gone has nothing to be made again on,
+      // so neither is offered; the keys say why.
+      ...(entry.variant === 'refine' && regionOrigin(entry, all())?.kind === 'gone'
+        ? {}
+        : { onReuse: () => reuse(entry, false), onAnother: () => reuse(entry, true) }),
       onSource: (desk) => sendAsSource(entry, desk),
       // Video records have no single frame to paint on, so the bench is not
       // offered for them; the frame picker is the route in for those.

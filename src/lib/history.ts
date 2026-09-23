@@ -165,6 +165,12 @@ export type HistoryEntry = {
   rev?: number
   /** Filed from the outputs folder after the fact, not by the desk that made it. */
   recovered?: boolean
+  /**
+   * Filed after the fact from a file whose record had been removed, because
+   * the reader asked for it. Without it the server refuses such a record, so
+   * that a recovery pass nobody asked for cannot take a removal back.
+   */
+  refiled?: boolean
 
   /** What the tagger saw, booru spelling, strongest first. Absent until a reading. */
   tags?: string[]
@@ -312,6 +318,7 @@ function normalise(e: any, fallbackNo: number): HistoryEntry {
     rev: numOrNull(e.rev) ?? undefined,
     pending: e.pending === true ? true : undefined,
     recovered: e.recovered === true ? true : undefined,
+    refiled: e.refiled === true ? true : undefined,
     tags: Array.isArray(e.tags) ? e.tags.filter((t: unknown): t is string => typeof t === 'string') : undefined,
     rating: ['general', 'sensitive', 'questionable', 'explicit'].includes(e.rating) ? e.rating : undefined,
     prompt: str(e.prompt, ''),
@@ -822,17 +829,72 @@ export function get(id: string): HistoryEntry | undefined {
 // Writing
 // ---------------------------------------------------------------------------
 
-/** File a finished generation. Returns the stored record. */
-export function add(input: NewEntry): HistoryEntry {
-  const entry: HistoryEntry = {
-    ...input,
-    id: cryptoId(),
-    no: nextNo++,
-    at: input.at ?? Date.now(),
+/** One file as the server spells it, with the folder it is in. */
+const fileKey = (f: FileRef): string => `${f.type || 'output'}:${relPath(f)}`
+
+/** Which record names each file, the first one found for each. */
+function fileHolders(list: readonly HistoryEntry[]): Map<string, HistoryEntry> {
+  const out = new Map<string, HistoryEntry>()
+  for (const e of list) {
+    for (const f of [e.file, ...(e.files ?? [])]) {
+      const k = fileKey(f)
+      if (!out.has(k)) out.set(k, e)
+    }
   }
-  const next = [entry, ...entries]
-  commit(trim(next), { untrimmed: next })
-  return entry
+  return out
+}
+
+/**
+ * The record already filed for the file `input` names, when filing `input`
+ * would make it a second one, or undefined when `input` is a record of its
+ * own.
+ *
+ * Two writers can file one job: two tabs following the same shot, a page
+ * that picked up a job left by the page before it, the recovery pass
+ * finding a file the desk that made it is about to file. The same job is
+ * the same prompt id. A name alone is not enough: ComfyUI hands a name out
+ * again once the file that had it is deleted, and a record kept for a
+ * deleted file must not stand for the new picture. A record filed after the
+ * fact knows only the file, so it is the same file whichever job made it.
+ */
+function holderFor(input: NewEntry, holders: ReadonlyMap<string, HistoryEntry>): HistoryEntry | undefined {
+  const held = holders.get(fileKey(input.file))
+  if (!held) return undefined
+  if (input.recovered || held.recovered) return held
+  return input.promptId && held.promptId === input.promptId ? held : undefined
+}
+
+/**
+ * The desk's record of a file that was filed after the fact first. The desk
+ * knows how the file was made and the recovery pass did not, so its account
+ * takes the place of the minimal one, under the same identity and number,
+ * keeping what the reader has added since: a star, a note, the tags.
+ */
+function inPlaceOf(held: HistoryEntry, input: NewEntry): HistoryEntry {
+  return {
+    ...input,
+    id: held.id,
+    no: held.no,
+    at: input.at ?? held.at,
+    rev: held.rev,
+    pending: held.rev !== undefined ? true : undefined,
+    recovered: undefined,
+    starred: held.starred,
+    note: held.note,
+    tags: held.tags,
+    rating: held.rating,
+  }
+}
+
+/**
+ * File a finished generation. Returns the stored record.
+ *
+ * A job filed already, by another writer, is not filed twice: the record it
+ * has is returned (see {@link holderFor}). One the recovery pass filed first
+ * is given the desk's account instead.
+ */
+export function add(input: NewEntry): HistoryEntry {
+  return fileAll([input], Date.now()).standing[0]
 }
 
 /**
@@ -840,19 +902,52 @@ export function add(input: NewEntry): HistoryEntry {
  * recovery pass can file thousands of outputs at once, and one {@link add}
  * each copied the whole archive every time and held the page for seconds.
  * Numbers are handed out in the order given, so pass them oldest first.
+ *
+ * Each is filed as {@link add} files it, a second record for one job in the
+ * same call included: the recovery pass lists the files it will file before
+ * it asks ComfyUI how they were made, and a desk can file one of them in
+ * between. Returns only the records made, not those that were there already.
  */
 export function addMany(inputs: readonly NewEntry[]): HistoryEntry[] {
   if (!inputs.length) return []
-  const now = Date.now()
-  const made: HistoryEntry[] = inputs.map((input) => ({
-    ...input,
-    id: cryptoId(),
-    no: nextNo++,
-    at: input.at ?? now,
-  }))
-  const next = [...made, ...entries].sort((a, b) => b.at - a.at)
+  return fileAll(inputs, Date.now()).made
+}
+
+/**
+ * What {@link add} and {@link addMany} share. `standing` has, for each input,
+ * the record that now stands for it: a new one, the one it replaced, or the
+ * one already filed for its job. `made` has the new ones.
+ */
+function fileAll(inputs: readonly NewEntry[], now: number): { standing: HistoryEntry[]; made: HistoryEntry[] } {
+  const holders = fileHolders(entries)
+  const replaced = new Map<HistoryEntry, HistoryEntry>()
+  const made: HistoryEntry[] = []
+  const out: HistoryEntry[] = []
+  for (const input of inputs) {
+    const held = holderFor(input, holders)
+    if (held) {
+      const standing = replaced.get(held) ?? held
+      if (!standing.recovered || input.recovered) {
+        out.push(standing)
+        continue
+      }
+      const better = inPlaceOf(standing, input)
+      replaced.set(held, better)
+      out.push(better)
+      continue
+    }
+    const entry: HistoryEntry = { ...input, id: cryptoId(), no: nextNo++, at: input.at ?? now }
+    made.push(entry)
+    out.push(entry)
+    for (const f of [entry.file, ...(entry.files ?? [])]) if (!holders.has(fileKey(f))) holders.set(fileKey(f), entry)
+  }
+  if (!made.length && !replaced.size) return { standing: out, made }
+  // A record replaced can be one made earlier in this same call.
+  const current = (e: HistoryEntry) => replaced.get(e) ?? e
+  const fresh = made.map(current)
+  const next = [...fresh, ...entries.map(current)].sort((a, b) => b.at - a.at)
   commit(trim(next), { untrimmed: next })
-  return made
+  return { standing: out.map(current), made: fresh }
 }
 
 // ---------------------------------------------------------------------------

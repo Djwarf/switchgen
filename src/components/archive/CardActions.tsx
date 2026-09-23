@@ -13,10 +13,15 @@ import type { HistoryEntry } from '../../lib/history'
 export type EntryActions = {
   /** Open the full record. */
   onOpen: () => void
-  /** Load everything back into its desk, ready to run. */
-  onReuse: () => void
-  /** The same, with a fresh seed. */
-  onAnother: () => void
+  /**
+   * Load everything back into its desk, ready to run. On a region pass, open
+   * the region bench on the picture it was drawn on instead. Absent when
+   * there is nothing to make it again from: a region pass whose picture has
+   * gone.
+   */
+  onReuse?: () => void
+  /** The same, with a fresh seed. Absent when {@link onReuse} is. */
+  onAnother?: () => void
   /** Send only the picture to a desk. */
   onSource: (desk: DeskId) => void
   /**
@@ -102,24 +107,46 @@ export function CardActions({
   }
 
   const isVideo = entry.kind === 'video'
+  // Both verbs open the same bench on a region pass, so it gets one link that
+  // says what it does.
+  const regionPass = entry.variant === 'refine'
 
   return (
     <div ref={wrap} className="relative flex items-center gap-3">
-      <button type="button" className={link} onClick={onReuse} title="Load these settings (r)">
-        Use these settings
-      </button>
-      <span className="text-grey-300" aria-hidden>
-        ·
-      </span>
-      <button type="button" className={link} onClick={onAnother} title="Load it with a fresh seed (Shift+R)">
-        Make another
-      </button>
+      {onReuse && regionPass ? (
+        <button
+          type="button"
+          className={link}
+          onClick={onReuse}
+          title="Open the region bench on the picture this was drawn on, with the same words (r)"
+        >
+          Draw the region again
+        </button>
+      ) : onReuse ? (
+        <>
+          <button type="button" className={link} onClick={onReuse} title="Load these settings (r)">
+            Use these settings
+          </button>
+          {onAnother && (
+            <>
+              <span className="text-grey-300" aria-hidden>
+                ·
+              </span>
+              <button type="button" className={link} onClick={onAnother} title="Load it with a fresh seed (Shift+R)">
+                Make another
+              </button>
+            </>
+          )}
+        </>
+      ) : null}
 
       {expanded && (
         <>
-          <span className="text-grey-300" aria-hidden>
-            ·
-          </span>
+          {onReuse && (
+            <span className="text-grey-300" aria-hidden>
+              ·
+            </span>
+          )}
           <button type="button" className={link} onClick={onRemove} title="Remove the record (Backspace)">
             Remove
           </button>

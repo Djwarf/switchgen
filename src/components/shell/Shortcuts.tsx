@@ -58,7 +58,7 @@ export const SHORTCUTS: readonly ShortcutGroup[] = [
     items: [
       { keys: 'j k', action: 'Move between records' },
       { keys: 'Enter', action: 'Open the record' },
-      { keys: 'r', action: 'Use these settings' },
+      { keys: 'r', action: 'Use these settings, or on a region pass, draw the region again' },
       { keys: 'Shift R', action: 'Make another, with a fresh seed' },
       { keys: 'u', action: 'Use as a source' },
       { keys: 's', action: 'Star it' },

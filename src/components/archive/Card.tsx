@@ -109,17 +109,20 @@ export function Card({
               <strong className="mr-1 text-[0.625rem] font-bold tracking-[0.05em] uppercase not-italic">
                 Not on disk
               </strong>
-              This file has been moved or deleted. The settings are still here, so you can make it
-              again.
+              {actions.onReuse
+                ? 'This file has been moved or deleted. The settings are still here, so you can make it again.'
+                : 'This file has been moved or deleted, and so has the picture it was drawn on, so it cannot be made again.'}
             </p>
             <p className="mt-1 flex gap-3">
-              <button
-                type="button"
-                onClick={actions.onReuse}
-                className="text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
-              >
-                Use these settings
-              </button>
+              {actions.onReuse && (
+                <button
+                  type="button"
+                  onClick={actions.onReuse}
+                  className="text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+                >
+                  {entry.variant === 'refine' ? 'Draw the region again' : 'Use these settings'}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={actions.onRemove}
