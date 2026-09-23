@@ -201,11 +201,21 @@ export async function systemStats(): Promise<any> {
   }
 }
 
-/** Pull the option list for one node input, e.g. which checkpoints exist. */
+/**
+ * Pull the option list for one node input, e.g. which checkpoints exist.
+ *
+ * ComfyUI sends a list in one of two shapes. Most loaders still put the bare
+ * list first, `[options, config]`; newer nodes send `['COMBO', { options }]`,
+ * and UpscaleModelLoader already does. Read only the old way, that loader lists
+ * nothing, and a machine with the upscaler looks as if it has none.
+ */
 export function optionsFor(info: Record<string, any>, node: string, field: string): string[] {
   const input = info?.[node]?.input
-  const spec = input?.required?.[field]?.[0] ?? input?.optional?.[field]?.[0]
-  return Array.isArray(spec) ? (spec as string[]) : []
+  const spec: unknown = input?.required?.[field] ?? input?.optional?.[field]
+  if (!Array.isArray(spec)) return []
+  const [head, config] = spec as [unknown, { options?: unknown } | null | undefined]
+  const list = Array.isArray(head) ? head : head === 'COMBO' ? config?.options : null
+  return Array.isArray(list) ? list.filter((v): v is string => typeof v === 'string') : []
 }
 
 const SAFE_NAME = /[^a-zA-Z0-9._-]+/g

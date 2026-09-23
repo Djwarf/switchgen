@@ -24,15 +24,15 @@
  * entry in the ledger, numbered, and the slug reads "Shot 3 of 8".
  */
 import { useEffect, useState } from 'react'
-import { Shell, go, jobs, parseRoute, useRoute, type JobDesk } from './components/shell'
+import { Shell, go, mirror, parseRoute, useRoute, type Bridge, type Reported } from './components/shell'
 import { Player } from './components/player/Player'
 import { posterUrl } from './components/archive/Poster'
 import { startArchiveSync } from './lib/archiveSync'
 import { gb, probeHardware, type Hardware } from './lib/hardware'
 import ArchivePage from './routes/ArchivePage'
-import Pictures, { pressSnapshot, subscribePress } from './routes/Pictures'
+import Pictures, { pressSnapshot, stopPress, subscribePress } from './routes/Pictures'
 import Reel, { reelRun } from './routes/Reel'
-import Video, { videoJobs, type PlayerSlot } from './routes/Video'
+import Video, { stopVideoJob, videoJobs, type PlayerSlot } from './routes/Video'
 
 export default function App() {
   const route = useRoute()
@@ -127,42 +127,8 @@ function describe(hw: Hardware): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// The two bridges
+// The three bridges
 // ---------------------------------------------------------------------------
-
-/** The shape both desk stores share, once the differences are flattened out. */
-type Reported = {
-  /** The desk's own id for the job, stable for its lifetime. */
-  key: string
-  status: 'submitting' | 'queued' | 'running' | 'done' | 'error' | 'cancelled'
-  promptId: string | null
-  label: string
-  prompt: string
-  value: number
-  max: number
-  entryId: string | null
-  error: string | null
-}
-
-type Bridge = {
-  desk: JobDesk
-  kind: 'image' | 'video'
-  subscribe: (fn: () => void) => () => void
-  read: () => Reported[]
-  /**
-   * The desk's own stop, given the desk's id for the job, for a desk where
-   * stopping means more than cancelling one prompt.
-   */
-  stop?: (key: string) => void
-  /**
-   * Desk job id → ledger job id, kept on the bridge rather than inside the
-   * mirror, so that a remount — StrictMode's double effect in development, or
-   * the shell being torn down and rebuilt — adopts the jobs it already opened
-   * instead of announcing the same clip twice. A blank value means "seen, and
-   * already finished before we looked".
-   */
-  seen: Map<string, string>
-}
 
 /**
  * Mirror every desk into the press ledger, for the whole life of the page.
@@ -180,10 +146,18 @@ function useJobBridges(): void {
   }, [])
 }
 
+/**
+ * The pictures desk. It runs one picture at a time, so it reports one job.
+ *
+ * Stopping goes through the desk's own Stop, which ends the whole batch. A
+ * bare cancel of the picture's prompt found nothing to stop when the picture
+ * had already saved, and the desk went on to make the rest of the batch.
+ */
 const pictureBridge: Bridge = {
   desk: 'images',
   kind: 'image',
   subscribe: subscribePress,
+  stop: () => stopPress(),
   read: () => {
     const job = pressSnapshot().job
     if (!job) return []
@@ -204,10 +178,19 @@ const pictureBridge: Bridge = {
   seen: new Map(),
 }
 
+/**
+ * The video desk, one entry per clip.
+ *
+ * Stopping goes through the desk's own Stop, because a heavy clip can wait a
+ * long time before it has a prompt to cancel: it waits its turn to release
+ * ComfyUI's memory. A bare cancel had nothing to send for it, so the clip went
+ * on waiting, released the memory, was sent, and only then was stopped.
+ */
 const videoBridge: Bridge = {
   desk: 'video',
   kind: 'video',
   subscribe: videoJobs.subscribe,
+  stop: (key) => stopVideoJob(key),
   read: () =>
     videoJobs.snapshot().map((job) => ({
       key: job.id,
@@ -264,97 +247,4 @@ const reelBridge: Bridge = {
     return out
   },
   seen: new Map(),
-}
-
-const LIVE = new Set(['submitting', 'queued', 'running'])
-const SEEN_LIMIT = 200
-
-function mirror(bridge: Bridge): () => void {
-  const seen = bridge.seen
-
-  const sync = () => {
-    for (const report of bridge.read()) {
-      let id = seen.get(report.key)
-
-      if (id === undefined) {
-        // Work that was already finished when the bridge first looked belongs
-        // to the archive, not to the slug. Note it and leave it alone.
-        if (!LIVE.has(report.status)) {
-          seen.set(report.key, '')
-          continue
-        }
-        const stop = bridge.stop
-        const key = report.key
-        id = jobs.start({
-          desk: bridge.desk,
-          kind: bridge.kind,
-          label: report.label,
-          prompt: report.prompt,
-          promptId: report.promptId,
-          steps: report.max || undefined,
-          stop: stop ? () => stop(key) : undefined,
-        })
-        seen.set(report.key, id)
-      }
-      if (!id) continue
-
-      const ledgerJob = jobs.get(id)
-      if (!ledgerJob) continue
-
-      if (report.promptId && ledgerJob.promptId !== report.promptId) {
-        jobs.attach(id, report.promptId)
-      }
-
-      // The desk's ending is the job's ending. It holds the run that settled
-      // it, so its word replaces anything the ledger shows, and the ledger
-      // takes a new ending only when it differs from the one it has.
-      switch (report.status) {
-        case 'running':
-          if (
-            LIVE.has(ledgerJob.status) &&
-            (ledgerJob.status !== 'running' ||
-              ledgerJob.value !== report.value ||
-              ledgerJob.max !== report.max)
-          ) {
-            jobs.apply(id, {
-              phase: 'running',
-              node: null,
-              value: report.value,
-              max: report.max,
-            })
-          }
-          break
-        case 'done':
-          if (ledgerJob.status !== 'done' || (report.entryId && report.entryId !== ledgerJob.entryId)) {
-            jobs.succeed(id, report.entryId ? { entryId: report.entryId } : undefined)
-          }
-          break
-        case 'error':
-          if (ledgerJob.status !== 'error') {
-            jobs.fail(id, report.error ?? 'The job stopped short.')
-          }
-          break
-        case 'cancelled':
-          if (ledgerJob.status !== 'cancelled') {
-            jobs.fail(id, report.error ?? 'Stopped.', { cancelled: true })
-          }
-          break
-        default:
-          break
-      }
-    }
-
-    // The map is a lookup for work in progress, not a second archive. A page
-    // left open all day should not accumulate one entry per picture for ever.
-    if (seen.size > SEEN_LIMIT) {
-      const live = new Set(bridge.read().map((r) => r.key))
-      for (const key of [...seen.keys()]) {
-        if (seen.size <= SEEN_LIMIT / 2) break
-        if (!live.has(key)) seen.delete(key)
-      }
-    }
-  }
-
-  sync()
-  return bridge.subscribe(sync)
 }

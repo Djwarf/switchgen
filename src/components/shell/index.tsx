@@ -66,6 +66,7 @@ export {
   type JobsSnapshot,
   type ServerQueue,
 } from './jobs'
+export { mirror, type Bridge, type Reported } from './mirror'
 
 // Telling the reader something
 export {

@@ -26,6 +26,7 @@ import { useSyncExternalStore } from 'react'
 import {
   ComfyError,
   cancelJob,
+  getJob,
   listJobs,
   type ApiWorkflow,
   type ProgressEvent,
@@ -95,8 +96,8 @@ export type Job = {
   error: string | null
   /**
    * A stop has been asked for and the job has not ended yet. It clears when
-   * the desk reports the ending, or when ComfyUI says there was nothing left
-   * to stop.
+   * the desk reports the ending, when ComfyUI says there was nothing left to
+   * stop, or when the job shows the stop did not take (see STOP_WAIT_MS).
    */
   cancelling: boolean
   /** The archive record it produced, when the desk tells us. */
@@ -158,6 +159,8 @@ let snapshot: JobsSnapshot = build()
 const listeners = new Set<() => void>()
 /** Ledger job id → the owning desk's own stop, from `JobInit.stop`. */
 const stoppers = new Map<string, () => void>()
+/** Ledger job id → when its stop was asked for, and the check that follows it up. */
+const asked = new Map<string, Ask>()
 
 function build(): JobsSnapshot {
   const active = ledger.filter(isLive)
@@ -305,7 +308,7 @@ function start(init: JobInit): string {
   }
   ledger = [job, ...ledger].slice(0, KEEP)
   if (init.stop) stoppers.set(job.id, init.stop)
-  for (const id of stoppers.keys()) if (!ledger.some((j) => j.id === id)) stoppers.delete(id)
+  forgetGone()
   emit()
   schedule()
   return job.id
@@ -323,6 +326,8 @@ function attach(id: string, promptId: string): void {
   // Only for the first id, and only when the ledger itself holds the stop: a
   // desk with a stop of its own was already told.
   if (job && !before.promptId && job.cancelling && isLive(job) && !stoppers.has(id)) {
+    // The stop is only now on its way, so its wait starts now.
+    askedFor(id)
     void sendCancel(id, promptId)
   }
   schedule()
@@ -357,6 +362,11 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
             }
           : j,
       )
+      // ComfyUI checks for a stop before it reports a step, so steps still
+      // coming well after one was asked for mean it did not take. A node
+      // starting (value 0) proves nothing: ComfyUI announces the next node
+      // before it notices the stop there and ends the job.
+      if (e.value > 0) stepAfterStop(id)
       return
     }
     case 'preview':
@@ -368,6 +378,7 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
           ? { ...j, status: 'done', stage: 'Done', finishedAt: Date.now(), value: j.max, cancelling: false }
           : j,
       )
+      ended(id)
       schedule()
       return
     case 'error':
@@ -383,6 +394,7 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
             }
           : j,
       )
+      ended(id)
       schedule()
       return
   }
@@ -417,6 +429,7 @@ function succeed(id: string, opts: { entryId?: string } = {}): void {
     cancelling: false,
     entryId: opts.entryId ?? j.entryId,
   }))
+  ended(id)
   schedule()
 }
 
@@ -430,12 +443,110 @@ function fail(id: string, message: string, opts: { cancelled?: boolean } = {}): 
     error: opts.cancelled ? null : message,
     cancelling: false,
   }))
+  ended(id)
   schedule()
 }
 
 /** Give up asking: the stop was refused, or there was nothing left to stop. */
 function stopAsking(id: string): void {
+  forgetAsk(id)
   patch(id, (j) => (j.cancelling ? { ...j, cancelling: false } : j))
+}
+
+/**
+ * How long a stop is given before the ledger stops vouching for it.
+ *
+ * A stop can be accepted and still not take: ComfyUI clears its stop flag as
+ * each prompt starts, so one that lands in that moment is lost, and a desk's
+ * own cancel can fail without a word. Left marked as stopping, such a job kept
+ * Stop out of reach for the rest of its run. So once this long has passed, the
+ * mark comes off as soon as the job shows the stop did not take: a step
+ * reported, or ComfyUI still listing it as waiting, since a stop takes a
+ * waiting job off the queue at once. A running job that shows neither is
+ * still being stopped: ComfyUI notices a stop at the next step or node, and
+ * one long step or a slow decode can take a while to get there.
+ */
+const STOP_WAIT_MS = 15_000
+
+type Ask = { at: number; timer: number }
+
+/** The stop's own notice, which says the stop failed or did not take. */
+const stopNotice = (id: string) => `stop-${id}`
+
+/** Start (or start again) the wait on a stop that has just been asked for. */
+function askedFor(id: string): void {
+  forgetAsk(id)
+  const ask: Ask = { at: Date.now(), timer: 0 }
+  ask.timer = setTimeout(() => void stillWaiting(id, ask), STOP_WAIT_MS) as unknown as number
+  asked.set(id, ask)
+}
+
+function forgetAsk(id: string): void {
+  const ask = asked.get(id)
+  if (!ask) return
+  clearTimeout(ask.timer)
+  asked.delete(id)
+}
+
+/** The job, while this stop of it is still the one being waited on. */
+function stillStopping(id: string, ask: Ask): Job | null {
+  const job = ledger.find((j) => j.id === id)
+  return asked.get(id) === ask && job && job.cancelling && isLive(job) ? job : null
+}
+
+/**
+ * The wait is over: a job ComfyUI still lists as waiting was not stopped. A
+ * job still being sent carries its stop with it, and whether a running one
+ * is still going is for its steps to say.
+ */
+async function stillWaiting(id: string, ask: Ask): Promise<void> {
+  const job = stillStopping(id, ask)
+  if (!job?.promptId) return
+  let server: Awaited<ReturnType<typeof getJob>>
+  try {
+    server = await getJob(job.promptId)
+  } catch {
+    return // no answer is no evidence either way
+  }
+  if (server?.status === 'pending' && stillStopping(id, ask)) notTaken(id, 'waiting')
+}
+
+/** A step reported after the wait: the stop did not take. */
+function stepAfterStop(id: string): void {
+  const ask = asked.get(id)
+  if (!ask || !stillStopping(id, ask) || Date.now() - ask.at < STOP_WAIT_MS) return
+  notTaken(id, 'running')
+}
+
+/** Take the stopping mark off, and say why, so Stop can be held again. */
+function notTaken(id: string, where: 'waiting' | 'running'): void {
+  stopAsking(id)
+  postNotice({
+    key: stopNotice(id),
+    tone: 'warning',
+    title: 'That job has not stopped yet',
+    body:
+      where === 'waiting'
+        ? 'ComfyUI still has it waiting in its queue. Hold Stop again to ask once more.'
+        : 'ComfyUI is still working on it. Hold Stop again to ask once more.',
+  })
+}
+
+/**
+ * A job has ended, or left the ledger. Its stop needs no more following up,
+ * and a notice about that stop, saying it may still be running and to try
+ * again, is no longer true.
+ */
+function ended(id: string): void {
+  forgetAsk(id)
+  dismissNotice(stopNotice(id))
+}
+
+/** Let go of everything kept for jobs no longer on the ledger. */
+function forgetGone(): void {
+  const kept = new Set(ledger.map((j) => j.id))
+  for (const id of stoppers.keys()) if (!kept.has(id)) stoppers.delete(id)
+  for (const id of asked.keys()) if (!kept.has(id)) ended(id)
 }
 
 /**
@@ -446,7 +557,7 @@ function stopAsking(id: string): void {
  * the desk reports whatever really happened: stopped, finished or failed.
  */
 async function sendCancel(id: string, promptId: string): Promise<void> {
-  const notice = `stop-${id}`
+  const notice = stopNotice(id)
   let stopped: boolean
   try {
     stopped = await cancelJob(promptId)
@@ -478,6 +589,7 @@ async function cancel(id: string): Promise<void> {
   const job = ledger.find((j) => j.id === id)
   if (!job || !isLive(job) || job.cancelling) return
   patch(id, (j) => ({ ...j, cancelling: true }))
+  askedFor(id)
   const stop = stoppers.get(id)
   if (stop) {
     try {
@@ -495,6 +607,7 @@ async function cancel(id: string): Promise<void> {
 /** Take a finished job off the bar without touching the archive. */
 function dismiss(id: string): void {
   stoppers.delete(id)
+  ended(id)
   const before = ledger.length
   ledger = ledger.filter((j) => j.id !== id)
   if (ledger.length !== before) emit()
@@ -507,7 +620,7 @@ function get(id: string): Job | null {
 function clearFinished(): void {
   const before = ledger.length
   ledger = ledger.filter(isLive)
-  for (const id of stoppers.keys()) if (!ledger.some((j) => j.id === id)) stoppers.delete(id)
+  forgetGone()
   if (ledger.length !== before) emit()
 }
 
