@@ -20,11 +20,13 @@ run the smaller families, and the desk says which fit before you press.
 ### 1. Get the app
 
 ```bash
-git clone git@github.com:Djwarf/switchgen.git
+git clone https://github.com/Djwarf/switchgen.git
 cd switchgen
 ```
 
-Every command below runs from this checkout.
+With an SSH key registered on GitHub, `git clone
+git@github.com:Djwarf/switchgen.git` works as well. Every command below runs
+from this checkout.
 
 ### 2. Install ComfyUI
 
@@ -97,6 +99,15 @@ seconds for as long as it is enabled.
 systemctl --user daemon-reload && systemctl --user enable --now comfyui
 ```
 
+The sample unit also passes `--enable-compress-response-body`, which has
+ComfyUI gzip its JSON answers; pictures and clips are sent as they are. The
+app's proxy does not compress what it passes on, and ComfyUI's model list,
+which every desk reads when it opens, measured 2,154,283 bytes here as plain
+text and 244,641 gzipped. A unit copied from an older checkout needs the flag
+added by hand, then `systemctl --user daemon-reload && systemctl --user
+restart comfyui` at a moment when nothing is rendering: a restart empties
+ComfyUI's queue.
+
 Optional, each probed and reported rather than assumed: `aria2c` for
 downloads from the catalogue, `ffmpeg` and `ffprobe` for joining a reel and
 for thumbnails, and `onnxruntime` plus `ultralytics` in the ComfyUI venv for
@@ -118,20 +129,77 @@ well, with `COMFY_URL` exported in the shell when ComfyUI is not on
 
 The desk offers only families whose files are installed and fit in memory.
 Fetch the rest from the catalogue behind More, which shows each family's
-missing files, their size and the server's fit verdict. Add-ons are indexed
-from your own LoRA folder with `npm run index-loras`, which reads each file's
-header and rewrites `src/lib/loraIndex.ts`; the checked-in index describes
-the folder this was built against. It reads `SWITCHGEN_LORA_DIR`, or the
-`Lora` folder under `SWITCHGEN_MODELS`, from the environment, so export
-them first. The tests carry their own index rows, so a regenerated index
-does not change what `npm test` checks.
+missing files, their size and the server's fit verdict. Once a fetch has
+begun it runs on the server, not in the page: a reload, a locked phone or a
+dropped connection leaves it going. Before that, while the server is still
+checking the disk and memory, closing the page calls it off. When the page comes back, the catalogue finds a family's
+fetch again, with its Stop. An add-on or the picture reader's tagger is not
+shown again by itself: pressing its fetch once more takes up the fetch still
+running, with its progress and Stop, rather than starting a second. Add-ons
+are indexed from your own LoRA folder with `npm run index-loras`, which reads
+each file's header and rewrites `src/lib/loraIndex.ts`; the checked-in index
+describes the folder this was built against. It reads `SWITCHGEN_LORA_DIR`, or
+the `Lora` folder under `SWITCHGEN_MODELS`, from the environment, so export
+them first. The tests carry their own index rows, so a regenerated index does
+not change what `npm test` checks.
 
 ### 4. Use it from a phone
 
 The app binds every interface. `localhost`, this machine's hostname and
 addresses, and any `*.ts.net` name are allowed; add anything else to
-`SWITCHGEN_ALLOWED_HOSTS`. Open it once on the phone and add it to the home
-screen: it installs as an app, and the archive is the same on every device.
+`SWITCHGEN_ALLOWED_HOSTS`. The archive is the same on every device.
+
+Open it on the phone over https. A browser treats a plain `http://` address
+on the tailnet as insecure, and there it runs no service worker (so no kept
+copy of the app for a weak signal), gives the page no clipboard and no way
+to keep the screen on, and "Add to Home screen" makes a bookmark rather than
+an installed app. Tailscale Serve puts https in front, with a certificate for
+the machine's tailnet name. HTTPS certificates have to be turned on for the
+tailnet first, on the DNS page of the Tailscale admin console. Then, once, on
+the machine that runs SwitchGen:
+
+```bash
+tailscale serve --bg 5273
+```
+
+(or the port `SWITCHGEN_PORT` names). Open
+`https://<machine>.<tailnet>.ts.net` on the phone and add it to the
+home screen. `switchgen` prints that address when Serve is set up for its
+port, and the command above when it is not. The setting stays until
+`tailscale serve reset`.
+
+To the browser the https address is a different site from the http one,
+with storage of its own. The archive lives on the server and is the same at
+either address; what the phone kept only in the browser under the old
+address stays there, clips waiting in the Video lane and a reel in progress
+included, so let those finish first. Current browsers mark the app's own
+requests as same-origin, which the write guard accepts behind Serve with no
+setting. If writes are refused as cross-site (an older browser, or a proxy
+that rewrites the Host header), set `SWITCHGEN_TRUSTED_ORIGINS` in `.env` to
+the https address.
+
+The phone's icon finds the app only while it is running. To have it back
+after the machine restarts, with nobody at the desk, install
+`contrib/switchgen.service` as a user unit. First copy it:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/switchgen.service ~/.config/systemd/user/
+```
+
+Then, in `~/.config/systemd/user/switchgen.service`, change `%h/switchgen`
+to the folder this checkout is in. Only after that, enable it, and let your
+user's units (ComfyUI's too) start when the machine does rather than when
+you log in:
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now switchgen
+loginctl enable-linger "$USER"
+```
+
+The unit runs `switchgen serve`: a build when anything changed, then the
+server in the foreground, restarted if it crashes. After a change, `systemctl
+--user restart switchgen` serves it.
 
 ## The four rooms
 
@@ -154,6 +222,23 @@ send what it finds on a guess; the desk lists those clips and asks whether to
 send them from here or forget them. Stop, on the desk or in the section bar,
 calls a waiting clip off before it is ever sent, and on the Pictures desk it
 stops the rest of the batch as well as the picture in hand.
+
+Three kinds of work wait in the page, not in ComfyUI: clips in that lane,
+the shots of a reel after the one on the press, and the pictures of a batch
+after the one being made. The page sends each when its turn comes, so while
+the page is closed or hidden, or the phone is locked, nothing more is sent;
+what ComfyUI already has carries on. The desk says so while anything waits,
+and over https (step 4) the page keeps the screen on until the last one has
+gone, except while the Video desk holds its lane after a lost clip: then
+nothing goes until you send the waiting clips or call them off, and the
+screen may sleep. A browser does not allow the wake lock over plain http.
+
+A clip or picture already sent is kept in the tab's session storage with its
+job number until it settles. When the page is reloaded, or the phone threw
+the background tab away and opens it again, the desk follows it again, with
+its progress and Stop, and files it when it finishes. If ComfyUI has
+restarted in the meantime and has no record of it, the desk says the job was
+lost rather than waiting on it.
 
 One tab renders a reel at a time. Another tab open on the same reel shows the
 shots as they land and which one is on the press, and sends nothing of its
@@ -210,9 +295,9 @@ again, and an unchanged file costs a 304.
 | `POST /api/archive/upsert`, `/remove`, `/restore` | archive | Write records; the server assigns revisions and edition numbers |
 | `GET /api/outputs` | archive | Every media file under the outputs root |
 | `GET /api/catalog`, `GET /api/catalog/plan` | downloads | The 104-family catalogue annotated with what is on disk; a fit verdict and download plan per family |
-| `POST /api/download`, `/download/cancel`, `GET /download/status` | downloads | Fetch through aria2c, resumable, as an event stream |
+| `POST /api/download`, `/download/cancel`, `GET /download/status` | downloads | Fetch through aria2c, resumable, as an event stream; a fetch goes on when its page goes, and the status lists each family fetch that is running or ended in the last ten minutes |
 | `GET /api/reel/probe`, `POST /api/reel/stitch` | reel | Probe clips with ffprobe; join them with ffmpeg |
-| `GET /api/vision/capabilities`, `POST /api/vision/tag`, `/detect`, `/inspect` | vision | The WD14 tagger and YOLO detectors, through the ComfyUI venv's Python, on the CPU |
+| `GET /api/vision/capabilities`, `POST /api/vision/tag`, `/detect`, `/inspect` | vision | The WD14 tagger and YOLO detectors, through the ComfyUI venv's Python, on the CPU, one reading at a time; a 503 with `busy: 'memory'` when free memory is too short to start one |
 
 ### Environment
 
@@ -237,6 +322,7 @@ export them first, or use `switchgen dev` and `switchgen validate`.
 | `SWITCHGEN_COMFY`, `SWITCHGEN_COMFY_INPUT` | `/mnt/storage/repos/ComfyUI`, `<comfy>/input` | vision |
 | `SWITCHGEN_PYTHON` | `<comfy>/venv/bin/python` | vision |
 | `SWITCHGEN_WD14` | `<models>/wd14` | vision |
+| `SWITCHGEN_MEMORY_FLOOR_PERCENT` | `8` | vision: the share of RAM below which the system stops programs to get memory back (earlyoom's `-m`) |
 | `SWITCHGEN_LORA_DIR` | `<models>/Lora` | `index-loras` |
 | `SWITCHGEN_TRUSTED_ORIGINS` | empty | the guard, for a TLS terminator that rewrites Host |
 
@@ -245,7 +331,9 @@ export them first, or use `switchgen dev` and `switchgen validate`.
 ```bash
 switchgen            # start ComfyUI if needed, build if anything changed, serve on :5273, open a browser
 switchgen --no-open  # the same without opening a browser (also: switchgen start --no-open)
-switchgen dev        # hot-reloading dev server
+switchgen serve      # build if anything changed, then serve in the foreground (what the user unit runs)
+switchgen dev        # hot-reloading dev server; refuses while the app is serving, since both would write one archive
+switchgen phone      # the https address to open on a phone, or how to set one up
 switchgen validate   # check every graph and derivation against ComfyUI's live schema
 switchgen build      # build without serving
 switchgen stop       # stop this checkout's server; ComfyUI is left running
@@ -254,8 +342,9 @@ switchgen install    # link the launcher into ~/.local/bin
 
 The launcher lives at `bin/switchgen`, reads `.env` beside `package.json`,
 and rebuilds whenever a source file is newer than the last build. Changes to
-`server/*.mjs` need a restart (`switchgen stop && switchgen`), because the
-middlewares are loaded when the server starts.
+`server/*.mjs` need a restart (`switchgen stop && switchgen`, or `systemctl
+--user restart switchgen` under the user unit), because the middlewares are
+loaded when the server starts.
 
 ## Model families
 
@@ -332,19 +421,30 @@ predates the server migrates), and follows the server's event stream. A
 removal is a tombstone, so a device that was offline learns of it. The log
 names itself and each start of the server, so when the archive is started
 again, or the server stopped before it saved changes it had already answered
-for, a browser notices and sends back what the new log lacks.
+for, a browser notices and sends back what the new log lacks. One server holds
+the archive at a time, through `archive.json.lock` beside it; a second one
+started on the same file (a dev server beside the running app, say) answers
+503 for the archive, with a sentence the page quotes, until the first stops.
 
 Files no record describes are filed from the outputs folder, with settings
 read back out of ComfyUI's own history where the graph survives. One job is
 filed once: two tabs following the same shot, or the recovery pass finding a
 file its desk is about to file, make one record, and the desk's account
-replaces the bare one the recovery pass made. A removed record stays removed.
-Its file stays on disk and is remembered as dismissed; the recovery pass
-leaves it out and says so, and files it again only when the reader asks. The
-server holds that line itself: a record filed after the fact for a dismissed
-file is refused unless it says it was asked for, so an older copy of the app
-still cached in some browser cannot bring it back. A file written at that
-path after the removal is a new file, and is filed as usual.
+replaces the bare one the recovery pass made. That holds across devices too,
+because the server itself folds a record the recovery pass filed into the
+desk's record for the same file, which keeps its edition number and what the
+reader added to it. A removed record stays removed. Its file stays on disk and
+is remembered as dismissed; the recovery pass leaves it out and says so, and
+files it again only when the reader asks. The server holds that line itself: a
+record filed after the fact for a dismissed file is refused unless it says it
+was asked for, so an older copy of the app still cached in some browser cannot
+bring it back. A file written at that path after the removal is a new file,
+and is filed as usual.
+
+Delete the file removes every output the record's run wrote, a reel shot's
+last frame as well as its clip, except a last frame the reel in this browser
+still opens a shot on and a file another record names. There is no trash folder to take it
+back from.
 
 ## Reading a picture
 
@@ -354,6 +454,15 @@ is one link, never automatic: under a finished picture, under an attached
 source, on every archive record, and in bulk from the archive rail. Tags go on
 the record and are searchable as `tag:red_hair`. If the tagger is missing the
 page says so and offers to fetch it.
+
+A reading is a process of its own that peaked, measured here, at 951 MB to
+tag 24 pictures and 1.81 GB to read one with the detectors as well. A heavy
+render can take free memory close to the line where the system stops its
+largest program, usually ComfyUI, to get memory back, so one reading runs at
+a time, whichever device asked, and a reading that would leave less than
+that line (8% of RAM, earlyoom's setting here, `SWITCHGEN_MEMORY_FLOOR_PERCENT`)
+plus half a GB is not started. The page gives both figures, what the reading
+needs and what is free, and says to try again later.
 
 ## Scripts
 
@@ -379,7 +488,9 @@ missing stands down with a sentence rather than failing later.
 ## Network posture
 
 Vite binds every interface and allows this machine's hostname and addresses
-and the tailnet, so the app is reachable from a phone. There is no login. The
+and the tailnet, so the app is reachable from a phone. It speaks plain http
+itself; Tailscale Serve gives the tailnet an https address in front of it
+(step 4). There is no login. The
 same-origin guard stops a page on another origin from driving the write
 routes from a browser, its own and ComfyUI's through the proxy alike, CORS is
 off so such a page cannot read the answers either, and every file path is

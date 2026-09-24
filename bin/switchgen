@@ -45,6 +45,72 @@ open_app() {
   fi
 }
 
+# The https address Tailscale Serve gives this app, when it is set up for
+# this port. A phone needs it: over plain http a browser runs no service
+# worker, gives no clipboard and no screen wake lock, and will not install
+# the page as an app. Only read here; the serve config is never changed.
+serve_url() {
+  command -v tailscale >/dev/null || return 1
+  local json
+  # Bounded, so a tailscaled that is still starting (at boot, under the
+  # user unit) cannot hold up the server.
+  json=$(timeout 5 tailscale serve status --json 2>/dev/null) || return 1
+  printf '%s' "$json" | PORT="$PORT" node -e '
+    let text = ""
+    process.stdin.on("data", (d) => { text += d })
+    process.stdin.on("end", () => {
+      let cfg
+      try { cfg = JSON.parse(text || "{}") } catch { process.exit(1) }
+      // A background config, and any serve running in the foreground.
+      const all = [cfg, ...Object.values(cfg.Foreground ?? {})]
+      const port = process.env.PORT
+      const ours = new RegExp(`^(https?://)?(localhost|127\\.0\\.0\\.1|\\[::1\\])?:?${port}/?$`)
+      for (const c of all) {
+        for (const [hostPort, web] of Object.entries(c.Web ?? {})) {
+          const at = hostPort.lastIndexOf(":")
+          const host = hostPort.slice(0, at)
+          const listen = hostPort.slice(at + 1)
+          // The app asks for /api and /comfy from the root, so only a
+          // handler at "/" serves it, and only an https one helps a phone.
+          if (!c.TCP?.[listen]?.HTTPS) continue
+          if (!ours.test(String(web?.Handlers?.["/"]?.Proxy ?? ""))) continue
+          console.log(listen === "443" ? `https://${host}` : `https://${host}:${listen}`)
+          process.exit(0)
+        }
+      }
+      process.exit(1)
+    })'
+}
+
+# This machine's name on the tailnet, for the hint below.
+tailnet_name() {
+  command -v tailscale >/dev/null || return 1
+  timeout 5 tailscale status --json 2>/dev/null | node -e '
+    let text = ""
+    process.stdin.on("data", (d) => { text += d })
+    process.stdin.on("end", () => {
+      try {
+        const name = String(JSON.parse(text).Self?.DNSName ?? "").replace(/\.$/, "")
+        if (!name) process.exit(1)
+        console.log(name)
+      } catch { process.exit(1) }
+    })'
+}
+
+# Where the phone should open the app: the https address when Tailscale
+# Serve is set up for it, or else the one command that sets it up. Nothing
+# is said on a machine without Tailscale.
+phone_line() {
+  local https name
+  if https=$(serve_url); then
+    echo "On the phone: $https"
+  elif name=$(tailnet_name); then
+    echo "For the phone, put https in front once with: tailscale serve --bg $PORT"
+    echo "then open https://$name there (README.md, \"Use it from a phone\")."
+  fi
+  return 0
+}
+
 ensure_comfy() {
   if comfy_up; then return; fi
   if systemctl --user cat comfyui >/dev/null 2>&1; then
@@ -98,6 +164,7 @@ case "${1:-start}" in
       if needs_build; then
         echo "Changes since it started are not being served. Run 'switchgen stop', then 'switchgen'."
       fi
+      phone_line
       open_app
       exit 0
     fi
@@ -122,13 +189,44 @@ case "${1:-start}" in
       exit 1
     fi
     echo "SwitchGen: $URL"
+    phone_line
     open_app
     ;;
+  serve)
+    # The server in the foreground, for a service manager to run and watch
+    # (contrib/switchgen.service). Vite is run straight, with no npm between,
+    # so a stop signal reaches it and `switchgen stop` still finds it.
+    [ -d node_modules ] || npm install
+    if app_up; then
+      # Exiting cleanly, so a unit started beside a copy run by hand is not
+      # restarted over and over against a port that copy holds.
+      echo "SwitchGen is already running at $URL; stop it to let this one serve."
+      exit 0
+    fi
+    if needs_build; then
+      echo "Building."
+      # A build that fails will fail again, so it is not one to retry: the
+      # unit leaves exit status 3 alone (RestartPreventExitStatus).
+      npm run build || { echo "The build failed; nothing is served until it is fixed." >&2; exit 3; }
+    fi
+    phone_line
+    exec "$APP/node_modules/.bin/vite" preview
+    ;;
   dev)
+    # Two servers on one archive each keep their own copy of it and write it
+    # whole, so the second to save undoes the first's records. The dev
+    # server used to start beside the running app without a word, on the
+    # next free port, with the same archive.
+    if app_up; then
+      echo "SwitchGen is already serving at $URL, on the same archive a dev server would use." >&2
+      echo "Stop it first with 'switchgen stop', or give the dev server its own SWITCHGEN_PORT and SWITCHGEN_ARCHIVE." >&2
+      exit 1
+    fi
     [ -d node_modules ] || npm install
     ensure_comfy
     npm run dev
     ;;
+  phone)    phone_line ;;
   build)    npm run build ;;
   validate) npm run validate ;;
   stop)
@@ -148,5 +246,5 @@ case "${1:-start}" in
     echo "Linked $HOME/.local/bin/switchgen -> $APP/bin/switchgen"
     case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "Add $HOME/.local/bin to your PATH." ;; esac
     ;;
-  *) echo "usage: switchgen {start [--no-open]|dev|build|validate|stop|install}"; exit 1 ;;
+  *) echo "usage: switchgen {start [--no-open]|serve|dev|phone|build|validate|stop|install}"; exit 1 ;;
 esac

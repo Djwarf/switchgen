@@ -53,6 +53,11 @@
  * Batching several images into one call amortises the 816 ms down to 170 ms
  * each, which is why /tag and /detect take a list rather than a single path.
  *
+ * Peak memory of that process, measured in the review of 2026-09-23 with the
+ * ComfyUI queue empty: tagging a batch of 24 outputs peaked at 951 MB, and
+ * /inspect (tags plus faces, hands and person) on one picture at 1.81 GB.
+ * That is the size of a thing that can tip a render over; see READER_PEAK.
+ *
  *
  * POSTURE.
  *
@@ -130,6 +135,34 @@ const MAX_IMAGES = 24
 const MAX_UPLOAD = 40 << 20
 /** Longest a child may run before it is killed, per batch. */
 const RUN_MS = 120000
+
+const GIB = 1073741824
+/**
+ * What one reader process is expected to peak at, rounded up from the
+ * figures measured above: 951 MB to tag, 1.81 GB to inspect. Detection alone
+ * was not measured; it loads the same detectors /inspect does, so it is held
+ * to the /inspect figure.
+ */
+const READER_PEAK = { tag: 1.0 * GIB, detect: 1.9 * GIB }
+/**
+ * The share of RAM below which the machine starts stopping programs to get
+ * memory back. earlyoom runs here as `-m 8`, and when it acts it stops the
+ * largest process, which while it renders is ComfyUI: its journal shows it
+ * doing so ten times between 2026-09-21 and 2026-09-22. It is measured
+ * against all of RAM here; earlyoom 1.9 takes zram out of its own total,
+ * which puts its line lower, so this errs on the safe side.
+ */
+const FLOOR_PERCENT = (() => {
+  // 0 is a real answer (no earlyoom, only the kernel's own killer at the end).
+  const set = Number(process.env.SWITCHGEN_MEMORY_FLOOR_PERCENT?.trim() || NaN)
+  return Number.isFinite(set) && set >= 0 && set < 100 ? set : 8
+})()
+/**
+ * Room kept on top of that line, because a render goes on growing while a
+ * reading runs: a reading takes a few seconds, and the free figure is read
+ * once, before it starts.
+ */
+const FLOOR_MARGIN = 0.5 * GIB
 
 // ---------------------------------------------------------------------------
 // Helpers, matching server/api.mjs
@@ -428,6 +461,97 @@ function runPython(request, signal) {
 }
 
 // ---------------------------------------------------------------------------
+// One reader at a time, and only when it fits
+// ---------------------------------------------------------------------------
+
+const gb = n => `${(n / GIB).toFixed(1)} GB`
+
+/**
+ * Why a reader that needs `peak` bytes must not start now, as the sentence
+ * the page shows, or null when it may.
+ *
+ * Every request used to start its own process at once, however many were
+ * running and however little memory was free. A heavy render can take free
+ * memory to within a couple of GB of the line where the machine stops its
+ * largest program, and that program is ComfyUI, not the reader, so a 1 to 2
+ * GB reading at that moment can cost a render of many minutes, and ComfyUI
+ * comes back with an empty queue. So a reading that would leave less than the
+ * line plus a margin is not started, and the sentence gives the real figures,
+ * so the reader can see why and when to try again.
+ */
+export function memoryRefusal(peak, free, total, floorPercent = FLOOR_PERCENT, margin = FLOOR_MARGIN) {
+  const floor = total * floorPercent / 100
+  if (free - peak >= floor + margin) return null
+  const line = `${gb(floor)} at which the system stops its largest program (usually ComfyUI) to get memory back`
+  // A reading that would go below the line says so; "too close to" is kept
+  // for one that would stay above it but inside the margin, where it was the
+  // truth and "under" would not be.
+  const why = free <= peak
+    ? `only ${gb(free)} is free. Running out makes the system stop its largest program (usually ComfyUI) ` +
+      'to get memory back'
+    : free - peak < floor
+      ? `${gb(free)} is free, so reading now would leave about ${gb(free - peak)}, under the ${line}`
+      : `${gb(free)} is free, so reading now would leave about ${gb(free - peak)}. That is too close to the ${line}`
+  return `The picture reader needs about ${gb(peak)} of memory and ${why}, so nothing was read. ` +
+    'Try again once more memory is free, for example when a render has finished.'
+}
+
+/**
+ * One reader process at a time, across every tab and device. Two tabs
+ * reading at once, the phone and the desktop say, used to double the memory
+ * taken. A request waits its turn; one whose page goes while it waits leaves
+ * the line without ever starting a process.
+ */
+let reading = false
+const waiting = []
+
+function takeTurn(signal) {
+  if (!reading) {
+    reading = true
+    return Promise.resolve()
+  }
+  return new Promise((resolve, reject) => {
+    const turn = () => {
+      signal?.removeEventListener('abort', leave)
+      resolve()
+    }
+    const leave = () => {
+      const i = waiting.indexOf(turn)
+      if (i >= 0) waiting.splice(i, 1)
+      reject(Object.assign(new Error('cancelled'), { cancelled: true }))
+    }
+    if (signal?.aborted) return leave()
+    waiting.push(turn)
+    signal?.addEventListener('abort', leave, { once: true })
+  })
+}
+
+function endTurn() {
+  const next = waiting.shift()
+  // Handed straight to the next in line, so the slot stays taken.
+  if (next) next()
+  else reading = false
+}
+
+/**
+ * Run one batch when its turn comes and it fits in memory. Free memory is
+ * read inside the turn, just before the process starts, so it is not counted
+ * while an earlier reader still holds some of it.
+ */
+async function read(request, signal) {
+  await takeTurn(signal)
+  try {
+    const peak = request.detect ? READER_PEAK.detect : READER_PEAK.tag
+    // os.freemem() is MemAvailable on Linux, the figure earlyoom watches.
+    const refusal = memoryRefusal(peak, os.freemem(), os.totalmem())
+    if (refusal) throw Object.assign(new Error(refusal), { busy: 'memory' })
+    return await runPython(request, signal)
+  } finally {
+    endTurn()
+  }
+}
+
+// ---------------------------------------------------------------------------
 // What is actually installed
 // ---------------------------------------------------------------------------
 
@@ -574,7 +698,7 @@ export const visionMiddleware = async (req, res, next) => {
       if (raw) {
         const result = await withUpload(req, async (file) => {
           const request = await buildAndRun([{ index: 0, path: file }])
-          const answer = await runPython(request, abort.signal)
+          const answer = await read(request, abort.signal)
           return { answer }
         })
         if (result.error) return send(res, 400, { error: result.error })
@@ -604,7 +728,7 @@ export const visionMiddleware = async (req, res, next) => {
       if (typeof b.detectThreshold === 'number') request.detectThreshold = b.detectThreshold
       if (typeof b.limit === 'number') request.limit = b.limit
 
-      const answer = await runPython(request, abort.signal)
+      const answer = await read(request, abort.signal)
       if (answer.error) return send(res, 500, { error: answer.error })
       // Hand back the caller's own reference on each row so a batch can be
       // reassembled without the client trusting array order.
@@ -627,6 +751,9 @@ export const visionMiddleware = async (req, res, next) => {
   } catch (err) {
     if (err?.cancelled) { try { res.end() } catch { /* gone */ } return }
     if (res.headersSent) { try { res.end() } catch { /* gone */ } return }
+    // Busy, not broken, and marked so a caller can tell the two apart: the
+    // sentence is meant to be shown as it is.
+    if (err?.busy === 'memory') return send(res, 503, { error: err.message, busy: 'memory' })
     return send(res, err?.timeout ? 504 : 500, { error: String(err?.message ?? err) })
   } finally {
     res.off('close', onClose)

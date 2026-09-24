@@ -141,10 +141,11 @@ export default defineConfig({
         // to any room made every device fetch React and the model tables
         // again. These groups change far less often than the rooms do, and as
         // chunks of their own they keep their hashes, and their cached copies,
-        // across a build that does not touch them. Nothing is loaded later
-        // than before: all of it is still imported from the start. The two
-        // tables import nothing and touch nothing outside themselves when
-        // loaded, so where they sit cannot change what runs first.
+        // across a build that does not touch them. A group's chunk loads with
+        // the first chunk that needs any of it, so grouping can load a module
+        // sooner than the chunk that imports it, never later. The two tables
+        // import nothing and touch nothing outside themselves when loaded, so
+        // where they sit cannot change what runs first.
         codeSplitting: {
           groups: [
             { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/, priority: 3 },
@@ -161,9 +162,13 @@ export default defineConfig({
   // (the pictures, the history) and /api, and send JSON writes that only the
   // origin checks stood in front of. The app's pages come from this server's
   // own origin and need no CORS at all.
-  server: { host, port, proxy, allowedHosts, cors: false },
-  // strictPort: with the port taken, preview used to move to the next free
-  // one without a word, and the launcher found the old server still answering
-  // on this one. Failing is the honest answer; bin/switchgen reports it.
+  //
+  // strictPort: with the port taken, a server used to move to the next free
+  // one without a word. For preview, the launcher then found the old server
+  // still answering on this one. For the dev server it was worse: it came up
+  // beside the running app on the same archive, and each wrote its own copy
+  // of the archive over the other's. Failing is the honest answer;
+  // bin/switchgen reports it.
+  server: { host, port, strictPort: true, proxy, allowedHosts, cors: false },
   preview: { host, port, strictPort: true, proxy, allowedHosts, cors: false },
 })

@@ -41,6 +41,9 @@ const MEDIA = `${VERSION}-media`
 const MEDIA_MAX = 200 // generated files kept locally; oldest evicted past this
 const THUMBS = `${VERSION}-thumbs`
 const THUMBS_MAX = 600 // each a small fraction of the file it stands for
+// How long a page load waits for the network before the kept shell is shown.
+const NAVIGATE_WAIT_MS = 4000
+const LATE = Symbol('late')
 
 const PRECACHE = [
   '/',
@@ -116,6 +119,14 @@ self.addEventListener('fetch', (event) => {
       const cache = await caches.open(name)
       try {
         const res = await fetch(request, { cache: 'no-cache' })
+        // While ComfyUI is down or restarting (earlyoom stops it, and systemd
+        // brings it back five seconds later), the proxy in front of it still
+        // answers, with an empty 502 or 504, so the fetch does not throw and
+        // the catch below never ran: an open picture went blank instead of
+        // showing the copy kept here. ComfyUI itself sends neither status. A
+        // thumbnail is not one of its answers, and a 503 from the thumbnail
+        // server means something of its own (see server/thumbs.mjs).
+        if (!thumb && (res.status === 502 || res.status === 504)) return (await cache.match(request)) ?? res
         // Whole files only: a 206 is part of a clip, and the cache refuses it.
         // A redirect is the thumbnail server handing over the full file
         // because it could not make a small one; that is not a thumbnail,
@@ -151,16 +162,48 @@ self.addEventListener('fetch', (event) => {
   // asset hashes change every build and the cached copy names the previous
   // ones. The cache is the fallback, not the answer: that is what keeps the
   // app booting over flaky wifi without pinning it to an old release.
+  //
+  // A fallback that waits for the network to fail is no help on a weak
+  // signal, where a request can hang for many seconds before it does, and
+  // the page stays blank all that time. So once NAVIGATE_WAIT_MS has passed
+  // the kept shell is shown, and the network's answer, when it comes, still
+  // refreshes the copy for next time.
+  //
+  // Over Tailscale Serve the network does not fail while the app server is
+  // away (stopped, starting at boot, or rebuilding after a restart): the
+  // proxy answers for it, with an empty 502. Shown as the page, that is a
+  // white screen with no script to recover it, and an app opened from the
+  // home screen has no reload control, so it stayed white after the server
+  // came back. A gateway error is therefore taken as the network failing,
+  // and the kept shell boots instead; the app's own offline line and polling
+  // take it from there. Our own server never answers a page load with one.
   if (request.mode === 'navigate') {
     event.respondWith((async () => {
       const cache = await caches.open(SHELL)
-      try {
-        const res = await fetch(request)
-        if (res.ok && res.type === 'basic') cache.put('/', res.clone())
+      const network = fetch(request).then((res) => {
+        if (res.ok && res.type === 'basic') cache.put('/', res.clone()).catch(() => {})
         return res
+      })
+      let timer
+      const late = new Promise((resolve) => { timer = setTimeout(resolve, NAVIGATE_WAIT_MS, LATE) })
+      try {
+        const first = await Promise.race([network, late])
+        const gateway = first !== LATE && first.status >= 502 && first.status <= 504
+        if (first !== LATE && !gateway) return first
+        const shell = await cache.match('/')
+        if (!shell) return first === LATE ? await network : first
+        if (first === LATE) {
+          // Kept alive until the refresh has landed, and a failure there is
+          // nobody's to hear: the page already has its shell.
+          const refresh = network.catch(() => {})
+          event.waitUntil?.(refresh)
+        }
+        return shell
       } catch {
         return (await cache.match('/')) ??
           new Response('Offline', { status: 503, statusText: 'Offline' })
+      } finally {
+        clearTimeout(timer)
       }
     })())
     return

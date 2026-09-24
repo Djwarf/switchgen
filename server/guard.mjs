@@ -192,7 +192,13 @@ export function sseOpen(res) {
   })
 }
 
+/**
+ * One event on an open stream. A stream can outlive its reader (a fetch goes
+ * on after its page has gone; see POST /api/download), so a write to a
+ * response that is closed or ended is skipped rather than attempted.
+ */
 export function sse(res, event, data) {
+  if (res.destroyed || res.writableEnded) return
   try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`) } catch { /* client gone */ }
 }
 

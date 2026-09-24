@@ -12,6 +12,13 @@
 #
 # --output-directory must match SWITCHGEN_OUTPUTS, and the models root must be
 # wired into ComfyUI through extra_model_paths.yaml (see contrib/).
+#
+# --enable-compress-response-body has ComfyUI gzip its JSON and plain-text
+# answers; files such as pictures and clips are sent as they are. ComfyUI 0.37
+# has it. The app's proxy does not compress what it passes on, so without it
+# the model list alone went to the phone as 2,154,283 bytes, where gzip made
+# 244,641 of it when measured here. A unit installed before this line was
+# added needs it added by hand, then a restart of ComfyUI.
 [Unit]
 Description=ComfyUI - AI image and video generation
 After=network-online.target
@@ -23,7 +30,8 @@ ExecStart=%h/ComfyUI/venv/bin/python main.py \
   --port 8188 \
   --output-directory %h/ai/outputs \
   --preview-method auto \
-  --disable-smart-memory
+  --disable-smart-memory \
+  --enable-compress-response-body
 # always, not on-failure. earlyoom stops ComfyUI with SIGTERM, and systemd
 # counts a SIGTERM death as a clean exit, so on-failure never brought it back:
 # on 2026-09-22 earlyoom stopped it and it stayed down. `systemctl --user stop

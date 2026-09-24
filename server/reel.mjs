@@ -332,11 +332,22 @@ async function stitch(req, res, url) {
   // Claim the slot before the first await below, not after. Two requests
   // arriving together would otherwise both clear the check, both pick
   // reel_00004_, and both write it.
-  busy = { startedAt: Date.now(), clips: clipRefs.length, out: null }
+  const slot = { startedAt: Date.now(), clips: clipRefs.length, out: null }
+  busy = slot
+  // Let go of it as the answer goes out, not once assemble returns. After
+  // answering, assemble still waits on the disk to remove its concat list,
+  // and a stitch sent the moment this one answered found the slot taken and
+  // was refused as another reel being assembled. The reel is written, or
+  // removed, before the answer, so the next one cannot meet it half made.
+  // The `finally` still lets go for an answer that never finishes (the page
+  // gone) and for a throw.
+  const release = () => { if (busy === slot) busy = null }
+  res.once('finish', release)
   try {
     return await assemble(b, clipRefs, res, url)
   } finally {
-    busy = null
+    res.off('finish', release)
+    release()
   }
 }
 

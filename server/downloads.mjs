@@ -383,6 +383,79 @@ let activePlans = 0
 const STOP_WAIT_MS = 10000
 
 /**
+ * Every family fetch this process has run lately, for GET
+ * /api/download/status. A fetch goes on when its page goes (see POST
+ * /api/download), so a page opened later has to be able to find it: the
+ * phone reloads, or throws a background tab away, and the page that comes
+ * back has only its own memory, which is empty. An ended one stays listed
+ * for ten minutes, long enough for a page that was asleep while it ended to
+ * hear how it ended, and to refresh what it shows as installed.
+ */
+const PLAN_KEEP_MS = 10 * 60 * 1000
+const plans = new Set()
+
+/**
+ * What GET /api/download/status says about the plans in `list`, one per
+ * family: the one running, or else the one started last. A page keeps one
+ * run per family, and a family can have had more than one plan in the time
+ * kept: one stopped and fetched again, or fetched again with another main
+ * weight chosen. Plans that ended more than PLAN_KEEP_MS before `now` are
+ * left out.
+ */
+export function publicPlans(list, now = Date.now()) {
+  const byFamily = new Map()
+  for (const plan of list) {
+    if (plan.family == null) continue
+    if (plan.endedAt != null && now - plan.endedAt > PLAN_KEEP_MS) continue
+    const seen = byFamily.get(plan.family)
+    const rank = p => (p.state === 'running' ? 1 : 0)
+    if (!seen || rank(plan) > rank(seen) || (rank(plan) === rank(seen) && plan.startedAt > seen.startedAt)) {
+      byFamily.set(plan.family, plan)
+    }
+  }
+  return [...byFamily.values()].map(plan => {
+    const job = plan.current
+    const live = plan.state === 'running' && job && (job.state === 'starting' || job.state === 'downloading')
+    return {
+      family: plan.family,
+      state: plan.state,
+      files: plan.files,
+      current: live
+        ? {
+            // The job id is what Stop names to POST /api/download/cancel.
+            jobId: job.id,
+            filename: job.filename,
+            index: job.fileIndex,
+            count: job.fileCount,
+            state: job.state,
+            done: job.done,
+            total: job.total,
+            pct: job.total ? Math.min(1, job.done / job.total) : 0,
+            speed: job.speed,
+            etaSec: job.etaSec,
+          }
+        : null,
+      finished: [...plan.finished],
+      error: plan.error,
+      startedAt: plan.startedAt,
+      endedAt: plan.endedAt,
+    }
+  })
+}
+
+/** Forget the plans that ended long enough ago. */
+function prunePlans(now = Date.now()) {
+  for (const plan of plans) if (plan.endedAt != null && now - plan.endedAt > PLAN_KEEP_MS) plans.delete(plan)
+}
+
+/** Mark a plan over, however it ended. */
+function endPlan(plan, state, error = null) {
+  plan.state = state
+  plan.error = error
+  plan.endedAt = Date.now()
+}
+
+/**
  * Stop a plan: the file it is on, and every file after it.
  *
  * Nothing used to stop a plan as a whole. A cancel that landed while a file
@@ -664,6 +737,63 @@ async function awaitTurn(other, job, plan, onProgress) {
 }
 
 /**
+ * The file a {url, filename, dest} fetch lands at, relative to the models
+ * root. Throws on a URL that cannot be parsed.
+ */
+function urlTarget(b) {
+  const filename = typeof b.filename === 'string' && b.filename ? b.filename : path.basename(new URL(b.url).pathname)
+  const dest = typeof b.dest === 'string' && b.dest
+    ? (b.dest.endsWith('/') || !path.extname(b.dest) ? path.posix.join(b.dest, filename) : b.dest)
+    : filename
+  return { filename, dest }
+}
+
+/**
+ * The single-file fetch already running for this request: same address,
+ * same file, and no family. It goes on when its page goes (see POST
+ * /api/download), and nothing on the add-on picker or the reader's install
+ * lists it, so the page that comes back shows plain fetch. Pressed, that used
+ * to be refused as already downloading, with no progress and no Stop, until
+ * the file was in. A family's file is not joined this way: stopping it from
+ * here would stop the whole family.
+ */
+function joinableJob(b) {
+  if (typeof b.family === 'string' || typeof b.url !== 'string' || !/^https:\/\//.test(b.url)) return null
+  let dest
+  try { ({ dest } = urlTarget(b)) } catch { return null }
+  for (const j of jobs.values()) {
+    if (j.family == null && j.url === b.url && j.dest === dest && (j.state === 'starting' || j.state === 'downloading')) return j
+  }
+  return null
+}
+
+/**
+ * Stream a running single-file fetch to a second page as though it were
+ * that page's own: the same job id, so its Stop names the file to POST
+ * /api/download/cancel, its progress, and how it ended. Nothing is started,
+ * so this takes no slot, and hanging up only stops the telling.
+ */
+async function followJob(res, job) {
+  sseOpen(res)
+  sse(res, 'plan', { family: null, files: job.plan.files })
+  sse(res, 'start', publicJob(job))
+  const mirror = setInterval(() => sse(res, 'progress', publicJob(job)), 500)
+  const gone = new Promise(resolve => res.once('close', resolve))
+  try {
+    await Promise.race([job.settled, gone])
+  } finally {
+    clearInterval(mirror)
+  }
+  if (job.state === 'done') {
+    sse(res, 'file', publicJob(job))
+    sse(res, 'done', { ids: [job.id], family: null, files: [job.filename], bytes: job.done })
+  } else {
+    sse(res, 'error', publicJob(job))
+  }
+  try { res.end() } catch {}
+}
+
+/**
  * Run a queue of files through aria2c, streaming SSE for each. `plan` is the
  * request's own stop switch (see stopPlan), checked before each file starts
  * and again once its size probe returns.
@@ -729,6 +859,7 @@ async function runPlan(res, queue, familyId, plan) {
         job.done = already.size
         job.state = 'done'
         bytes += job.done
+        plan.finished.push(job.filename)
         sse(res, 'skip', publicJob(job))
         jobs.delete(id)
         continue
@@ -736,10 +867,12 @@ async function runPlan(res, queue, familyId, plan) {
       await fetchFile(job, j => sse(res, 'progress', publicJob(j)))
       job.state = 'done'
       bytes += job.done
+      plan.finished.push(job.filename)
       sse(res, 'file', publicJob(job))
     } catch (err) {
       job.state = job.state === 'cancelled' || plan.cancelled ? 'cancelled' : 'error'
       job.error = String(err?.message ?? err)
+      endPlan(plan, job.state, job.error)
       sse(res, 'error', publicJob(job))
       jobs.delete(id)
       try { res.end() } catch {}
@@ -752,6 +885,7 @@ async function runPlan(res, queue, familyId, plan) {
     }
     jobs.delete(id)
   }
+  endPlan(plan, 'done')
   sse(res, 'done', { ids, family: familyId, files: queue.map(f => f.filename), bytes })
   try { res.end() } catch {}
 }
@@ -853,8 +987,12 @@ export const downloadsMiddleware = async (req, res, next) => {
     }
 
     // ---- GET /api/download/status -----------------------------------------
+    // Every file being fetched, and every family fetch running or ended in
+    // the last ten minutes, so a page that was reloaded or thrown away can
+    // take up the runs its predecessor started.
     if (p === '/api/download/status' && req.method === 'GET') {
-      return send(res, 200, { downloads: [...jobs.values()].map(publicJob) })
+      prunePlans()
+      return send(res, 200, { downloads: [...jobs.values()].map(publicJob), plans: publicPlans(plans) })
     }
 
     // ---- POST /api/download/cancel ----------------------------------------
@@ -896,17 +1034,39 @@ export const downloadsMiddleware = async (req, res, next) => {
     // ---- POST /api/download -----------------------------------------------
     if (p === '/api/download' && req.method === 'POST') {
       if (!guardMutation(req, res)) return
-      // The client hanging up stops the plan, and keeps the partial so -c can
-      // resume it. That has to be heard on the response. The request's own
-      // 'close' fires once its body is read, which readBody below does
-      // straight away, so a listener on it heard nothing: aria2c ran on to
-      // the end of the file, and the plan to the end of its queue. It is
-      // armed before the first await, because the checks below take long
-      // enough for a tab to close during them.
-      const plan = { cancelled: false, current: null, abort: new AbortController() }
-      res.on('close', () => { if (!res.writableEnded) stopPlan(plan) })
+      // A fetch outlives the page that asked for it. It used to stop when the
+      // page hung up, and on a phone the page hangs up all the time: a
+      // reload, a background tab the browser throws away, a locked screen
+      // that drops the connection. A fetch of many GB then needed the screen
+      // on and the page in front for its whole length. A Stop never needed
+      // the hang-up, because it names the file to POST /api/download/cancel
+      // first. So a plan ends only when its files are in, when one fails,
+      // when it is cancelled, or when the server exits (liveAria2c). A page
+      // that comes back finds a family's fetch in GET /api/download/status,
+      // and a single file's by asking for the same file again (joinableJob).
+      //
+      // A hang-up before the plan starts still calls it off: the checks
+      // below take a while, and a fetch nobody has seen start is not one a
+      // page will look for. That has to be heard on the response. The
+      // request's own 'close' fires once its body is read, which readBody
+      // below does straight away. It is armed before the first await,
+      // because a tab can close during the checks.
+      const plan = {
+        cancelled: false, current: null, abort: new AbortController(),
+        family: null, files: [], finished: [], state: 'starting', error: null, startedAt: null, endedAt: null,
+      }
+      let begun = false
+      res.on('close', () => { if (!begun && !res.writableEnded) stopPlan(plan) })
       const b = await readBody(req)
       if (!b) return send(res, 400, { error: 'body must be JSON under 1 MB' })
+      // An add-on or the tagger fetched again while its last fetch still
+      // runs: the page was reloaded or thrown away, and this is the way back
+      // to it. Asked before the slot count, since it starts nothing.
+      const running = joinableJob(b)
+      if (running) {
+        begun = true
+        return followJob(res, running)
+      }
       if (activePlans >= MAX_ACTIVE_PLANS) {
         return send(res, 429, { error: `${MAX_ACTIVE_PLANS} downloads are already running; wait for one to finish` })
       }
@@ -933,10 +1093,7 @@ export const downloadsMiddleware = async (req, res, next) => {
         }))
       } else if (typeof b.url === 'string') {
         if (!/^https:\/\//.test(b.url)) return send(res, 400, { error: 'url must be https' })
-        const filename = typeof b.filename === 'string' && b.filename ? b.filename : path.basename(new URL(b.url).pathname)
-        const dest = typeof b.dest === 'string' && b.dest
-          ? (b.dest.endsWith('/') || !path.extname(b.dest) ? path.posix.join(b.dest, filename) : b.dest)
-          : filename
+        const { filename, dest } = urlTarget(b)
         if (!confine(MODELS, dest)) return send(res, 400, { error: 'dest escapes the models root' })
         const cat = await catalog()
         // A catalogue entry vouches for its own URL and nothing else. It was
@@ -1002,13 +1159,27 @@ export const downloadsMiddleware = async (req, res, next) => {
         return send(res, 429, { error: `${MAX_ACTIVE_PLANS} downloads are already running; wait for one to finish` })
       }
 
+      // From here the plan is on its own; see the top of this route.
+      begun = true
+      const files = queue.map(f => ({ filename: f.filename, dest: f.dest, sizeBytes: f.sizeBytes, gated: f.gated }))
+      Object.assign(plan, { family: familyId, files, state: 'running', startedAt: Date.now() })
+      // A single file fetched by address (an add-on, the tagger) has no
+      // family, and nothing takes it up by one, so only families are listed.
+      // Its page finds it again by asking for the same file (joinableJob).
+      if (familyId != null) {
+        prunePlans()
+        plans.add(plan)
+      }
       sseOpen(res)
-      sse(res, 'plan', { family: familyId, files: queue.map(f => ({ filename: f.filename, dest: f.dest, sizeBytes: f.sizeBytes, gated: f.gated })) })
+      sse(res, 'plan', { family: familyId, files })
       activePlans += 1
       try {
         await runPlan(res, queue, familyId, plan)
       } finally {
         activePlans -= 1
+        // runPlan settles the plan on every path it knows; a throw it did
+        // not expect must not leave it listed as running for good.
+        if (plan.state === 'running') endPlan(plan, 'error', 'the fetch stopped unexpectedly')
       }
       return
     }

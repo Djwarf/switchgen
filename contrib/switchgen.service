@@ -1,0 +1,38 @@
+# A systemd user unit for SwitchGen itself, so the app is back after the
+# machine restarts and a phone's home-screen icon finds it without anyone
+# running `switchgen` at the desk.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/switchgen.service ~/.config/systemd/user/
+#
+# Then change %h/switchgen below, in the copy, to the folder this checkout is
+# in. The launcher reads the checkout's .env itself, so nothing else needs
+# setting here, unless node is not on the system's own PATH (installed
+# through nvm, say): then add an Environment=PATH=... line that names it.
+# Only after that, enable it:
+#
+#   systemctl --user daemon-reload && systemctl --user enable --now switchgen
+#
+# A user unit starts at login, not at boot. `loginctl enable-linger $USER`
+# starts this one, and ComfyUI's, when the machine does.
+[Unit]
+Description=SwitchGen - the app, served for the tailnet
+After=network-online.target
+
+[Service]
+Type=simple
+# Builds when anything changed since the last build, then runs the server in
+# the foreground (bin/switchgen, "serve").
+ExecStart=%h/switchgen/bin/switchgen serve
+# Brought back if it crashes. Vite ends with status 143 when it is told to
+# stop, by `switchgen stop` as well as by systemd, and that is a stop, not a
+# crash. Status 3 is a build that failed: trying it again every few seconds
+# would fail the same way, so the unit waits for someone to fix it.
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=143
+RestartPreventExitStatus=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
