@@ -132,9 +132,10 @@ Fetch the rest from the catalogue behind More, which shows each family's
 missing files, their size and the server's fit verdict. Once a fetch has
 begun it runs on the server, not in the page: a reload, a locked phone or a
 dropped connection leaves it going. Before that, while the server is still
-checking the disk and memory, closing the page calls it off. When the page comes back, the catalogue finds a family's
-fetch again, with its Stop. An add-on or the picture reader's tagger is not
-shown again by itself: pressing its fetch once more takes up the fetch still
+checking the disk and memory, closing the page calls it off. When the page
+comes back, the catalogue finds a family's fetch again, with its Stop.
+An add-on or the picture reader's tagger is not shown again by itself:
+pressing its fetch once more takes up the fetch still
 running, with its progress and Stop, rather than starting a second. Add-ons
 are indexed from your own LoRA folder with `npm run index-loras`, which reads
 each file's header and rewrites `src/lib/loraIndex.ts`; the checked-in index
@@ -170,9 +171,12 @@ port, and the command above when it is not. The setting stays until
 
 To the browser the https address is a different site from the http one,
 with storage of its own. The archive lives on the server and is the same at
-either address; what the phone kept only in the browser under the old
-address stays there, clips waiting in the Video lane and a reel in progress
-included, so let those finish first. Current browsers mark the app's own
+either address, and so is the work waiting in the queue on the server (see
+"Work that waits" below): a clip, batch or reel sent from the old address
+goes on, and shows at the new one. What the phone kept only in the browser
+under the old address stays there: the reel's list of shots, and, on a
+server without the queue, clips waiting in the Video lane and a reel in
+progress, so let those finish first. Current browsers mark the app's own
 requests as same-origin, which the write guard accepts behind Serve with no
 setting. If writes are refused as cross-site (an older browser, or a proxy
 that rewrites the Host header), set `SWITCHGEN_TRUSTED_ORIGINS` in `.env` to
@@ -210,33 +214,131 @@ server in the foreground, restarted if it crashes. After a change, `systemctl
 | Reel | `#/reel` | A list of shots rendered in order, each opening on the last frame of the one before, joined by the server into one file. |
 | Archive | `#/archive` | Every picture and clip, searchable, with the settings that made it. One archive for every device. |
 
-The 14B text-to-video pair has been killed for memory when models from
-earlier runs were still loaded, so a clip on either 14B pair waits until
-ComfyUI has nothing queued or running, has ComfyUI release its cached models,
-and only then is sent.
-Until it is sent, nothing on the server knows about it. The clips waiting in
-that lane are kept in the tab's own session storage: a reload of the tab
-picks them up again in order, and closing the tab loses them, which the desk
-says while any are waiting. A copied tab, or a page that crashed, does not
-send what it finds on a guess; the desk lists those clips and asks whether to
-send them from here or forget them. Stop, on the desk or in the section bar,
-calls a waiting clip off before it is ever sent, and on the Pictures desk it
-stops the rest of the batch as well as the picture in hand.
+### Work that waits
 
-Three kinds of work wait in the page, not in ComfyUI: clips in that lane,
-the shots of a reel after the one on the press, and the pictures of a batch
-after the one being made. The page sends each when its turn comes, so while
-the page is closed or hidden, or the phone is locked, nothing more is sent;
-what ComfyUI already has carries on. The desk says so while anything waits,
-and over https (step 4) the page keeps the screen on until the last one has
-gone, except while the Video desk holds its lane after a lost clip: then
-nothing goes until you send the waiting clips or call them off, and the
+Work that waits its turn waits on the SwitchGen server, in a queue of its
+own, wherever the server runs one (`GET /api/capabilities` says so, desk by
+desk). Make, Run and Render each hand the whole of the work to the server in
+one request, and from then on the page only watches: the server sends each
+clip, picture or shot to ComfyUI when its turn comes and files what it makes
+in the archive. Closing the page, reloading it or locking the phone stops
+nothing, and the section bar on every device shows the same work, with its
+Stop, whichever device sent it. The desk says so while anything waits, and
+keeps no screen awake for it. If the SwitchGen server itself stops, the work
+waits and carries on when the server is back.
+
+The 14B text-to-video pair has been killed for memory when models from
+earlier runs were still loaded, so a clip on either 14B pair, and any clip
+or reel shot whose memory check asks for it, is heavy. A heavy job waits
+until ComfyUI has nothing queued or running, has ComfyUI release its cached
+models, waits a moment (`SWITCHGEN_RUNNER_SETTLE_MS`), checks that the queue
+is still empty, and only then is sent. A graph that samples in two passes is
+taken as heavy whatever the page said. Stop, on the desk or in the section
+bar and from any device, calls a waiting job off before it is ever sent; on
+the Pictures desk it stops the rest of the batch as well as the picture in
+hand, and on the Reel the rest of the pass.
+
+If ComfyUI loses a heavy job (it restarted, say), or a heavy job may never
+have reached it, while another heavy job waits, nothing heavy is sent until
+you send the waiting work or call it off, from any device; light work goes
+on. Everything that was waiting when the machine itself restarted is held the
+same way, because hours may have passed and ComfyUI came back empty, and so
+is everything that waited while the queue was off (see below). A restart of
+the SwitchGen server alone holds nothing: the work picks up where it was.
+When the answer to a send is unclear (the connection dropped part way), the
+queue asks ComfyUI whether it has the job rather than sending it again, and a
+job ComfyUI never got is marked as not sent, never sent a second time.
+
+While anything is held, every room shows the same notice, on every device:
+one line saying why (a heavy job was lost, one may not have reached ComfyUI,
+the machine restarted, or the queue was off while work waited), how many
+waiting jobs the hold covers on each desk (the heavy ones when a heavy job
+began it, every one after a restart or a time with the queue off), and two
+controls, Send them and Call them off, so the hold can be lifted from
+whichever room is open. A desk may say so as well for its own jobs, and then
+counts them the same way. Either answer is for the hold the page showed. If
+that hold has since been answered on another device, or a new one has begun
+(a heavy job lost while the phone slept, say), the server turns the answer
+down, and the notice shows what is held now, if anything, with its own reason
+and count. A notice left from an earlier hold cannot answer a later one.
+
+A reel shot that opens on the last frame of the shot before it in the same
+pass is completed on the server once that shot lands, so the pass goes on
+with no page open. A pass is refused while another pass of any of the same
+shots is being rendered, from this page or another.
+
+The queue's folder belongs to one archive. It sits beside the archive and is
+named after it: `runner` beside the default `archive.json`, and the archive
+file's name with `.runner` added beside any other (`archive-b.json.runner` for
+`archive-b.json`), so two archives in one folder never share a list of work
+(`SWITCHGEN_RUNNER_DIR` names another folder). The queue writes its list there
+before each step it takes, and forgets a job 48 hours after it ended, or
+sooner once 500 have ended. A reel's pass that no page has taken in yet is
+kept apart, for 30 days and up to 2000 such jobs, because only the browser
+that pressed it can fold its clips into that reel's list of shots. It runs
+only in the server that holds both the archive's lock and the `lock` file in
+that folder, which names the server's process and is let go when it exits; a
+lock left by a process that has gone, or from before the machine restarted, is
+taken over. A second server on the same outputs (a dev server beside the
+running app, say) stands back from the queue as it does from the archive, and
+its pages send their own work. So does a server that finds the folder's lock
+held by another, as when two are pointed at one folder by
+`SWITCHGEN_RUNNER_DIR`.
+
+Compared with pages that send their own work, the queue changes a few
+things:
+
+- One heavy lane covers the Video desk and the Reel on every device, and a
+  heavy job lost on either holds both.
+- The queue has one job at a time in ComfyUI and takes turns between
+  batches, reels and clips, so a picture pressed during a reel goes after the
+  shot in hand, not after the whole reel.
+- A job's time is ComfyUI's own, from the moment it started running the job
+  to its end, without the time it waited. A job whose start ComfyUI did not
+  record is filed with no time.
+- One batch of pictures is made at a time, whichever device asks; another is
+  refused until it ends.
+- After the machine restarts, waiting work is held until you say. So is
+  work that waited while the queue was off, once it runs again.
+
+Turning the queue off loses nothing it holds. While `SWITCHGEN_RUNNER=off` is
+set, or while the server stands back and no other server runs its folder,
+nothing on its list is sent, but `GET /api/runner` still answers that list,
+read-only, so every page shows the work as waiting on a queue that is off,
+with the server's reason, not as gone. A page cannot stop it or send it: the
+server refuses every change to that list until a queue runs the folder again.
+So a desk only shows that work: it does not take it up or wait on it, offers
+no Stop for it, and leaves its press free for work the page sends itself
+(below). No hold is shown either, since its controls could not work. When a
+queue does run it again, all the work still waiting is held, as after a
+machine restart, until you send it or call it off: you may have made some of
+it again in the page meanwhile, so nothing that waited is sent without your
+word.
+
+On a server without the queue, or with SWITCHGEN_RUNNER=off, the desks work
+as before, and so does a desk that still has work of its own under way from
+before the queue. Then a heavy clip waits in the page itself, and until it is
+sent, nothing on the server knows about it. The clips waiting in that lane
+are kept in the tab's own session storage: a reload of the tab picks them up
+again in order, and closing the tab loses them, which the desk says while any
+are waiting. A copied tab, or a page that crashed, does not send what it
+finds on a guess; the desk lists those clips and asks whether to send them
+from here or forget them.
+
+Three kinds of work then wait in the page, not in ComfyUI: clips in that
+lane, the shots of a reel after the one on the press, and the pictures of a
+batch after the one being made. The page sends each when its turn comes, so
+while the page is closed or hidden, or the phone is locked, nothing more is
+sent; what ComfyUI already has carries on. The desk says so while anything
+waits, and over https (step 4) the page keeps the screen on until the last
+one has gone, except while the Video desk holds its lane after a lost clip:
+then nothing goes until you send the waiting clips or call them off, and the
 screen may sleep. A browser does not allow the wake lock over plain http.
 
-A clip or picture already sent is kept in the tab's session storage with its
-job number until it settles. When the page is reloaded, or the phone threw
-the background tab away and opens it again, the desk follows it again, with
-its progress and Stop, and files it when it finishes. If ComfyUI has
+A clip or picture the page sent itself is kept in the tab's session storage
+with its job number until it settles. When the page is reloaded, or the phone
+threw the background tab away and opens it again, the desk follows it again,
+with its progress and Stop, and files it when it finishes. If ComfyUI has
 restarted in the meantime and has no record of it, the desk says the job was
 lost rather than waiting on it.
 
@@ -253,10 +355,10 @@ Browser (React 19 + Tailwind 4, hash router, no state library)
    |  /comfy      -> HTTP       (proxied by Vite, single origin)
    |  /comfy-ws   -> WebSocket  (live progress, reconnecting)
    |  /api/*      -> the SwitchGen middleware below, in the same Vite process
-   v
+   v                                 (its queue talks to ComfyUI directly)
 ComfyUI :8188                      systemctl --user status comfyui
 /mnt/storage/ai/models             the shared model library
-/mnt/storage/ai/outputs            generated files, and .switchgen/archive.json
+/mnt/storage/ai/outputs            generated files, .switchgen/archive.json and the queue's .switchgen/runner
 ```
 
 Nothing imports ComfyUI's Python. The only coupling is node names and input
@@ -264,7 +366,7 @@ schemas, which `npm run validate` checks against the live server.
 
 ### The local server
 
-Six Vite middlewares in `server/` mount under `/api` in both `vite dev` and
+Seven Vite middlewares in `server/` mount under `/api` in both `vite dev` and
 `vite preview`. Every mutating route runs the same-origin guard in
 `server/guard.mjs`: the browser's `Sec-Fetch-Site` verdict when present, else
 `Origin` must match `Host`, and the body must be the type the route reads. A
@@ -278,6 +380,12 @@ is off in both servers, so a page on another port of this machine cannot
 read what either answers. `GET /api/capabilities` probes the binaries below
 and reports what actually runs. A JSON answer of 1 KB or more is gzipped
 when the browser accepts it.
+
+The queue on the server (`server/runner.mjs`, with its parts in
+`server/runner/`) is the one piece of the server that sends work to ComfyUI.
+It goes to `COMFY_URL` directly, not through `/comfy`. While it is not
+running it answers 503 to every write, with its reason, and still answers
+what its list holds, read-only.
 
 ComfyUI sends the files behind `/view` with no `Cache-Control`, and it gives a
 deleted file's name to the next render, so the proxy marks those answers
@@ -293,7 +401,13 @@ again, and an unchanged file costs a 304.
 | `GET /api/thumb?rel=&w=` | thumbs | A WebP of one output, 256, 512 or 1024 pixels wide, made with ffmpeg and kept under `<outputs>/.switchgen/thumbs`; a picture it cannot shrink is redirected to the full file |
 | `GET /api/archive`, `GET /api/archive/stream` | archive | The shared archive as a revision log, and its event stream |
 | `POST /api/archive/upsert`, `/remove`, `/restore` | archive | Write records; the server assigns revisions and edition numbers |
-| `GET /api/outputs` | archive | Every media file under the outputs root |
+| `GET /api/outputs` | archive | Every media file under the outputs root, marking the files a record names or the queue is filing |
+| `GET /api/runner`, `GET /api/runner/stream` | runner | Everything the queue holds, its batches, clips and shots, and their event stream; when this server does not run the queue, the reason, and the saved list read-only |
+| `GET /api/runner/jobs/:id`, `/jobs/:id/preview` | runner | One job with its graph and record template, and the newest preview ComfyUI sent for it |
+| `POST /api/runner/groups` | runner | Hand the queue a batch of pictures, a reel's pass or clips; sent again with the same ids, it is taken once |
+| `POST /api/runner/jobs/:id/stop`, `/groups/:id/stop` | runner | Stop one job, or a whole batch or pass, from any device |
+| `POST /api/runner/lane` | runner | Send or call off the work held after a lost job, a machine restart or a time with the queue off, naming the hold the page showed; refused when that hold has changed since |
+| `POST /api/runner/dismiss` | runner | Put away jobs that have ended |
 | `GET /api/catalog`, `GET /api/catalog/plan` | downloads | The 104-family catalogue annotated with what is on disk; a fit verdict and download plan per family |
 | `POST /api/download`, `/download/cancel`, `GET /download/status` | downloads | Fetch through aria2c, resumable, as an event stream; a fetch goes on when its page goes, and the status lists each family fetch that is running or ended in the last ten minutes |
 | `GET /api/reel/probe`, `POST /api/reel/stitch` | reel | Probe clips with ffprobe; join them with ffmpeg |
@@ -308,13 +422,17 @@ export them first, or use `switchgen dev` and `switchgen validate`.
 
 | Variable | Default | Used by |
 |---|---|---|
-| `COMFY_URL` | `http://127.0.0.1:8188` | the Vite proxy, the launcher, `validate`, `chain-e2e` |
+| `COMFY_URL` | `http://127.0.0.1:8188` | the Vite proxy, the queue on the server, the launcher, `validate`, `chain-e2e` |
 | `SWITCHGEN_PORT` | `5273` | where the app listens, and where the launcher looks for it |
 | `SWITCHGEN_NO_OPEN` | empty | the launcher: any value starts without opening a browser |
 | `SWITCHGEN_ALLOWED_HOSTS` | empty | extra hostnames the app may be reached by, comma separated |
 | `SWITCHGEN_MODELS` | `/mnt/storage/ai/models` | api, downloads, vision, `index-loras` |
 | `SWITCHGEN_OUTPUTS` | `/mnt/storage/ai/outputs` | api, archive, thumbs, reel, vision |
 | `SWITCHGEN_ARCHIVE` | `<outputs>/.switchgen/archive.json` | archive |
+| `SWITCHGEN_RUNNER` | empty | the queue on the server: `off` turns it off, and every desk sends its own work; what the queue had saved shows as waiting, and is held until you say once it is on again |
+| `SWITCHGEN_RUNNER_DIR` | beside the archive and named after it: `<outputs>/.switchgen/runner` for the default archive, `<archive file>.runner` for any other | the queue's list of work and its lock, for one archive |
+| `SWITCHGEN_RUNNER_DESKS` | `video,images,reel` | the desks whose work goes through the queue |
+| `SWITCHGEN_RUNNER_SETTLE_MS` | `1000` | how long the queue waits after ComfyUI is asked to release its memory before it checks the queue again and sends a heavy job |
 | `SWITCHGEN_THUMBS` | `<outputs>/.switchgen/thumbs` | thumbs |
 | `SWITCHGEN_CATALOG` | `server/catalog.json` | downloads |
 | `SWITCHGEN_ARIA2C`, `SWITCHGEN_FFMPEG`, `SWITCHGEN_FFPROBE` | `/usr/bin/...` | downloads, reel, thumbs, capabilities |
@@ -433,18 +551,21 @@ file its desk is about to file, make one record, and the desk's account
 replaces the bare one the recovery pass made. That holds across devices too,
 because the server itself folds a record the recovery pass filed into the
 desk's record for the same file, which keeps its edition number and what the
-reader added to it. A removed record stays removed. Its file stays on disk and
-is remembered as dismissed; the recovery pass leaves it out and says so, and
-files it again only when the reader asks. The server holds that line itself: a
-record filed after the fact for a dismissed file is refused unless it says it
-was asked for, so an older copy of the app still cached in some browser cannot
-bring it back. A file written at that path after the removal is a new file,
-and is filed as usual.
+reader added to it. Work the queue on the server makes is filed by the server
+itself, once, under the job's own id, and the job is done only once its
+record is on disk; while it files, `GET /api/outputs` lists the files as
+filed, so the recovery pass leaves them to it. A removed record stays
+removed. Its file stays on disk and is remembered as dismissed; the recovery
+pass leaves it out and says so, and files it again only when the reader asks.
+The server holds that line itself: a record filed after the fact for a
+dismissed file is refused unless it says it was asked for, so an older copy
+of the app still cached in some browser cannot bring it back. A file written
+at that path after the removal is a new file, and is filed as usual.
 
 Delete the file removes every output the record's run wrote, a reel shot's
 last frame as well as its clip, except a last frame the reel in this browser
-still opens a shot on and a file another record names. There is no trash folder to take it
-back from.
+still opens a shot on and a file another record names. There is no trash
+folder to take it back from.
 
 ## Reading a picture
 
@@ -471,7 +592,7 @@ needs and what is free, and says to try again later.
 | `npm run dev` / `build` / `preview` | Vite |
 | `npm start` | `bin/switchgen start` |
 | `npm run lint` | oxlint |
-| `npm test` | Vitest: the pure modules under `src/lib`, the desks' job engines and the press ledger with ComfyUI stood in, a few components rendered to a string, the service worker, the Vite config, the launcher's install advice, and the server middlewares against temporary folders. Needs no ComfyUI, no models, no running app and no LoRA index of your own |
+| `npm test` | Vitest: the pure modules under `src/lib`, the desks' job engines and the press ledger with ComfyUI stood in, a few components rendered to a string, the service worker, the Vite config, the launcher's install advice, the server middlewares against temporary folders, and the queue on the server against a stand-in ComfyUI. Needs no ComfyUI, no models, no running app and no LoRA index of your own |
 | `npm run validate` | Every node class the graphs use, naming a missing node pack, then every base graph, image-to-image variant, quality derivation, continuation derivation and video add-on chain, checked node by node against ComfyUI's live `/object_info`. Exits 1 when anything fails and 2 when ComfyUI cannot be reached |
 | `npm run index-loras` | Reads every safetensors header in the LoRA folder and writes `src/lib/loraIndex.ts`: bases, triggers and training vocabulary, with no network calls |
 | `npx tsx scripts/chain-e2e.ts` | A live two-shot reel on the 5B family, end to end, against the GPU |
