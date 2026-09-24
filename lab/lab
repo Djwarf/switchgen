@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# The model lab's launcher. Every command runs from the repo root.
+#
+#   lab/lab test        the lab's own tests (never part of `npm test`)
+#   lab/lab typecheck   the lab's own type check (never part of `tsc -b`)
+#   lab/lab help        every other command, which lab/bin/lab.ts runs
+#
+# Nothing here sends work anywhere: pictures are made only after Start is
+# pressed on the lab page or `lab/lab start <run>` is run. See lab/README.md.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+
+case "${1:-}" in
+  test)
+    shift
+    exec npx vitest run --config lab/vitest.config.ts "$@"
+    ;;
+  typecheck)
+    shift
+    exec npx tsc -p lab/tsconfig.json "$@"
+    ;;
+  *)
+    exec npx tsx lab/bin/lab.ts "$@"
+    ;;
+esac

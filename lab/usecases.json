@@ -1,0 +1,51 @@
+[
+  {
+    "id": "thumbnail",
+    "name": "Video thumbnail",
+    "note": "A clear focal point with room for a title, readable at 160 pixels.",
+    "weights": { "layout": 3, "following": 2, "text": 1, "photo": 1, "anatomy": 1, "shapes": 1, "cost": 1 },
+    "mustHave": ["layout"]
+  },
+  {
+    "id": "magazine-cover",
+    "name": "Magazine or book cover",
+    "note": "Exact lettering on a tall frame with space kept for the title.",
+    "weights": { "text": 3, "layout": 2, "photo": 1, "anatomy": 1, "following": 1, "shapes": 1 },
+    "mustHave": ["text"]
+  },
+  {
+    "id": "portrait-photo",
+    "name": "Portrait photo",
+    "note": "A believable photograph of an adult, with hands and faces right.",
+    "weights": { "photo": 3, "anatomy": 3, "detail": 1, "following": 1, "defaults": 1, "content": 1 },
+    "mustHave": ["photo", "anatomy"]
+  },
+  {
+    "id": "anime-illustration",
+    "name": "Anime illustration",
+    "note": "A drawn character piece: anatomy, following and a steady character matter more than photo skills.",
+    "weights": { "anatomy": 2, "following": 2, "character": 2, "style": 1, "variation": 1, "content": 1 },
+    "mustHave": ["anatomy"]
+  },
+  {
+    "id": "pet-restyle",
+    "name": "Pet restyle",
+    "note": "Your own pet from a photo, restyled, and still recognisably your pet.",
+    "weights": { "reference": 3, "style": 2, "character": 1, "edit": 1 },
+    "mustHave": ["reference"]
+  },
+  {
+    "id": "product-shot",
+    "name": "Product shot",
+    "note": "A clean studio photograph where materials read right and the frame does what it is told.",
+    "weights": { "photo": 3, "following": 2, "detail": 1, "layout": 1, "negative": 1, "cost": 1 },
+    "mustHave": ["photo"]
+  },
+  {
+    "id": "storybook",
+    "name": "Storybook",
+    "note": "The same character across pages in a painted style, following each scene.",
+    "weights": { "character": 3, "style": 2, "following": 2, "anatomy": 1, "shapes": 1, "variation": 1 },
+    "mustHave": ["character"]
+  }
+]

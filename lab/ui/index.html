@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#1e1e1e">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex">
+  <title>SwitchGen Lab</title>
+  <link rel="stylesheet" href="/ui/judge.css">
+  <script defer src="/ui/judge.js"></script>
+  <script defer src="/ui/refs.js"></script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#/">Lab</a>
+    <nav>
+      <a href="#/" data-nav="runs">Runs</a>
+      <a href="#/refs" data-nav="refs">Photos</a>
+    </nav>
+    <span id="net" class="net" aria-live="polite"></span>
+  </header>
+  <main id="view"><p class="muted">Loading…</p></main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="full" hidden aria-modal="true" role="dialog" aria-label="Full screen picture">
+    <div class="stage" id="full-stage">
+      <div class="topbar">
+        <button class="small" id="full-close" type="button">Close</button>
+        <span class="hint" id="full-hint">Swipe for the next picture · pinch to zoom · double-tap for the full-size copy</span>
+      </div>
+      <img id="full-img" alt="">
+    </div>
+    <div class="bar2">
+      <span class="where" id="full-where"></span>
+      <div class="row">
+        <button class="small" id="full-flip" type="button">Flip</button>
+        <button class="small" id="full-fail" type="button" aria-pressed="false">Failed</button>
+        <button class="small" id="full-best" type="button" aria-pressed="false">Best</button>
+      </div>
+    </div>
+  </div>
+  <noscript><p style="padding:16px">The lab page needs JavaScript.</p></noscript>
+</body>
+</html>

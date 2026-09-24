@@ -1,0 +1,31 @@
+{
+  // The lab's own type check: `lab/lab typecheck`, which runs
+  // `npx tsc -p lab/tsconfig.json`. It is not referenced from the root
+  // tsconfig.json, so `tsc -b` and the app build never see lab/. The module
+  // settings match tsconfig.scripts.json, because tsx runs both the same way.
+  // allowJs lets a lab file import one of the server's .mjs modules that has
+  // no .d.mts beside it (server/guard.mjs); checkJs stays off, so the
+  // server's own files are read for their types, not checked here.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["./**/*.ts"]
+}
