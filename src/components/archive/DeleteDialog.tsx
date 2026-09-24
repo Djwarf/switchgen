@@ -7,14 +7,18 @@
  *
  * The copy states what actually happens on this machine. `POST /api/delete`
  * unlinks the file; there is no trash folder to fall back on, so the dialog
- * does not offer one.
+ * does not offer one. A record whose run wrote more than one file (a reel
+ * shot's last frame beside its clip) takes all of them, and the dialog names
+ * every one, and any kept.
  */
 import { useEffect, useRef, useState } from 'react'
-import type { HistoryEntry } from '../../lib/history'
+import { filesToDelete, type HistoryEntry } from '../../lib/history'
 import { relPath } from '../../lib/comfy'
 
 type Props = {
   records: readonly HistoryEntry[]
+  /** Files something else still uses, which stay on disk. The same test the deletion is given. */
+  keep?: (rel: string) => boolean
   busy: boolean
   error: string | null
   onCancel: () => void
@@ -25,14 +29,19 @@ const OUTPUTS = '/mnt/storage/ai/outputs'
 /** Above this many files, the count has to be typed out. */
 const TYPE_THRESHOLD = 5
 
-export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Props) {
+export function DeleteDialog({ records, keep, busy, error, onCancel, onConfirm }: Props) {
   const panel = useRef<HTMLDivElement | null>(null)
   const cancel = useRef<HTMLButtonElement | null>(null)
   const [typed, setTyped] = useState('')
 
+  const plans = records.map((r) => filesToDelete(r, { keep }))
+  const total = plans.reduce((n, p) => n + p.go.length, 0)
+  const extras = plans.length === 1 ? plans[0].go.slice(1) : []
+  const kept = plans.flatMap((p) => p.kept)
   const many = records.length > 1
-  const needsTyping = records.length > TYPE_THRESHOLD
-  const ready = !busy && (!needsTyping || typed.trim() === String(records.length))
+  const files = total > 1
+  const needsTyping = total > TYPE_THRESHOLD
+  const ready = !busy && (!needsTyping || typed.trim() === String(total))
 
   useEffect(() => {
     cancel.current?.focus()
@@ -82,26 +91,57 @@ export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Prop
           id="delete-title"
           className="border-b-2 border-burgundy-900 pb-1 text-[0.625rem] font-semibold tracking-[0.18em] text-burgundy-900 uppercase"
         >
-          {many ? `Delete ${records.length} files` : 'Delete the file'}
+          {files ? `Delete ${total} files` : 'Delete the file'}
         </h2>
 
         <p className="mt-4 text-body leading-relaxed">
           {many ? (
             <>
-              This removes {records.length} files from <span className="text-grey-700">{OUTPUTS}</span>.
+              This removes {total} files from <span className="text-grey-700">{OUTPUTS}</span>
+              {total > records.length
+                ? `: those of ${records.length} records, and the other files their runs wrote.`
+                : '.'}
             </>
           ) : (
             <>
               This removes{' '}
               <span className="font-semibold">{relPath(records[0].file)}</span> from{' '}
-              <span className="text-grey-700">{OUTPUTS}</span>.
+              <span className="text-grey-700">{OUTPUTS}</span>
+              {extras.length ? (
+                <>
+                  , and with it {extras.length === 1 ? 'the other file' : `the ${extras.length} other files`} its
+                  run wrote:{' '}
+                  {extras.map((f, i) => (
+                    <span key={relPath(f)}>
+                      {i ? ', ' : ''}
+                      <span className="font-semibold">{relPath(f)}</span>
+                    </span>
+                  ))}
+                  .
+                </>
+              ) : (
+                '.'
+              )}
             </>
           )}
         </p>
 
+        {kept.length ? (
+          <p className="mt-2 text-body leading-relaxed">
+            {kept.length === 1 ? (
+              <>
+                <span className="font-semibold">{relPath(kept[0])}</span> stays, because the reel still
+                opens a shot on it.
+              </>
+            ) : (
+              `${kept.length} last frames stay, because the reel still opens shots on them.`
+            )}
+          </p>
+        ) : null}
+
         <p className="mt-2 text-body leading-relaxed">
-          The {many ? 'files go' : 'file goes'} at once and for good. There is no trash folder on
-          this machine, so we cannot put {many ? 'them' : 'it'} back.{' '}
+          The {files ? 'files go' : 'file goes'} at once and for good. There is no trash folder on
+          this machine, so we cannot put {files ? 'them' : 'it'} back.{' '}
           {many ? 'Their records leave' : 'The record leaves'} the archive at the same time.
         </p>
 
@@ -121,7 +161,7 @@ export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Prop
         )}
 
         <p className="mt-3 text-small text-grey-700 italic">
-          To keep the {many ? 'files' : 'file'} and only stop seeing{' '}
+          To keep the {files ? 'files' : 'file'} and only stop seeing{' '}
           {many ? 'these records' : 'this record'}, cancel and choose{' '}
           <span className="not-italic">Remove from the archive</span> instead.
         </p>
@@ -129,7 +169,7 @@ export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Prop
         {needsTyping && (
           <label className="mt-4 block">
             <span className="block text-[0.625rem] font-semibold tracking-[0.18em] text-grey-700 uppercase">
-              Type {records.length} to confirm
+              Type {total} to confirm
             </span>
             <input
               value={typed}
@@ -155,16 +195,16 @@ export function DeleteDialog({ records, busy, error, onCancel, onConfirm }: Prop
             type="button"
             onClick={onConfirm}
             disabled={!ready}
-            className="border border-error bg-error px-4 py-2 text-[0.75rem] font-semibold tracking-[0.16em] text-newsprint uppercase hover:bg-newsprint hover:text-error disabled:border-grey-300 disabled:bg-grey-300 disabled:text-grey-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+            className="border border-error bg-error px-4 py-2 text-[0.75rem] font-semibold tracking-[0.16em] text-newsprint uppercase hover:bg-newsprint hover:text-error disabled:border-grey-300 disabled:bg-grey-300 disabled:text-grey-500 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
           >
-            {busy ? 'Deleting…' : many ? `Delete ${records.length} files` : 'Delete the file'}
+            {busy ? 'Deleting…' : files ? `Delete ${total} files` : 'Delete the file'}
           </button>
           <button
             ref={cancel}
             type="button"
             onClick={onCancel}
             disabled={busy}
-            className="text-[0.75rem] font-semibold tracking-[0.16em] text-grey-700 uppercase underline underline-offset-4 hover:text-burgundy-900 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+            className="inline-flex items-center text-[0.75rem] font-semibold tracking-[0.16em] text-grey-700 uppercase underline underline-offset-4 hover:text-burgundy-900 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
           >
             Cancel
           </button>

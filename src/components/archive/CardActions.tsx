@@ -29,6 +29,12 @@ export type EntryActions = {
    * Absent on a video record, where there is no single frame to paint on.
    */
   onRegion?: () => void
+  /**
+   * Show this picture on the Pictures desk's plate, with what the plate
+   * offers for it. Absent on a video record, and on a region pass, which is
+   * one area of another picture.
+   */
+  onPlate?: () => void
   onStar: () => void
   onDownload: () => void
   /** Remove the record. The file stays. */
@@ -62,6 +68,7 @@ export function CardActions({
   onAnother,
   onSource,
   onRegion,
+  onPlate,
   onStar,
   onDownload,
   onRemove,
@@ -193,6 +200,14 @@ export function CardActions({
             </button>
           ) : (
             <>
+              {onPlate ? (
+                <button role="menuitem" className={item} onClick={run(onPlate)} disabled={entry.missing}>
+                  Open it on the Pictures desk
+                  <span className="block text-caption text-grey-500 italic">
+                    The desk shows what it can still do for it, such as fixing the face.
+                  </span>
+                </button>
+              ) : null}
               <button role="menuitem" className={item} onClick={run(() => onSource('images'))}>
                 Use as a source on the Pictures desk
               </button>

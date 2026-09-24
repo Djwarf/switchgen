@@ -5,9 +5,14 @@
  * detail view shows the complete parameter record. Reading a fact is not being
  * offered a choice.
  *
- * Every number here is a link that adopts itself into the desk this record
- * belongs to, so reuse works at the granularity of a single value as well as
- * the whole recipe.
+ * Every setting the desk can take back is a link that adopts itself into the
+ * desk this record belongs to, so reuse works at the granularity of a single
+ * value as well as the whole recipe. The facts the desk cannot take on their
+ * own (the style, the model, the file) are printed plain.
+ *
+ * On a phone this overlay is the whole screen and Close is the only way out
+ * (there is no Esc key, and the back gesture changes the room), so the
+ * controls get a finger-sized target on a touch screen.
  */
 import { useEffect, useRef, useState } from 'react'
 import { fileUrl, relPath } from '../../lib/comfy'
@@ -53,14 +58,18 @@ type Props = EntryActions & {
   onOpenEntry: (id: string) => void
 }
 
-/**
- * `adoptValue` is generic over the field, and the table walks fields at
- * runtime. One cast, here, rather than a cast at every row.
- */
 /** Everything a person can reach with Tab. Used to hold Tab inside the scrim. */
 const FOCUSABLE =
   'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
 
+/** Previous and Next, in the header. */
+const NAV =
+  'inline-flex items-center text-[0.625rem] font-semibold tracking-[0.16em] text-grey-700 uppercase hover:text-burgundy-900 disabled:text-grey-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11'
+
+/**
+ * `adoptValue` is generic over the field, and the table walks fields at
+ * runtime. One cast, here, rather than a cast at every row.
+ */
 const adopt = adoptValue as unknown as (
   desk: DeskId,
   field: TunableField,
@@ -90,7 +99,7 @@ function Row({ label, value, field, raw, onAdopt, wrap = false }: RowProps) {
             type="button"
             onClick={() => onAdopt(field, raw ?? value, label)}
             title={`Use this ${label.toLowerCase()} on the desk`}
-            className="text-left underline decoration-grey-300 underline-offset-4 hover:text-burgundy-900 hover:decoration-burgundy-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+            className="text-left underline decoration-grey-300 underline-offset-4 hover:text-burgundy-900 hover:decoration-burgundy-900 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
           >
             {text}
           </button>
@@ -217,7 +226,7 @@ export function Detail({
               type="button"
               onClick={onPrev}
               disabled={!hasPrev}
-              className="text-[0.625rem] font-semibold tracking-[0.16em] text-grey-700 uppercase hover:text-burgundy-900 disabled:text-grey-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+              className={NAV}
               title="The record before this one (k)"
             >
               ← Previous
@@ -226,7 +235,7 @@ export function Detail({
               type="button"
               onClick={onNext}
               disabled={!hasNext}
-              className="text-[0.625rem] font-semibold tracking-[0.16em] text-grey-700 uppercase hover:text-burgundy-900 disabled:text-grey-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+              className={NAV}
               title="The next record (j)"
             >
               Next →
@@ -234,7 +243,7 @@ export function Detail({
             <button
               type="button"
               onClick={onClose}
-              className="text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+              className="inline-flex items-center text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:px-2"
               title="Close (Esc)"
             >
               Close
@@ -297,7 +306,7 @@ export function Detail({
                     flash.undo()
                     setFlash(null)
                   }}
-                  className="ml-3 text-burgundy-900 underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+                  className="ml-3 inline-flex items-center text-burgundy-900 underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
                 >
                   Undo
                 </button>
@@ -310,7 +319,7 @@ export function Detail({
               The record
             </h3>
             <p className="mt-2 text-caption text-grey-500 italic">
-              Every value here is a link. Click one and that setting alone moves to the desk.
+              Underlined values are links. Press one and that setting alone moves to the desk.
             </p>
 
             <dl className="mt-3">
@@ -318,7 +327,7 @@ export function Detail({
               <Row label="Model" value={entry.modelLabel} />
               <Row label="Weight file" value={entry.model} wrap />
               <Row label="Variant" value={variantLabel(entry.variant)} />
-              <Row label="Mode" value={entry.mode} />
+              <Row label="Mode" value={madeFrom(entry)} />
               <Row
                 label="Size"
                 value={entry.width && entry.height ? `${entry.width} × ${entry.height}` : null}
@@ -414,7 +423,7 @@ export function Detail({
                   <button
                     type="button"
                     onClick={() => onOpenEntry(lineage.id)}
-                    className="mt-1 text-small text-burgundy-900 underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+                    className="mt-1 text-left text-small text-burgundy-900 underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
                   >
                     Open {editionNo(lineage.no)}, which it came from
                   </button>
@@ -435,7 +444,9 @@ export function Detail({
                 onChange={(e) => setNote(e.target.value)}
                 rows={3}
                 placeholder="What you would change next time"
-                className="mt-2 w-full resize-y border border-grey-300 bg-transparent px-2 py-1.5 font-serif text-small leading-relaxed focus:border-burgundy-900 focus:outline-none placeholder:text-grey-400 placeholder:italic"
+                // 16 px on a touch screen: iOS zooms the page into any field
+                // smaller, and this overlay stays zoomed once the keyboard goes.
+                className="mt-2 w-full resize-y border border-grey-300 bg-transparent px-2 py-1.5 font-serif text-small leading-relaxed focus:border-burgundy-900 focus:outline-none placeholder:text-grey-400 placeholder:italic [@media(pointer:coarse)]:text-body"
               />
               <p className="mt-1 text-caption text-grey-500 italic">
                 Saved as you type, and searchable.

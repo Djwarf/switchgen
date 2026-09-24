@@ -691,7 +691,6 @@ function commit(next: HistoryEntry[], opts: { remote?: boolean; untrimmed?: read
   const prev = entries
   const remote = opts.remote === true
   entries = next
-  indexCache = new WeakMap()
   if (remote && !commitListeners.size) {
     save()
     announce()
@@ -783,7 +782,6 @@ onStorage(HISTORY_KEY, (value) => {
     if (typeof parsed.nextNo === 'number') nextNo = Math.max(nextNo, parsed.nextNo)
     goneIds = gone
     readCursor(parsed)
-    indexCache = new WeakMap()
     // Written back, so the other tab gets what only this one had. A write
     // already due is left to land when it was going to: pushed back on every
     // arrival, a tab written to often enough would never write at all.
@@ -1064,6 +1062,33 @@ export function mergeFromServer(
 }
 
 /**
+ * What the server kept on a record from one filed after the fact whose place
+ * it took: the reader's star and note, and the tags and rating read from the
+ * picture, where the copy sent had none.
+ */
+export type KeptFromRecovered = Pick<HistoryEntry, 'starred' | 'note' | 'tags' | 'rating'>
+
+/**
+ * `e` with what the server kept filled in, by the server's own rule: a field
+ * this copy has stays, and one it lacks takes the kept value. Applied to the
+ * copy that was sent, that is exactly the record the server stored.
+ */
+function withKept(e: HistoryEntry, kept: KeptFromRecovered | undefined): HistoryEntry {
+  if (!kept || typeof kept !== 'object') return e
+  const fill: Partial<HistoryEntry> = {}
+  if (!e.starred && kept.starred === true) fill.starred = true
+  if (!e.note && typeof kept.note === 'string' && kept.note) fill.note = kept.note
+  if (!e.tags?.length && Array.isArray(kept.tags)) {
+    const tags = kept.tags.filter((t: unknown): t is string => typeof t === 'string')
+    if (tags.length) fill.tags = tags
+  }
+  if (e.rating == null && kept.rating && ['general', 'sensitive', 'questionable', 'explicit'].includes(kept.rating)) {
+    fill.rating = kept.rating
+  }
+  return Object.keys(fill).length ? { ...e, ...fill } : e
+}
+
+/**
  * Stamp records the server just accepted with its revision and, when it
  * reassigned one, its edition number.
  *
@@ -1073,9 +1098,16 @@ export function mergeFromServer(
  * number, so it is not renumbered a second time. A record that was replaced
  * some other way meanwhile (another tab's save) becomes what was sent, stamped,
  * so this browser and the server never hold different content at one revision.
+ *
+ * A desk's record that took the place of one filed after the fact on another
+ * device comes back with `kept`: the star, note, tags and rating the server
+ * kept from that one. They are added here in every case. The stamp alone
+ * would leave this copy without them at the stored rev, which a pull passes
+ * over; and a record changed here in flight, sent whole next, would put its
+ * copy over the server's without them.
  */
 export function applyServerMeta(
-  assigned: readonly { id: string; no: number; rev: number }[],
+  assigned: readonly { id: string; no: number; rev: number; kept?: KeptFromRecovered }[],
   sent: readonly HistoryEntry[] = [],
 ): void {
   if (!assigned.length) return
@@ -1088,17 +1120,19 @@ export function applyServerMeta(
     if (!m) return e
     const went = sentById.get(e.id)
     if (!went || went === e) {
-      if (e.rev === m.rev && e.no === m.no && !e.pending) return e
+      const filled = withKept(e, m.kept)
+      if (filled === e && e.rev === m.rev && e.no === m.no && !e.pending) return e
       changed = true
-      return { ...e, rev: m.rev, no: m.no, pending: undefined }
+      return { ...filled, rev: m.rev, no: m.no, pending: undefined }
     }
     if (unpushed(e)) {
-      if (e.no === m.no) return e
+      const filled = withKept(e, m.kept)
+      if (filled === e && e.no === m.no) return e
       changed = true
-      return { ...e, no: m.no }
+      return { ...filled, no: m.no }
     }
     changed = true
-    return { ...went, rev: m.rev, no: m.no, pending: undefined }
+    return { ...withKept(went, m.kept), rev: m.rev, no: m.no, pending: undefined }
   })
   if (!changed) return
   nextNo = Math.max(nextNo, next.reduce((mx, e) => Math.max(mx, e.no), 0) + 1)
@@ -1279,28 +1313,63 @@ export function clear(): void {
 // ---------------------------------------------------------------------------
 
 export type DeleteResult =
-  | { ok: true; freed: number }
+  | {
+      ok: true
+      freed: number
+      /** Files that are no longer on disk: deleted now, or found already gone. */
+      gone: number
+      /** Other files the record named that could not be deleted, and are still on disk. */
+      left: string[]
+      /** Other files the record named, kept on purpose because something still uses them. */
+      kept: string[]
+    }
   /** `reason` is written for a person to read. */
   | { ok: false; reason: string; unsupported?: boolean }
 
 /**
- * Remove the record *and* the file from ComfyUI's output folder.
+ * Which files deleting a record's file takes with it, the record's own file
+ * first, and which of the others are kept.
  *
- * Needs the local API (`POST /api/delete`), which only exists when the app is
- * served by the SwitchGen dev or preview server. On a bare static host the
- * call 404s and the result carries `unsupported: true`, so the UI can hide the
- * action rather than offer something that cannot work.
- *
- * The record is dropped only when the file actually went, so a failed delete
- * never loses you the settings.
+ * A run can write more than one output (a reel shot's last frame beside its
+ * clip, a batch's other pictures), and the record is what names them all:
+ * once it is removed, the server marks every one of them as a file whose
+ * record was removed, so one left behind would sit on disk with nothing to
+ * show it. Only outputs go: a picture in ComfyUI's input or temp folder is
+ * not the record's to delete. A file another record also names stays, since
+ * that record still stands for it, and so does one `keep` asks for.
  */
-async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
+export function filesToDelete(
+  entry: HistoryEntry,
+  opts: { keep?: (rel: string) => boolean; others?: readonly HistoryEntry[] } = {},
+): { go: FileRef[]; kept: FileRef[] } {
+  const named = new Set<string>()
+  for (const e of opts.others ?? entries) {
+    if (e.id === entry.id) continue
+    for (const f of [e.file, ...(e.files ?? [])]) named.add(relPath(f))
+  }
+  const seen = new Set([relPath(entry.file)])
+  const go: FileRef[] = [entry.file]
+  const kept: FileRef[] = []
+  for (const f of entry.files ?? []) {
+    const rel = relPath(f)
+    if ((f.type || 'output') !== 'output' || seen.has(rel) || named.has(rel)) continue
+    seen.add(rel)
+    if (opts.keep?.(rel)) kept.push(f)
+    else go.push(f)
+  }
+  return { go, kept }
+}
+
+type OneDeleted = { ok: true; freed: number } | { ok: false; reason: string; unsupported?: boolean }
+
+/** Delete one output file. A file already gone counts as deleted. */
+async function deleteOne(f: FileRef): Promise<OneDeleted> {
   let res: Response
   try {
     res = await fetch('/api/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'output', rel: relPath(entry.file) }),
+      body: JSON.stringify({ kind: 'output', rel: relPath(f) }),
     })
   } catch {
     return { ok: false, reason: 'The server did not answer.' }
@@ -1310,11 +1379,7 @@ async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
     const body = await res.json().catch(() => null)
     // The endpoint itself answers 404 for a file that is already gone; the
     // router answers 404 with a different body when there is no endpoint.
-    if (body?.error === 'not found') {
-      remove(entry.id)
-      forgetOfflineCopy(entry.file)
-      return { ok: true, freed: 0 }
-    }
+    if (body?.error === 'not found') return { ok: true, freed: 0 }
     return {
       ok: false,
       unsupported: true,
@@ -1329,9 +1394,41 @@ async function deleteFile(entry: HistoryEntry): Promise<DeleteResult> {
   }
 
   const body = await res.json().catch(() => null)
-  remove(entry.id)
-  forgetOfflineCopy(entry.file)
   return { ok: true, freed: Number(body?.freed ?? 0) }
+}
+
+/**
+ * Remove the record *and* its files from ComfyUI's output folder: its own
+ * file and the other outputs its run wrote (see {@link filesToDelete}).
+ *
+ * Needs the local API (`POST /api/delete`), which only exists when the app is
+ * served by the SwitchGen dev or preview server. On a bare static host the
+ * call 404s and the result carries `unsupported: true`, so the UI can hide the
+ * action rather than offer something that cannot work.
+ *
+ * The record is dropped only when its own file actually went, so a failed
+ * delete never loses you the settings. Its own file goes first, so nothing
+ * else is touched when that fails. One of the others that will not go is
+ * reported, not taken as a failure: the file the reader chose has gone.
+ */
+async function deleteFile(entry: HistoryEntry, keep?: (rel: string) => boolean): Promise<DeleteResult> {
+  const { go, kept } = filesToDelete(entry, { keep })
+  const [own, ...others] = go
+  const first = await deleteOne(own)
+  if (!first.ok) return first
+  let freed = first.freed
+  const gone = [own]
+  const left: string[] = []
+  for (const f of others) {
+    const r = await deleteOne(f)
+    if (r.ok) {
+      freed += r.freed
+      gone.push(f)
+    } else left.push(relPath(f))
+  }
+  remove(entry.id)
+  for (const f of gone) forgetOfflineCopy(f)
+  return { ok: true, freed, gone: gone.length, left, kept: kept.map(relPath) }
 }
 
 /**
@@ -1377,12 +1474,16 @@ function forgetOfflineCopy(f: FileRef): void {
   }
 }
 
-/** Delete several files. Each result is reported separately. */
+/**
+ * Delete several records' files. Each result is reported separately. `keep`
+ * names files something else still uses, which stay on disk.
+ */
 export async function deleteFiles(
   records: readonly HistoryEntry[],
+  opts: { keep?: (rel: string) => boolean } = {},
 ): Promise<{ entry: HistoryEntry; result: DeleteResult }[]> {
   const out: { entry: HistoryEntry; result: DeleteResult }[] = []
-  for (const entry of records) out.push({ entry, result: await deleteFile(entry) })
+  for (const entry of records) out.push({ entry, result: await deleteFile(entry, opts.keep) })
   return out
 }
 
@@ -1441,7 +1542,14 @@ export async function checkMissing(
 // Search
 // ---------------------------------------------------------------------------
 
-let indexCache = new WeakMap<HistoryEntry, string>()
+/**
+ * Each record's haystack, keyed by the record object. Records are replaced,
+ * never changed in place, so a changed record misses here and is read again,
+ * and one that leaves the archive takes its entry with it. Emptied on every
+ * change, as it was, a star or a sync made the next keystroke in the search
+ * box read the whole archive again.
+ */
+const indexCache = new WeakMap<HistoryEntry, string>()
 
 /**
  * The lowercased haystack one record is matched against: the positive prompt as

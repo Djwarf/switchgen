@@ -42,13 +42,21 @@
  * with a number another device already used, the server hands back the number
  * it assigned instead, and the client corrects its copy.
  *
+ * One process serves an archive at a time. Each keeps the whole archive in
+ * memory and writes all of it over the file, so a second server on the same
+ * file (a dev server started beside the preview, say) would put its copy over
+ * the first one's writes, and neither would know. The first to start holds a
+ * lock beside the file, `archive.json.lock`, naming its process; another
+ * answers every archive route with 503 and a sentence saying so, and takes
+ * the archive, read afresh from disk, once the holder has stopped.
+ *
  * Local-only, same posture as the other servers: writes pass guardMutation,
  * the body is capped, and nothing here touches a media file. GET /api/outputs
  * lists them, marking the ones a record already names and the ones whose
  * record was removed, so the client can find files no record describes.
  */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, promises as fs, renameSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, promises as fs, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { guardMutation, readBody, reqUrl, safely, send } from './guard.mjs'
 
@@ -83,12 +91,165 @@ function readDismissed(raw) {
   return out
 }
 
+// ------------------------------------------------------------------- lock --
+
+const LOCK = `${ARCHIVE}.lock`
+
+/** This boot of the machine. A lock written before a reboot names a process that is gone, whatever runs under its number now. */
+const MACHINE_BOOT = (() => {
+  try { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null } catch { return null }
+})()
+
+/**
+ * When a process started, in clock ticks since boot, where Linux says; null
+ * elsewhere. With the pid it names one process: a pid is handed out again
+ * once its process has gone, the start time is not.
+ */
+function startOf(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    // The command name, in parentheses, may hold spaces; the fields after it
+    // cannot. The start time is the 22nd field, the 20th after the name.
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19] ?? null
+  } catch {
+    return null
+  }
+}
+
+const SELF = { pid: process.pid, boot: MACHINE_BOOT, start: startOf(process.pid) }
+
+/** Whether the process a lock names is still running. */
+function holderAlive(holder) {
+  if (!Number.isInteger(holder?.pid) || holder.pid <= 0) return false
+  try {
+    process.kill(holder.pid, 0)
+  } catch (err) {
+    // EPERM: it runs, as another user.
+    if (err?.code !== 'EPERM') return false
+  }
+  if (holder.boot && MACHINE_BOOT && holder.boot !== MACHINE_BOOT) return false
+  if (holder.start) {
+    const now = startOf(holder.pid)
+    if (now !== null && now !== holder.start) return false
+  }
+  return true
+}
+
+function readHolder() {
+  try { return JSON.parse(readFileSync(LOCK, 'utf8')) } catch { return null }
+}
+
+/**
+ * Whether this process may write the archive. `none` is a folder where no lock
+ * could be made at all (read-only, say), which is left as it always was.
+ */
+let lockState = 'unheld'
+
+/**
+ * Take the lock, or return the pid of the live server that holds it (0 when
+ * it cannot be told).
+ *
+ * A lock naming this process is its own: Vite loads this file afresh in the
+ * same process when its config reloads, and each load takes the archive over
+ * from the one before, as the exit hooks below do. A lock naming a process
+ * that has gone was left by a crash or a kill, and is cleared. The lock is
+ * written whole beside it and linked into place, which fails if one is there,
+ * so no server ever reads another's half written.
+ */
+function takeLock() {
+  if (lockState !== 'unheld') return null
+  const tmp = `${LOCK}.${process.pid}.tmp`
+  try {
+    mkdirSync(path.dirname(LOCK), { recursive: true })
+    writeFileSync(tmp, JSON.stringify(SELF))
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        linkSync(tmp, LOCK)
+        lockState = 'held'
+        return null
+      } catch (err) {
+        if (err?.code !== 'EEXIST') throw err
+      }
+      const holder = readHolder()
+      if (holder?.pid === process.pid) {
+        renameSync(tmp, LOCK)
+        lockState = 'held'
+        return null
+      }
+      if (holder !== null && holderAlive(holder)) return holder.pid
+      try { unlinkSync(LOCK) } catch { /* cleared by someone else first */ }
+    }
+    return readHolder()?.pid ?? 0
+  } catch (err) {
+    console.warn(`[switchgen-archive] could not lock ${ARCHIVE}: ${err?.message ?? err}; a second server on this file would not be noticed`)
+    lockState = 'none'
+    return null
+  } finally {
+    try { unlinkSync(tmp) } catch { /* renamed into place, or never written */ }
+  }
+}
+
+/**
+ * Whether the lock still names this process, asked before every write. A lock
+ * taken over after this process took it (its file deleted by hand, and
+ * another server started) means another server now writes the file.
+ */
+function stillMine() {
+  if (lockState !== 'held') return lockState === 'none'
+  const holder = readHolder()
+  if (holder?.pid === process.pid) return true
+  lockState = 'unheld'
+  // Gone with nobody in its place (deleted by hand): taken again, and this
+  // process carries on with what it holds.
+  if (holder === null && takeLock() === null) return true
+  // What this process holds is behind what the other server has written, so
+  // it is dropped, and read again from disk if the archive comes back.
+  store = null
+  loading = null
+  console.warn(`[switchgen-archive] ${ARCHIVE} is locked by another server now; this one stops writing it`)
+  return false
+}
+
+/** Let the file go as the process ends, so the next server does not have to decide the lock is stale. */
+function releaseLock() {
+  if (lockState !== 'held') return
+  if (readHolder()?.pid !== process.pid) return
+  try { unlinkSync(LOCK) } catch { /* gone already */ }
+  lockState = 'unheld'
+}
+
+/** Another server holds the archive. Answered as 503, in its own words. */
+class ArchiveBusy extends Error {
+  constructor(pid) {
+    super(
+      `Another SwitchGen server${pid ? ` (process ${pid})` : ''} is using this archive, so this one cannot share it. ` +
+        'Stop the other server, or give this one an archive of its own.',
+    )
+  }
+}
+
+/** Say once, where the server was started, that this one is standing back. */
+let saidBusy = false
+function standBack(pid) {
+  if (!saidBusy) {
+    saidBusy = true
+    console.warn(`[switchgen-archive] ${ARCHIVE} is in use by another SwitchGen server${pid ? ` (process ${pid})` : ''}; this one answers 503 for the archive until that one stops`)
+  }
+  return new ArchiveBusy(pid)
+}
+
+// ------------------------------------------------------------------ store --
+
 let store = null
 let loading = null
 
 async function load() {
   if (store) return store
   if (!loading) {
+    // Asked again on every request while another server holds the lock, so
+    // this one takes the archive, read afresh from disk, once that one stops.
+    const holder = takeLock()
+    if (holder !== null) throw standBack(holder)
     loading = (async () => {
       try {
         const raw = await fs.readFile(ARCHIVE, 'utf8')
@@ -157,6 +318,7 @@ function serialise(s) {
 /** Atomic: write beside, then rename over. A crash mid-write leaves the old file whole. */
 function writeNow() {
   saveTimer = null
+  if (!store || !stillMine()) return writing
   const upTo = changes
   const body = serialise(store)
   writing = writing.then(async () => {
@@ -189,6 +351,7 @@ function save() {
 function flushSync() {
   if (!store || persisted >= changes) return
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+  if (!stillMine()) return
   try {
     mkdirSync(path.dirname(ARCHIVE), { recursive: true })
     const tmp = `${ARCHIVE}.exit.tmp`
@@ -262,6 +425,43 @@ async function dismissedWritten(s, records) {
 }
 
 /**
+ * A desk's record `r`, taking the place of `held`, a record of the same file
+ * filed after the fact. It keeps what the reader added to that one: the star,
+ * the note, the tags and rating read from the picture. The first such record
+ * it replaces gives it its edition number, so the number the reader has seen
+ * on the card stays with the card.
+ */
+function inPlaceOfRecovered(held, r, takeNumber) {
+  return {
+    ...r,
+    no: takeNumber && num(held.no, 0) > 0 ? held.no : r.no,
+    starred: r.starred || held.starred || undefined,
+    note: r.note || held.note || undefined,
+    tags: Array.isArray(r.tags) && r.tags.length ? r.tags : held.tags,
+    rating: r.rating ?? held.rating,
+  }
+}
+
+/** The fields {@link inPlaceOfRecovered} can fill in from the record it replaces. */
+const KEPT_FIELDS = ['starred', 'note', 'tags', 'rating']
+
+/**
+ * What a record stored after taking another's place holds that the copy sent
+ * did not, for the device that sent it. That device stamps its copy with the
+ * rev the record was stored at, and a pull passes over a record whose rev it
+ * already holds, so without these it would never show the star or the note;
+ * and its next edit, sent whole, would put its copy over the stored one
+ * without them, on every device.
+ */
+function keptOver(sent, stored) {
+  let kept = null
+  for (const k of KEPT_FIELDS) {
+    if (stored[k] !== undefined && stored[k] !== sent[k]) (kept ??= {})[k] = stored[k]
+  }
+  return kept
+}
+
+/**
  * Store what a client sent. Returns what was stamped and the ids refused.
  *
  * Three kinds of record are refused, and the client drops its copy of each:
@@ -280,6 +480,17 @@ async function dismissedWritten(s, records) {
  *     is one the reader filed again on purpose, and the restore route takes
  *     it too. An undo sends back the record that was removed, whose tombstone
  *     is still here, and passes as well.
+ *
+ * The other way round, a desk's first record of a file that a record filed
+ * after the fact already names takes that record's place. The recovery pass
+ * on one device can file a clip before the desk that made it on another has
+ * filed it (a phone locked while the clip finished, say), and the desk's
+ * record, which knows how the clip was made, is the one to keep. It takes the
+ * other's edition number and whatever the reader added to it, and the other
+ * is removed, so every device drops it on its next pull. Its files are not
+ * dismissed: the desk's record names them. What it took that the copy sent
+ * did not have comes back in its entry of `assigned`, as `kept`, for the
+ * sender to add to its own copy.
  */
 function upsert(s, records, { restore = false, written = new Map() } = {}) {
   const assigned = []
@@ -287,8 +498,9 @@ function upsert(s, records, { restore = false, written = new Map() } = {}) {
   const noOwner = new Map()
   for (const r of s.records.values()) if (num(r.no, 0) > 0) noOwner.set(r.no, r.id)
   let owners = null
-  for (const r of records) {
-    if (!sane(r)) continue
+  for (const sent of records) {
+    if (!sane(sent)) continue
+    let r = sent
     const tomb = s.tombstones.get(r.id)
     if (tomb && !restore && typeof r.rev === 'number' && num(tomb.rev, 0) > r.rev) {
       refused.push(r.id)
@@ -304,6 +516,20 @@ function upsert(s, records, { restore = false, written = new Map() } = {}) {
       if (!restore && r.refiled !== true && !tomb && rels.some((rel) => stillDismissed(s, rel, written))) {
         refused.push(r.id)
         continue
+      }
+    } else if (r.recovered !== true && !s.records.has(r.id)) {
+      owners ??= fileOwners(s)
+      let first = true
+      for (const rel of relsOf(r)) {
+        const o = owners.get(rel)
+        const held = o !== undefined && o !== r.id ? s.records.get(o) : undefined
+        if (held?.recovered !== true) continue
+        r = inPlaceOfRecovered(held, r, first)
+        first = false
+        s.records.delete(held.id)
+        s.tombstones.set(held.id, { rev: ++s.rev, at: Date.now() })
+        if (noOwner.get(held.no) === held.id) noOwner.delete(held.no)
+        for (const its of relsOf(held)) if (owners.get(its) === held.id) owners.delete(its)
       }
     }
     const rev = ++s.rev
@@ -321,7 +547,8 @@ function upsert(s, records, { restore = false, written = new Map() } = {}) {
     // A record naming a file again (an undo, a restore) takes back its removal.
     for (const rel of relsOf(r)) s.dismissed.delete(rel)
     s.tombstones.delete(r.id)
-    assigned.push({ id: r.id, no, rev })
+    const kept = r === sent ? null : keptOver(sent, r)
+    assigned.push(kept ? { id: r.id, no, rev, kept } : { id: r.id, no, rev })
   }
   return { assigned, refused }
 }
@@ -419,7 +646,13 @@ if (!(flushers instanceof Map)) {
   })
 }
 flushers.get(ARCHIVE)?.retire()
-flushers.set(ARCHIVE, { flush: flushSync, retire: () => clearInterval(pinger) })
+flushers.set(ARCHIVE, {
+  flush: () => {
+    flushSync()
+    releaseLock()
+  },
+  retire: () => clearInterval(pinger),
+})
 
 // --------------------------------------------------------------- outputs --
 
@@ -550,13 +783,21 @@ export function switchgenArchive() {
       return send(res, 404, { error: `no such endpoint: ${req.method} ${p}` })
     } catch (err) {
       if (res.headersSent) { try { res.end() } catch { /* gone */ } return }
+      if (err instanceof ArchiveBusy) return send(res, 503, { error: err.message, busy: 'archive' })
       return send(res, 500, { error: String(err?.message ?? err) })
     }
   }
 
+  // Taken as the server starts, not at its first request, so the server that
+  // was running first keeps the archive when a second one is started beside it.
+  const serve = (server) => {
+    const holder = takeLock()
+    if (holder !== null) standBack(holder)
+    server.middlewares.use(safely(handler))
+  }
   return {
     name: 'switchgen-archive',
-    configureServer(server) { server.middlewares.use(safely(handler)) },
-    configurePreviewServer(server) { server.middlewares.use(safely(handler)) },
+    configureServer: serve,
+    configurePreviewServer: serve,
   }
 }

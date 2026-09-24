@@ -41,10 +41,16 @@ export type ArchiveSyncState = {
   /** The last server revision this tab has merged. */
   rev: number
   error: string | null
+  /**
+   * The server's own sentence when it answered but would not share the
+   * archive: another SwitchGen server holds it. Null when it simply did not
+   * answer, or did.
+   */
+  refusal: string | null
   lastSyncAt: number | null
 }
 
-let state: ArchiveSyncState = { mode: 'starting', pending: 0, rev: 0, error: null, lastSyncAt: null }
+let state: ArchiveSyncState = { mode: 'starting', pending: 0, rev: 0, error: null, refusal: null, lastSyncAt: null }
 const listeners = new Set<() => void>()
 
 function set(patch: Partial<ArchiveSyncState>): void {
@@ -79,6 +85,9 @@ function notePending(): void {
  */
 class NotMounted extends Error {}
 
+/** The server answered, and said why it will not share the archive. */
+class Refused extends Error {}
+
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, body === undefined
     ? { headers: { Accept: 'application/json' } }
@@ -88,8 +97,11 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
     if (res.status < 500) throw new NotMounted('the archive server is not mounted here')
     throw new Error(`the archive server answered HTTP ${res.status}`)
   }
-  const data = (await res.json()) as T & { error?: string }
-  if (!res.ok) throw new Error(String(data.error ?? `HTTP ${res.status}`))
+  const data = (await res.json()) as T & { error?: string; busy?: string }
+  if (!res.ok) {
+    const said = String(data.error ?? `HTTP ${res.status}`)
+    throw data.busy === 'archive' ? new Refused(said) : new Error(said)
+  }
   return data
 }
 
@@ -162,7 +174,7 @@ async function pull(): Promise<void> {
       { rev: data.rev, epoch: data.epoch ?? null, boot: data.boot ?? null },
       lost === null ? undefined : { lostAbove: lost, removedRev: data.removedRev },
     )
-    set({ rev: data.rev, mode: 'server', error: null, lastSyncAt: Date.now(), pending: history.pendingCount() })
+    set({ rev: data.rev, mode: 'server', error: null, refusal: null, lastSyncAt: Date.now(), pending: history.pendingCount() })
     // What the server lost is marked to send; a pull from the stream is not
     // followed by a push of its own.
     if (lost !== null) scheduleFlush()
@@ -204,7 +216,7 @@ async function flush(): Promise<void> {
       notePending()
     }
     backoff = 5000
-    set({ mode: 'server', error: null, pending: history.pendingCount(), lastSyncAt: Date.now() })
+    set({ mode: 'server', error: null, refusal: null, pending: history.pendingCount(), lastSyncAt: Date.now() })
   } catch (err) {
     fail(err)
   } finally {
@@ -214,7 +226,17 @@ async function flush(): Promise<void> {
 
 /** The server did not answer: say so, and try the whole round again later. */
 function fail(err: unknown): void {
-  set({ mode: 'offline', error: err instanceof Error ? err.message : String(err), pending: history.pendingCount() })
+  set({
+    mode: 'offline',
+    error: err instanceof Error ? err.message : String(err),
+    refusal: err instanceof Refused ? err.message : null,
+    pending: history.pendingCount(),
+  })
+  retryLater()
+}
+
+/** Run the whole round again later, waiting longer each time until one gets through. */
+function retryLater(): void {
   if (retryTimer) clearTimeout(retryTimer)
   retryTimer = setTimeout(() => { retryTimer = null; void catchUp() }, backoff)
   backoff = Math.min(60000, backoff * 2)
@@ -231,10 +253,14 @@ async function catchUp(): Promise<void> {
   }
   if (!connected) {
     connected = true
-    if (!hidden()) openStream()
     // Files on disk that no record describes are filed on idle, once.
     setTimeout(() => { void recoverUnfiled().catch(() => {}) }, 4000)
   }
+  // Every pull that gets through opens the stream if there is none: the first
+  // one, and each after the browser gave one up (see openStream). Whichever
+  // retry reaches the server first reopens it, so a push that fails in the
+  // meantime and takes over the retry does not leave the stream closed.
+  if (!hidden()) openStream()
   await flush()
 }
 
@@ -246,15 +272,30 @@ const hidden = () => typeof document !== 'undefined' && document.visibilityState
 
 function openStream(): void {
   if (stream || typeof EventSource === 'undefined') return
+  let source: EventSource
   try {
-    stream = new EventSource('/api/archive/stream')
+    source = new EventSource('/api/archive/stream')
   } catch {
     return
+  }
+  stream = source
+  // A browser reconnects a stream by itself after a network error, but not
+  // after an answer that is not the stream: any HTTP error closes it for
+  // good. Behind tailscale serve that is what a restart gives, a 502 while
+  // the server is down or building, and a server standing back behind the
+  // lock answers 503. The closed stream was kept, so nothing opened another,
+  // and nothing was pulled until the tab was hidden and shown. It is dropped
+  // here and the round retried, whose pull reopens it (catchUp) and runs the
+  // lost-tail check a restart may need.
+  source.onerror = () => {
+    if (stream !== source || source.readyState !== EventSource.CLOSED) return
+    stream = null
+    retryLater()
   }
   // Any difference from where this browser stands is worth a pull, not only a
   // log that moved ahead: a server started again reconnects this stream at a
   // lower rev, or as another log or load, and the pull is what notices.
-  stream.onmessage = (ev) => {
+  source.onmessage = (ev) => {
     let msg: { rev?: unknown; epoch?: unknown; boot?: unknown }
     try { msg = JSON.parse(ev.data) as typeof msg } catch { return }
     const cur = history.syncCursor()
@@ -301,7 +342,7 @@ function settleLocal(err: Error): void {
   if (flushTimer) clearTimeout(flushTimer)
   if (retryTimer) clearTimeout(retryTimer)
   history.setServerBacked(false)
-  set({ mode: 'local', error: err.message, pending: 0 })
+  set({ mode: 'local', error: err.message, refusal: null, pending: 0 })
 }
 
 /**

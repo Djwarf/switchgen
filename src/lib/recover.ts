@@ -165,6 +165,35 @@ function minimal(f: UnfiledFile): NewEntry {
   }
 }
 
+/**
+ * How far a file's time may fall outside the run that wrote it, in ms. ComfyUI
+ * stamps its messages and the server reads the file's time from the same
+ * machine's clock, so this only has to cover rounding in the file system.
+ */
+const SLACK_MS = 5000
+
+/**
+ * The run that wrote the file on disk now, out of the runs ComfyUI remembers
+ * naming its path, which are given newest first; undefined when none fits.
+ *
+ * ComfyUI hands a deleted file's name to the next picture made with the same
+ * prefix, so one path can be named by several runs, and only one of them
+ * wrote this file: the one under way when it was written. A run that ended
+ * before then made an earlier file under the name, since deleted, and its
+ * prompt and seed would remake that one; a run that began after it found the
+ * file already made (a cached run names its outputs without writing them).
+ * When none fits, none is taken: a record with no settings is better than one
+ * carrying another picture's. A run with no time on one side is not ruled out
+ * on that side.
+ */
+export function runThatWrote(runs: readonly PastRun[], mtime: number): PastRun | undefined {
+  return runs.find(
+    (r) =>
+      (r.startedAt === null || r.startedAt <= mtime + SLACK_MS) &&
+      (r.finishedAt === null || r.finishedAt >= mtime - SLACK_MS),
+  )
+}
+
 export type Recovered = {
   /** Records made. */
   filed: number
@@ -194,8 +223,16 @@ export function recoverUnfiled(opts: { includeRemoved?: boolean } = {}): Promise
     if (!unfiled.length) return { filed: 0, fromHistory: 0, removed }
     let runs: PastRun[] = []
     try { runs = await pastRuns(1000) } catch { /* ComfyUI is down or has forgotten; file minimally */ }
-    const byFile = new Map<string, PastRun>()
-    for (const run of runs) for (const f of run.files) byFile.set(relPath(f), run)
+    // Every run that names each path, kept newest first.
+    const byFile = new Map<string, PastRun[]>()
+    for (const run of runs) {
+      for (const f of run.files) {
+        const rel = relPath(f)
+        const named = byFile.get(rel)
+        if (!named) byFile.set(rel, [run])
+        else if (named[named.length - 1] !== run) named.push(run)
+      }
+    }
     const asked = new Set(opts.includeRemoved ? found.removed : [])
     // Oldest first, so edition numbers follow the order the files were made.
     // One change for the lot: filed one at a time, a folder of thousands held
@@ -203,7 +240,7 @@ export function recoverUnfiled(opts: { includeRemoved?: boolean } = {}): Promise
     const records = [...unfiled]
       .sort((a, b) => a.mtime - b.mtime)
       .map((f) => {
-        const run = byFile.get(f.rel)
+        const run = runThatWrote(byFile.get(f.rel) ?? [], f.mtime)
         const record = run ? fromRun(run, f) : minimal(f)
         return asked.has(f) ? { ...record, refiled: true } : record
       })

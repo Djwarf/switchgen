@@ -13,7 +13,7 @@
  *   3. Reuse lands in the right room. A clip restores into the Video desk and
  *      a picture into Pictures, with every parameter the record carried.
  */
-import { tagImages, watchCapabilities } from '../lib/vision'
+import { tagImages, VisionBusy, watchCapabilities } from '../lib/vision'
 import { serverArchiveCopy, useArchiveSync } from '../lib/archiveSync'
 import { recoverUnfiled } from '../lib/recover'
 import {
@@ -51,6 +51,7 @@ import { modelFiles } from '../lib/hardware'
 import { regionOrigin, regionPicture } from '../lib/refine'
 import {
   adoptSource,
+  requestPlate,
   requestRegionEdit,
   reuseIntoDesk,
   settings,
@@ -64,7 +65,9 @@ import {
   setArchiveQuery,
 } from '../components/shell/route'
 import type { EntryActions } from '../components/archive/CardActions'
+import { reelRun } from '../components/reel/engine'
 import { DeleteDialog } from '../components/archive/DeleteDialog'
+import { deletedText } from '../components/archive/deletion'
 import { Detail } from '../components/archive/Detail'
 import { FacetRail } from '../components/archive/FacetRail'
 import { Grid } from '../components/archive/Grid'
@@ -89,6 +92,17 @@ const PAGE = 120
 // ---------------------------------------------------------------------------
 // Small helpers that only this screen needs
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a file is a last frame the reel in this tab still holds for one of
+ * its shots. The next shot opens on it, so deleting a shot's clip keeps its
+ * frame: without it, rendering the shot after it again would fail.
+ */
+function heldByReel(): (rel: string) => boolean {
+  const held = new Set<string>()
+  for (const shot of Object.values(reelRun.snapshot().states)) if (shot.frame) held.add(relPath(shot.frame))
+  return (rel) => held.has(rel)
+}
 
 /**
  * Whether the local server will delete a file on request.
@@ -527,7 +541,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     if (!pendingDelete) return
     setDeleting(true)
     setDeleteError(null)
-    const outcome = await deleteFiles(pendingDelete)
+    const outcome = await deleteFiles(pendingDelete, { keep: heldByReel() })
     setDeleting(false)
 
     const failed = outcome.filter((o) => !o.result.ok)
@@ -547,13 +561,11 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
     setPendingDelete(null)
     setSelected(new Set())
     setOpenId(null)
+    const done = outcome.flatMap((o) => (o.result.ok ? [o.result] : []))
     setBanner({
-      variant: 'success',
+      variant: done.some((r) => r.left.length) ? 'correction' : 'success',
       title: 'Deleted',
-      text:
-        gone === 1
-          ? 'One file has gone from the outputs folder, and its record with it.'
-          : `${gone} files have gone from the outputs folder, and their records with them.`,
+      text: deletedText(done),
     })
   }, [pendingDelete])
 
@@ -666,6 +678,20 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
         text: `${tagged} ${tagged === 1 ? 'picture' : 'pictures'} read. Search tag:something, or use the Content facets.`,
       })
     } catch (err) {
+      // Short of memory, the server reads nothing rather than risk the render
+      // it is sharing the machine with. That is a pause, not a fault: what was
+      // read keeps its tags, and the next pass starts from what has none.
+      if (err instanceof VisionBusy) {
+        const before = tagged
+          ? `Before that, ${tagged} ${tagged === 1 ? 'picture was read and keeps its' : 'pictures were read and keep their'} tags. `
+          : ''
+        setBanner({
+          variant: 'info',
+          title: 'Tagging paused',
+          text: `${err.message} ${before}Tagging from the index again carries on with the pictures that have none.`,
+        })
+        return
+      }
       setBanner({
         variant: 'error',
         title: 'The tagger stopped',
@@ -735,6 +761,15 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
               requestRegionEdit(entry)
               goToDesk('images')
             },
+      // A region pass is one area of another picture; the plate would offer
+      // it as a picture of its own, so it goes back through its bench instead.
+      onPlate:
+        entry.kind === 'image' && entry.variant !== 'refine'
+          ? () => {
+              requestPlate(entry)
+              goToDesk('images')
+            }
+          : undefined,
       onStar: () => starRecord(entry.id, !entry.starred),
       onDownload: () => {
         saveToDisk(entry).catch((err: unknown) =>
@@ -1042,7 +1077,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
                 , which takes minutes.
               </p>
               <p className="mt-6 border-t border-grey-300 pt-3 text-small text-grey-700 italic">
-                Already have an archive saved? Restore it from the index on the left.
+                Already have an archive saved? Use Restore from a file, in the index.
               </p>
             </section>
           )}
@@ -1168,6 +1203,7 @@ export function ArchivePage({ q, onQueryChange, onNavigate }: ArchivePageProps =
       {pendingDelete && pendingDelete.length > 0 && (
         <DeleteDialog
           records={pendingDelete}
+          keep={heldByReel()}
           busy={deleting}
           error={deleteError}
           onCancel={() => {

@@ -113,12 +113,12 @@ export function Card({
                 ? 'This file has been moved or deleted. The settings are still here, so you can make it again.'
                 : 'This file has been moved or deleted, and so has the picture it was drawn on, so it cannot be made again.'}
             </p>
-            <p className="mt-1 flex gap-3">
+            <p className="mt-1 flex flex-wrap gap-x-3">
               {actions.onReuse && (
                 <button
                   type="button"
                   onClick={actions.onReuse}
-                  className="text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+                  className="inline-flex items-center text-[0.625rem] font-semibold tracking-[0.16em] text-burgundy-900 uppercase underline underline-offset-4 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
                 >
                   {entry.variant === 'refine' ? 'Draw the region again' : 'Use these settings'}
                 </button>
@@ -126,7 +126,7 @@ export function Card({
               <button
                 type="button"
                 onClick={actions.onRemove}
-                className="text-[0.625rem] font-semibold tracking-[0.16em] text-grey-700 uppercase underline underline-offset-4 hover:text-burgundy-900 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900"
+                className="inline-flex items-center text-[0.625rem] font-semibold tracking-[0.16em] text-grey-700 uppercase underline underline-offset-4 hover:text-burgundy-900 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-burgundy-900 [@media(pointer:coarse)]:min-h-11"
               >
                 Remove this record
               </button>

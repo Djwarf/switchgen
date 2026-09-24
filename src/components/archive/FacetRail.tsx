@@ -45,6 +45,9 @@ function syncLine(sync: ArchiveSyncState | null): string {
     ? ` ${sync.pending} ${sync.pending === 1 ? 'change is' : 'changes are'} waiting for the server.`
     : ''
   if (sync.mode === 'server') return `Shared with every device on this server.${waiting || ' Up to date.'}`
+  // A server that answered with a reason (another server holds the archive)
+  // is quoted, so the reader knows what to stop rather than waiting for it.
+  if (sync.mode === 'offline' && sync.refusal) return `This browser only for now. ${sync.refusal}${waiting}`
   if (sync.mode === 'offline') return `This browser only for now: the server did not answer.${waiting}`
   return 'This browser only. There is no local server to share it through.'
 }
