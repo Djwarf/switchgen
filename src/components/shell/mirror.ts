@@ -8,7 +8,7 @@
  * App.tsx holds the bridges, since they reach into the desks; the mirror
  * lives here, beside the ledger it writes to.
  */
-import { jobs, type JobDesk, type SamplingPass } from './jobs'
+import { jobs, type JobDesk, type SamplingPass, type Stopper } from './jobs'
 
 /** The shape every desk's store shares, once the differences are flattened out. */
 export type Reported = {
@@ -38,6 +38,11 @@ export type Reported = {
    * job not sent yet, which may be held or waiting rather than on its way.
    */
   stage?: string
+  /**
+   * Why the job cannot be stopped from here just now, in the words the slug
+   * shows in Stop's place (see `Job.noStop`). Left out while it can be.
+   */
+  noStop?: string | null
 }
 
 export type Bridge = {
@@ -49,8 +54,10 @@ export type Bridge = {
    * The desk's own stop, given the desk's id for the job. Every desk has one,
    * because on every desk stopping means more than cancelling one prompt: a
    * batch or a reel has more to come, and a clip may not have a prompt yet.
+   * A stop sent to the queue on the server says whether it got there (see
+   * `JobInit.stop`).
    */
-  stop?: (key: string) => void
+  stop?: (key: string) => ReturnType<Stopper>
   /**
    * Desk job id → ledger job id, kept on the bridge rather than inside the
    * mirror, so that a remount — StrictMode's double effect in development, or
@@ -112,6 +119,7 @@ export function mirror(bridge: Bridge): () => void {
       // was being sent the whole time. (The ledger takes it only while the
       // job is unsent, so a job just attached above is left alone.)
       if (report.stage && report.stage !== ledgerJob.stage) jobs.setStage(id, report.stage)
+      if ((report.noStop ?? null) !== ledgerJob.noStop) jobs.setNoStop(id, report.noStop ?? null)
 
       // The desk's ending is the job's ending. It holds the run that settled
       // it, so its word replaces anything the ledger shows, and the ledger

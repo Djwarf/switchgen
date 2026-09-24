@@ -91,18 +91,40 @@ export function RunningSlug({ className = '' }: RunningSlugProps) {
   }
 
   const waiting = snap.active.filter((j) => j.id !== job.id).length
+  const live = job.status === 'running' || job.status === 'queued' || job.status === 'submitting'
+  // A job that cannot be stopped from here just now (the queue on the server
+  // takes no stop while it is off) is offered none, and the slug says why in
+  // its place.
+  const noStop = live ? job.noStop : null
   // Below a wide screen the slug has a row of its own, and Hold to stop goes
   // to the far end of it, apart from the line a tap on which opens the desk.
   // Only here: the busy line above is one sentence, and spread across the
   // row its pieces stood hundreds of pixels apart on a tablet.
+  //
+  // The reason in Stop's place is a sentence or two, far wider than the room
+  // the job's own line leaves it on a phone or a tablet, where it was cut to
+  // a few words and the rest was only in a title a touch screen cannot open.
+  // So below a wide screen it takes a line of its own under the job's and
+  // wraps there in full. On a wide screen it shares the bar with the rooms,
+  // and is cut short with the rest in its title, which a pointer can show.
   return (
-    <div className={`flex min-w-0 items-center gap-3 max-lg:justify-between ${className}`}>
+    <div
+      className={`flex min-w-0 items-center gap-3 max-lg:justify-between ${noStop ? 'max-lg:flex-wrap max-lg:gap-y-0.5' : ''} ${className}`}
+    >
       <SlugBody job={job} waiting={waiting} now={now} />
       {/* Keyed by job, so a press armed for one job is not carried over to
           the next one the slug turns to. */}
-      {(job.status === 'running' || job.status === 'queued' || job.status === 'submitting') && (
-        <StopButton key={job.id} job={job} />
-      )}
+      {live &&
+        (noStop ? (
+          <span
+            className="min-w-0 flex-1 text-small text-grey-700 italic max-lg:basis-full lg:truncate lg:text-right"
+            title={noStop}
+          >
+            {noStop}
+          </span>
+        ) : (
+          <StopButton key={job.id} job={job} />
+        ))}
     </div>
   )
 }

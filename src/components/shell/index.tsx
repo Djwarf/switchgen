@@ -12,6 +12,7 @@ export { Masthead, britishDate, useEntryCount, type MastheadProps } from './Mast
 export { SectionBar } from './SectionBar'
 export { RunningSlug, type RunningSlugProps } from './RunningSlug'
 export { Offline, useConnection } from './Offline'
+export { RunnerHold, type HeldCounts } from './RunnerHold'
 
 // Where we are
 export {
@@ -67,6 +68,7 @@ export {
   type JobsSnapshot,
   type SamplingPass,
   type ServerQueue,
+  type Stopper,
 } from './jobs'
 export { mirror, type Bridge, type Reported } from './mirror'
 

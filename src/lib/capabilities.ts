@@ -33,8 +33,40 @@ export type ServerCapabilities = {
   archive: boolean
   tools: ServerTools
   roots: { models?: string; outputs?: string }
+  /**
+   * The server keeps its own queue (server/runner.mjs) and sends waiting work
+   * to ComfyUI itself, so it goes on while the page sleeps. False from a
+   * server too old to have one, which does not send the field.
+   */
+  runner: boolean
+  /** The desks whose work the queue takes. Empty when `runner` is false. */
+  runnerDesks: RunnerDesk[]
+  /** The server's own sentence for why the queue is not running. Null when it is, or when nothing said. */
+  runnerReason: string | null
   /** Why everything is false, when it is. Null when the server answered. */
   reason: string | null
+}
+
+/** A desk whose work the server's queue can take. */
+export type RunnerDesk = 'video' | 'images' | 'reel'
+
+const RUNNER_DESKS: readonly RunnerDesk[] = ['video', 'images', 'reel']
+
+/**
+ * The queue's three fields, read with care. They decide where a desk sends
+ * its work, so anything but a plain yes counts as no: a desk that believed a
+ * queue was there when it was not would hand its work to nobody.
+ */
+function runnerFields(data: Partial<ServerCapabilities>): Pick<ServerCapabilities, 'runner' | 'runnerDesks' | 'runnerReason'> {
+  const runner = data.runner === true
+  const desks = Array.isArray(data.runnerDesks)
+    ? RUNNER_DESKS.filter((d) => (data.runnerDesks as unknown[]).includes(d))
+    : []
+  return {
+    runner,
+    runnerDesks: runner ? desks : [],
+    runnerReason: typeof data.runnerReason === 'string' ? data.runnerReason : null,
+  }
 }
 
 const NONE: ServerCapabilities = {
@@ -49,6 +81,9 @@ const NONE: ServerCapabilities = {
   archive: false,
   tools: { aria2c: null, ffmpeg: null, ffprobe: null },
   roots: {},
+  runner: false,
+  runnerDesks: [],
+  runnerReason: null,
   reason: 'the local server did not answer, so this page can only talk to ComfyUI',
 }
 
@@ -84,6 +119,7 @@ export function serverCapabilities(): Promise<ServerCapabilities> {
         ...data,
         tools: { ...NONE.tools, ...(data.tools ?? {}) },
         roots: data.roots ?? {},
+        ...runnerFields(data),
         reason: null,
       }
     })
@@ -95,6 +131,15 @@ export function serverCapabilities(): Promise<ServerCapabilities> {
     })
   cache = probe
   return probe
+}
+
+/**
+ * Let the answer go, so the next caller asks the server again. For an answer
+ * the page has since heard is out of date: the queue on the server, off when
+ * the page asked, running now (runnerAvailable in lib/runner).
+ */
+export function forgetCapabilities(): void {
+  cache = null
 }
 
 /** How many retries keep the short wait before it starts to grow. */

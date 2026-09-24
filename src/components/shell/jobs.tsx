@@ -118,6 +118,13 @@ export type Job = {
    * stop, or when the job shows the stop did not take (see STOP_WAIT_MS).
    */
   cancelling: boolean
+  /**
+   * Why the job cannot be stopped from here just now, in the words the slug
+   * shows in Stop's place, or null when it can be. The queue on the server
+   * takes no stop while it is off, so the slug offers none for its work, as
+   * the desks do not, and gives the server's reason.
+   */
+  noStop: string | null
   /** The archive record it produced, when the desk tells us. */
   entryId: string | null
 }
@@ -148,9 +155,17 @@ export type JobInit = {
    * How to stop it, when stopping means more than cancelling one prompt. The
    * desk that owns the job does the stopping and reports the outcome back
    * through the usual calls; `cancel()` only marks the job as stopping.
+   *
+   * A stop that has to travel (a word to the queue on the server) may say
+   * whether it got there. False means it did not, so no ending is coming of
+   * it: the stopping mark comes off and the reader is told, so Stop can be
+   * held again. Nothing else about the ending is read from it.
    */
-  stop?: () => void
+  stop?: Stopper
 }
+
+/** A desk's own stop. See `JobInit.stop`. */
+export type Stopper = () => void | Promise<boolean>
 
 /** What ComfyUI says about its own queue, including work we did not start. */
 export type ServerQueue = {
@@ -192,7 +207,7 @@ let server: ServerQueue = { running: 0, pending: 0, foreign: 0, known: false }
 let snapshot: JobsSnapshot = build()
 const listeners = new Set<() => void>()
 /** Ledger job id → the owning desk's own stop, from `JobInit.stop`. */
-const stoppers = new Map<string, () => void>()
+const stoppers = new Map<string, Stopper>()
 /** Ledger job id → when its stop was asked for, and the check that follows it up. */
 const asked = new Map<string, Ask>()
 
@@ -340,6 +355,7 @@ function start(init: JobInit): string {
     finishedAt: null,
     error: null,
     cancelling: false,
+    noStop: null,
     entryId: null,
   }
   ledger = [job, ...ledger].slice(0, KEEP)
@@ -376,6 +392,18 @@ function attach(id: string, promptId: string): void {
 function setStage(id: string, stage: string): void {
   if (!stage) return
   patch(id, (j) => (j.status === 'submitting' && j.stage !== stage ? { ...j, stage } : j))
+}
+
+/**
+ * The desk's word on whether the job can be stopped from here just now (see
+ * Job.noStop). A notice from a stop that did not get through, saying to hold
+ * Stop again, goes once there is no Stop to hold: the slug says why instead.
+ */
+function setNoStop(id: string, why: string | null): void {
+  const job = get(id)
+  if (!job || job.noStop === why) return
+  patch(id, (j) => ({ ...j, noStop: why }))
+  if (why) dismissNotice(stopNotice(id))
 }
 
 /** The pass a sampler node runs, in a graph that samples in two. Null for any other node. */
@@ -591,9 +619,28 @@ function stepAfterStop(id: string): void {
   notTaken(id, 'running')
 }
 
+/**
+ * A desk's stop said it did not get through: the queue on the server was not
+ * reached, or did not take it. A job waiting there has no prompt id to check
+ * and sends no steps, so nothing else would ever take the stopping mark off,
+ * and a job held for hours kept Stop out of reach for all of them.
+ */
+function notReached(id: string): void {
+  stopAsking(id)
+  // No Stop to hold again: the slug says why in its place.
+  if (get(id)?.noStop) return
+  postNotice({
+    key: stopNotice(id),
+    tone: 'error',
+    title: 'Could not stop that job',
+    body: 'The stop did not get through, so the job may still be going. Hold Stop again to ask once more.',
+  })
+}
+
 /** Take the stopping mark off, and say why, so Stop can be held again. */
 function notTaken(id: string, where: 'waiting' | 'running'): void {
   stopAsking(id)
+  if (get(id)?.noStop) return
   postNotice({
     key: stopNotice(id),
     tone: 'warning',
@@ -660,16 +707,32 @@ async function sendCancel(id: string, promptId: string): Promise<void> {
  */
 async function cancel(id: string): Promise<void> {
   const job = ledger.find((j) => j.id === id)
-  if (!job || !isLive(job) || job.cancelling) return
+  // A job with no Stop offered is not stopped from here either (see Job.noStop).
+  if (!job || !isLive(job) || job.cancelling || job.noStop) return
   patch(id, (j) => ({ ...j, cancelling: true }))
   askedFor(id)
+  const ask = asked.get(id)!
   const stop = stoppers.get(id)
   if (stop) {
+    let told: void | Promise<boolean>
     try {
-      stop()
+      told = stop()
     } catch {
       stopAsking(id)
+      return
     }
+    if (!told) return
+    let reached: boolean
+    try {
+      reached = (await told) !== false
+    } catch {
+      reached = false
+    }
+    // Only for this stop, and only while the job still waits on it: a job that
+    // ended meanwhile, or a stop asked for again, has news of its own.
+    if (!reached && stillStopping(id, ask)) notReached(id)
+    // A stop that got through clears an earlier one's refusal.
+    else if (reached && asked.get(id) === ask) dismissNotice(stopNotice(id))
     return
   }
   // Nothing was submitted yet; `attach` sends the stop the moment it is.
@@ -703,6 +766,7 @@ export const jobs = {
   start,
   attach,
   setStage,
+  setNoStop,
   handler,
   apply,
   succeed,

@@ -13,6 +13,10 @@
  * is why every desk also says in words, while work waits, that nothing more
  * is sent while the page is closed, hidden or the phone is locked.
  *
+ * Where the server runs its own queue, a desk hands its waiting work to it
+ * and takes no hold at all: the server sends each job in turn whatever the
+ * page is doing, and the desk says so with WAITS_ON_SERVER instead.
+ *
  * Holds are counted. Each desk takes one with holdAwake and lets it go with
  * the function it returns; the lock goes when the last hold does. The browser
  * drops the lock itself whenever the page is hidden, so it is asked for again
@@ -32,6 +36,16 @@ type WakeLockApi = { request(type: 'screen'): Promise<Sentinel> }
  */
 export const WAITS_IN_PAGE =
   'Nothing more is sent while this page is closed or hidden, or the phone is locked. Work already sent to ComfyUI carries on.'
+
+/**
+ * The line a desk shows instead while its waiting work is held by the queue
+ * on the SwitchGen server (src/lib/runner.ts). That work needs no page and no
+ * screen kept on, so no wake lock is taken for it, and this line says why the
+ * reader can put the phone down. It lives beside WAITS_IN_PAGE so the two are
+ * read, and changed, together.
+ */
+export const WAITS_ON_SERVER =
+  'Waiting work is kept on the SwitchGen server and sent in turn, so it goes on while this page is closed or the phone is locked. If the SwitchGen server stops, it waits and carries on when the server is back.'
 
 /** Hold id to the reason it was taken, so a hold can only be let go once. */
 const holds = new Map<number, string>()

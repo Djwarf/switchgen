@@ -1,9 +1,10 @@
 /**
  * The shell.
  *
- * Masthead, section bar, the page, and the four things that must be reachable
- * from every section: the running job, notices, the undo window and the
- * shortcuts card. `App.tsx` renders exactly one route inside it.
+ * Masthead, section bar, the page, and the five things that must be reachable
+ * from every section: the running job, work the server holds until you say,
+ * notices, the undo window and the shortcuts card. `App.tsx` renders exactly
+ * one route inside it.
  *
  *   <Shell gpu={hardware?.gpu}>
  *     {route.name === 'pictures' ? <Pictures /> : …}
@@ -15,6 +16,7 @@ import { draftIssue, subscribeDraftIssue } from '../../lib/session'
 import { Masthead, useEntryCount } from './Masthead'
 import { NoticeRail, dismissNotice, postNotice } from './Notice'
 import { Offline } from './Offline'
+import { RunnerHold } from './RunnerHold'
 import { SectionBar } from './SectionBar'
 import { Shortcuts, closeShortcuts, shortcutsOpen, toggleShortcuts, useShortcutsOpen } from './Shortcuts'
 import { UndoBar, undoLast } from './UndoBar'
@@ -115,6 +117,8 @@ export function Shell({ gpu, children }: ShellProps) {
       <Masthead gpu={gpu} />
       <SectionBar />
       <Offline />
+      {/* The queue's hold is one for every desk, so its word is given from any room. */}
+      <RunnerHold />
       {/* tabIndex -1 so focus has somewhere to land when an overlay closes and
           the element it was opened from has since been unmounted. Without it
           focus falls back to the body, and a keyboard session then restarts at

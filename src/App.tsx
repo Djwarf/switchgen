@@ -2,8 +2,9 @@
  * SwitchGen.
  *
  * The whole application is four rooms and one frame around them. The frame is
- * `components/shell` — masthead, section bar, running job, notices, undo and the
- * shortcuts card — and it owns every global key. This file does four things and
+ * `components/shell` — masthead, section bar, running job, the work the server
+ * holds until you say, notices, undo and the shortcuts card — and it owns every
+ * global key. This file does four things and
  * nothing else:
  *
  *   1. probes the machine once, for the line under the wordmark,
@@ -21,7 +22,7 @@
  *
  * Point 4 is worth a sentence. Each desk keeps its own job engine, because a
  * four-minute clip must survive walking over to the pictures desk. The section
- * bar reads a single ledger. Without the three bridges below, your own picture
+ * bar reads a single ledger. Without the bridges below, your own picture
  * would be announced as a job this page is not following, with no Stop: the
  * ledger polls ComfyUI's queue and would see a prompt it had never been told
  * about. So the desks' stores are mirrored into the ledger here, at the one
@@ -30,11 +31,17 @@
  * The reel is the third bridge and the odd one. A reel is not one job, it is a
  * queue of them walked in order, so the bridge reports each shot as its own
  * entry in the ledger, numbered, and the slug reads "Shot 3 of 8".
+ *
+ * The fourth is the queue on the server. Where it runs, the desks hand it
+ * their work and only watch, so the work is its to report: from every
+ * device, whichever one sent it, and the desk bridges leave those rows out.
  */
 import { Component, Suspense, lazy, useEffect, useState, type ReactNode } from 'react'
 import {
+  RECENT_MS,
   Shell,
   go,
+  jobs,
   mirror,
   parseRoute,
   useRoute,
@@ -47,6 +54,14 @@ import { startArchiveSync } from './lib/archiveSync'
 import { forgetObjectInfo } from './lib/comfy'
 import { onPlanLanded } from './lib/downloads'
 import { gb, probeHardware, type Hardware } from './lib/hardware'
+import {
+  reportedOf,
+  runnerStore,
+  stopGroup,
+  stopJob,
+  type RunnerJob,
+  type RunnerSnapshot,
+} from './lib/runner'
 import type { PlayerSlot } from './routes/Video'
 
 // The model list is shared by every desk (objectInfo), and a family landing
@@ -97,10 +112,12 @@ export default function App() {
 
   useJobBridges()
 
-  // One archive for every device. Started here, the one component mounted
-  // for the life of the page, so a route change never restarts it.
+  // One archive for every device, and one queue on the server. Started
+  // here, the one component mounted for the life of the page, so a route
+  // change never restarts either.
   useEffect(() => {
     void startArchiveSync()
+    runnerStore.start()
   }, [])
 
   const label = ROOM_NAME[route.name]
@@ -234,7 +251,7 @@ function describe(hw: Hardware): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// The three bridges
+// The bridges
 // ---------------------------------------------------------------------------
 
 type PicturesModule = Awaited<ReturnType<typeof loadPictures>>
@@ -251,11 +268,12 @@ const BRIDGE_TRIES = 3
  * reporting a clip while you are standing at the pictures desk, so the mirror
  * cannot be mounted by the room that started the job.
  *
- * Each bridge attaches when its desk's code arrives, which is asked for here,
- * once the first paint is done, whatever room is showing: loading a desk is
- * what picks up the work it saved, and the bridge is what lets the section
- * bar report and stop that work. The Archive's code is fetched after them,
- * so a later visit does not wait for it.
+ * Each desk's bridge attaches when its desk's code arrives, which is asked
+ * for here, once the first paint is done, whatever room is showing: loading a
+ * desk is what picks up the work it saved, and the bridge is what lets the
+ * section bar report and stop that work. The queue's bridges attach then too.
+ * The Archive's code is fetched after them, so a later visit does not wait
+ * for it.
  */
 function useJobBridges(): void {
   useEffect(() => {
@@ -276,6 +294,9 @@ function useJobBridges(): void {
     }
     // After the first paint, not before it.
     const t = setTimeout(() => {
+      // The queue's bridges need no desk's code: its work is reported even on
+      // a device where that desk has not loaded, or never will.
+      for (const desk of RUNNER_DESKS) stops.push(mirror(runnerBridgeOf(desk)))
       void Promise.all([
         attach(loadPictures, pictureBridgeOf),
         attach(loadVideo, videoBridgeOf),
@@ -321,7 +342,8 @@ function pictureBridgeOf({ pressSnapshot, stopPress, subscribePress }: PicturesM
     stop: () => stopPress(),
     read: () => {
       const job = pressSnapshot().job
-      if (!job) return []
+      // A batch the queue on the server makes is the queue's to report.
+      if (!job || job.runner) return []
       return [
         {
           key: job.id,
@@ -361,7 +383,8 @@ function videoBridgeOf({ stopVideoJob, videoJobs }: VideoModule): Bridge {
     subscribe: videoJobs.subscribe,
     stop: (key) => stopVideoJob(key),
     read: () =>
-      videoJobs.snapshot().map((job) => ({
+      // Clips the queue on the server sends are the queue's to report.
+      videoJobs.snapshot().filter((job) => !job.runner).map((job) => ({
         key: job.id,
         status: job.status,
         promptId: job.status === 'submitting' ? null : job.promptId,
@@ -402,6 +425,8 @@ function reelBridgeOf({ reelRun }: ReelModule): Bridge {
     stop: () => reelRun.stop(),
     read: () => {
       const run = reelRun.snapshot()
+      // A pass the queue on the server renders is the queue's to report.
+      if (run.runnerGroupId) return []
       const out: Reported[] = []
       run.order.forEach((shotId, i) => {
         const shot = run.states[shotId]
@@ -426,4 +451,121 @@ function reelBridgeOf({ reelRun }: ReelModule): Bridge {
     },
     seen: new Map(),
   })
+}
+
+/**
+ * The queue on the server, one bridge per desk, since a bridge reports for
+ * one desk. Unlike the desks' bridges these report work from every device,
+ * whichever one sent it: the queue holds it, so every page can show it and
+ * stop it. It also has a prompt id from the moment ComfyUI has it, so no
+ * device counts it among the jobs it is not following.
+ *
+ * A job is reported while it is live, and for a few seconds after it ends,
+ * as the ledger keeps an ending in the slug. It is reported for longer when
+ * the ledger still shows it live: a phone asleep through the ending wakes to
+ * find the job long over, and the ledger hears how a job ended only from its
+ * bridge, so a job dropped by age alone would be shown running for ever.
+ *
+ * In a batch of pictures or a reel's pass the work goes one at a time, and
+ * only the job next up is reported while the rest wait behind it, as the
+ * desks' own bridges report the picture in hand and the shot on the press. A
+ * batch may hold 200 pictures, and the ledger keeps only its newest rows. A
+ * clip waits on its own, and each is reported, as the Video desk's are.
+ *
+ * Stopping a picture or a shot stops its whole batch or pass, as the desks'
+ * own Stop does; stopping a clip stops that clip. While the queue is off it
+ * still lists the work it keeps, as it was last saved, but takes no stop, so
+ * the bar offers none, as the desks do not, and gives the server's reason in
+ * its place.
+ */
+const RUNNER_DESKS = ['images', 'video', 'reel'] as const
+type RunnerDesk = (typeof RUNNER_DESKS)[number]
+
+/** What each desk makes, for the ledger's slug. */
+const RUNNER_KIND: Record<RunnerDesk, Bridge['kind']> = { images: 'image', video: 'video', reel: 'video' }
+
+/** How a queue job can end. Every other status is live. */
+const RUNNER_ENDED: ReadonlySet<RunnerJob['status']> = new Set(['done', 'failed', 'stopped', 'lost', 'unsent', 'skipped'])
+
+/**
+ * What the bar says in Stop's place for work that has not ended, while the
+ * queue on the server is off (it has said where it stands, and it is not
+ * running); null while it runs.
+ */
+function noStopOf(snap: RunnerSnapshot, job: RunnerJob): string | null {
+  if (snap.boot === '' || snap.available || RUNNER_ENDED.has(job.status)) return null
+  const why = snap.reason ?? 'The queue on the server is not running.'
+  return job.stopRequested
+    ? `${why} The stop goes through once the queue on the server is running again.`
+    : `${why} It can be stopped once the queue on the server is running again.`
+}
+
+/** Made once per desk and kept, for the same reason as the desks' bridges: its `seen`. */
+const runnerBridges = new Map<RunnerDesk, Bridge>()
+
+// oxlint-disable-next-line react/only-export-components -- exported for the bridge's tests, which cannot mount the app
+export function runnerBridgeOf(desk: RunnerDesk): Bridge {
+  const made = runnerBridges.get(desk)
+  if (made) return made
+  const seen = new Map<string, string>()
+  const bridge: Bridge = {
+    desk,
+    kind: RUNNER_KIND[desk],
+    subscribe: runnerStore.subscribe,
+    // The answer goes back to the ledger: a word that did not reach the
+    // server (the phone's connection dropped, or the queue is not running)
+    // leaves a waiting job with no ending coming, and the ledger then gives
+    // Stop back and says so rather than show Stopping until the job ends.
+    stop: (key) => {
+      const job = runnerStore.snapshot().jobs.find((j) => j.id === key)
+      return job && desk !== 'video' ? stopGroup(job.groupId) : stopJob(key)
+    },
+    read: () => {
+      const snap = runnerStore.snapshot()
+      const behind = waitingBehind(snap)
+      const now = Date.now()
+      const out: Reported[] = []
+      for (const job of snap.jobs) {
+        if (job.desk !== desk) continue
+        if (RUNNER_ENDED.has(job.status)) {
+          if (!ledgerShowsLive(seen.get(job.id)) && !endedJustNow(job, now)) continue
+        } else if (behind.has(job.id)) continue
+        out.push({ ...reportedOf(job, snap.progress[job.id]), noStop: noStopOf(snap, job) })
+      }
+      return out
+    },
+    seen,
+  }
+  runnerBridges.set(desk, bridge)
+  return bridge
+}
+
+/** Jobs waiting behind another live job of their own batch or pass. */
+function waitingBehind(snap: RunnerSnapshot): Set<string> {
+  const byId = new Map(snap.jobs.map((j) => [j.id, j]))
+  const out = new Set<string>()
+  for (const group of snap.groups) {
+    if (group.kind === 'clips') continue
+    let ahead = false
+    for (const id of group.jobIds) {
+      const job = byId.get(id)
+      if (!job || RUNNER_ENDED.has(job.status)) continue
+      if (ahead && job.status === 'waiting') out.add(id)
+      ahead = true
+    }
+  }
+  return out
+}
+
+/** Whether the ledger job a bridge opened (its `seen` entry) has not heard its ending yet. */
+function ledgerShowsLive(ledgerId: string | undefined): boolean {
+  if (!ledgerId) return false
+  const status = jobs.get(ledgerId)?.status
+  return status === 'submitting' || status === 'queued' || status === 'running'
+}
+
+/** Ended within the time the slug shows an ending for, and not put away by the reader. */
+function endedJustNow(job: RunnerJob, now: number): boolean {
+  const ended = job.endedAt ?? job.finishedAt
+  return !job.dismissed && ended !== null && now - ended < RECENT_MS
 }

@@ -1147,7 +1147,7 @@ const LOST_TERMINAL_WAITS = 3
  * failed, so "may"; if it finished, its file is on disk with no record, and
  * the one control that files it is named as the Archive labels it.
  */
-const ENDED_UNSENT = `ComfyUI says this job has ended but never sent the result. If it finished, its file is on disk: ${FIND_UNFILED}.`
+export const ENDED_UNSENT = `ComfyUI says this job has ended but never sent the result. If it finished, its file is on disk: ${FIND_UNFILED}.`
 
 type LossWatch = {
   since: number
