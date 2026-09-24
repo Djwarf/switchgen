@@ -59,11 +59,13 @@ export {
   stageFor,
   useJob,
   useJobs,
+  type ApplyContext,
   type Job,
   type JobDesk,
   type JobInit,
   type JobStatus,
   type JobsSnapshot,
+  type SamplingPass,
   type ServerQueue,
 } from './jobs'
 export { mirror, type Bridge, type Reported } from './mirror'

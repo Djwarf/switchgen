@@ -8,19 +8,22 @@
  * two pairs did on one 30.5 GB machine, and this module holds each pair to
  * its own record rather than to a model of memory nobody measured.
  *
- * The text-to-video pair loads no add-on of its own. Measured bare:
+ * The text-to-video pair loads no add-on of its own. Its record, bare:
  *
- *   49 frames at 832 x 480   peaked near 20 GB and survived
- *   81 frames at 832 x 480   peaked at 28.1 GB, exactly where earlyoom fires
+ *   49 frames at 832 x 480 ran near 20 GB and came through
+ *   earlyoom kills ComfyUI at about 28.1 GB used of 30.5 GB
+ *   a second render in the same long-lived ComfyUI process was killed at
+ *   about 20 GB, because memory from earlier runs had stayed resident
  *
- * The second point is an edge, not a limit: the same render was killed the
- * next time because memory from earlier runs had stayed resident in the
- * long-lived ComfyUI process. So a clip larger than the edge is refused and a
- * clip between the two is cautioned. Releasing ComfyUI's cached models before
- * the clip (releaseComfyMemory) is the registry's own advice ("restart the
- * service between heavy renders") without the restart, and it answers only
- * that second kind of kill: it clears what earlier runs left behind and makes
- * no room for the clip itself.
+ * Nothing larger than the 49-frame clip was measured. The line drawn above
+ * it is the family's own default, 81 frames at 832 x 480, about 1.65 times
+ * the clip that fit: an estimate of where a clip stops fitting under the kill
+ * line, not a measurement, and the copy says so. A clip larger than that line
+ * is refused and a clip between the two is cautioned. Releasing ComfyUI's
+ * cached models before the clip (releaseComfyMemory) is the registry's own
+ * advice ("restart the service between heavy renders") without the restart,
+ * and it answers only the second kind of kill: it clears what earlier runs
+ * left behind and makes no room for the clip itself.
  *
  * The image-to-video pair always loads an add-on on each half, and it is
  * worse. The registry lists one result for each setting it tried, by length
@@ -38,14 +41,16 @@
  * and anything else is cautioned, never simply let through.
  *
  * Neither pair was measured with anything on the rack, and the registry says
- * of a clip already at 28.1 GB that any addition tips it. Add-ons the reader
- * chains make the verdict one step stricter: what would pass is cautioned and
- * what would be cautioned is refused.
+ * of the image-to-video pair, which peaked at 28.1 GB with an add-on on one
+ * half, that any addition tips it. Add-ons the reader chains make the verdict
+ * one step stricter: what would pass is cautioned and what would be cautioned
+ * is refused.
  *
  * On a machine with clearly more memory than the one measured, nothing is
  * refused: the figures were not taken there, and a refusal would be a claim
  * about a machine nobody measured.
  */
+import { withDeadline } from './comfy'
 import type { Hardware } from './hardware'
 
 type Point = { width: number; height: number; frames: number; peakGb?: number }
@@ -53,9 +58,18 @@ type Point = { width: number; height: number; frames: number; peakGb?: number }
 /** The machine every point below was measured on. */
 const MEASURED_RAM_GB = 30.5
 
-/** The text-to-video pair, bare. */
+/** The text-to-video pair, bare: the one clip its record measured. */
 const SURVIVED: Point = { width: 832, height: 480, frames: 49, peakGb: 20 }
-const EDGE: Point = { width: 832, height: 480, frames: 81, peakGb: 28.1 }
+/**
+ * Where the machine kills ComfyUI: earlyoom fires at 8% free, about 28.1 GB
+ * used of 30.5. A property of the machine, not a peak any clip was measured at.
+ */
+const KILL_GB = 28.1
+/**
+ * The line above which a text-to-video clip is refused: the family's default
+ * length and size. An estimate, not a measurement (see the header).
+ */
+const LINE_EST: Point = { width: 832, height: 480, frames: 81 }
 
 /**
  * The image-to-video pair, with its own add-on on each half. Only the frame
@@ -111,30 +125,32 @@ export function clipMemory(
 const unmeasured = (ramGb: number) => `This machine has ${ramGb.toFixed(0)} GB, which was not measured, so it may fit.`
 
 /**
- * The text-to-video pair against its two bare points. `roomier` is the
- * machine's memory in GB when it is clearly more than the measured machine's.
+ * The text-to-video pair against its record. `roomier` is the machine's
+ * memory in GB when it is clearly more than the measured machine's.
  */
 function textToVideo(size: number, rack: boolean, roomier: number | null): ClipMemory {
   const onTop = rack ? ' Its add-ons load on top of that, and the pair was measured with none.' : ''
-  if (size > pixelFrames(EDGE)) {
-    const times = (size / pixelFrames(EDGE)).toFixed(1)
+  const measured = `${at(SURVIVED)} measured near ${SURVIVED.peakGb} GB`
+  const killLine = `the machine kills ComfyUI at about ${KILL_GB} GB used`
+  if (size > pixelFrames(LINE_EST)) {
+    const times = (size / pixelFrames(SURVIVED)).toFixed(1)
     if (roomier !== null) {
       return caution(
-        `This clip is ${times} times the size that peaked at ${EDGE.peakGb} GB on a ${MEASURED_RAM_GB} GB machine (${at(EDGE)}).${onTop} ${unmeasured(roomier)}`,
+        `This clip is ${times} times the ${measured} on a ${MEASURED_RAM_GB} GB machine, which kills ComfyUI at about ${KILL_GB} GB used.${onTop} ${unmeasured(roomier)}`,
       )
     }
     return refuse(
-      `Too large for memory. ${at(EDGE)} was measured to peak at ${EDGE.peakGb} GB of ${MEASURED_RAM_GB} GB, which is where the machine kills the process, and this clip is ${times} times that size.${onTop} It would sample for several minutes and then be killed in its final decode. Shorten it or make it smaller.`,
+      `Too large for memory. On a ${MEASURED_RAM_GB} GB machine this pair made ${at(SURVIVED)} near ${SURVIVED.peakGb} GB, and ${killLine}. This clip is ${times} times that size, more than the family's default of ${at(LINE_EST)}, and nothing that large has been measured here.${onTop} It would sample for several minutes and is expected to be killed in its final decode. Shorten it or make it smaller.`,
     )
   }
 
   if (size > pixelFrames(SURVIVED)) {
     if (!rack) {
       return caution(
-        `Larger than the ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB). A clip this size has been killed for memory at its final decode. ComfyUI releases its cached models before it runs, which clears what earlier clips left behind and nothing more.`,
+        `Larger than the ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB), and nothing this size has been measured on this pair. The machine kills ComfyUI at about ${KILL_GB} GB used, and a second render on this pair was killed at about ${SURVIVED.peakGb} GB once memory from earlier runs had built up. ComfyUI releases its cached models before this clip runs, which clears what earlier clips left behind and nothing more.`,
       )
     }
-    const why = `The ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB) ran with no add-ons, and ${at(EDGE)} peaked at ${EDGE.peakGb} GB, which is where the machine kills the process. This clip is larger than the one that fit, and its add-ons load on top.`
+    const why = `The ${at(SURVIVED)} measured to fit (about ${SURVIVED.peakGb} GB) ran with no add-ons, and ${killLine}. This clip is larger than the one that fit, and its add-ons load on top.`
     if (roomier !== null) return caution(`${why} ${unmeasured(roomier)}`)
     return refuse(
       `Too large for memory with add-ons. ${why} Take the add-ons off, or make it no larger than ${at(SURVIVED)}.`,
@@ -181,6 +197,27 @@ function imageToVideo(size: number, rack: boolean, roomier: number | null): Clip
   )
 }
 
+/** How long one read of ComfyUI's queue may take before it counts as unanswered. */
+const QUEUE_READ_MS = 10_000
+
+type QueueItem = unknown[]
+type QueueState = { running: QueueItem[]; pending: QueueItem[] }
+
+/**
+ * One read of ComfyUI's queue. Throws when ComfyUI does not answer with one:
+ * a network error, a read that takes too long, or the proxy's empty 502 while
+ * ComfyUI is down or restarting.
+ */
+async function readQueue(signal?: AbortSignal): Promise<QueueState> {
+  return withDeadline(QUEUE_READ_MS, signal, async (s) => {
+    const res = await fetch('/comfy/queue', { signal: s })
+    if (!res.ok) throw new Error(`/queue -> HTTP ${res.status}`)
+    const q = (await res.json()) as { queue_running?: unknown; queue_pending?: unknown }
+    const list = (v: unknown) => (Array.isArray(v) ? (v.filter(Array.isArray) as QueueItem[]) : [])
+    return { running: list(q.queue_running), pending: list(q.queue_pending) }
+  })
+}
+
 /**
  * Wait until ComfyUI has nothing running and nothing queued.
  *
@@ -193,10 +230,15 @@ function imageToVideo(size: number, rack: boolean, roomier: number | null): Clip
  * with nothing between, the release is read by that clip.
  *
  * Polls the queue every two seconds. `onWait` hears how many jobs are ahead
- * each time it has to wait, for the desk to say so. Resolves true once the
- * queue is empty, false if `signal` aborts first, and true without waiting
- * when the queue cannot be read (ComfyUI down or unreachable): the submit
- * that follows then reports the real error.
+ * each time it has to wait, or -1 while ComfyUI is not answering, for the
+ * desk to say so. Resolves true once a read shows the queue empty, and false
+ * if `signal` aborts first.
+ *
+ * It keeps waiting while ComfyUI does not answer. That is usually earlyoom
+ * having killed it and systemd bringing it back, empty, a few seconds later:
+ * waiting it out sends the clip onto a clean card. Giving up on the first
+ * unanswered read sent the clip into the dead server, where it failed as if
+ * the queue had refused it and left the lane with nothing to send again.
  */
 export async function waitForIdleComfy(
   signal?: AbortSignal,
@@ -206,13 +248,11 @@ export async function waitForIdleComfy(
     if (signal?.aborted) return false
     let ahead: number
     try {
-      const res = await fetch('/comfy/queue', { signal })
-      if (!res.ok) return true
-      const q = (await res.json()) as { queue_running?: unknown[]; queue_pending?: unknown[] }
-      ahead = (q.queue_running?.length ?? 0) + (q.queue_pending?.length ?? 0)
+      const q = await readQueue(signal)
+      ahead = q.running.length + q.pending.length
     } catch {
       if (signal?.aborted) return false
-      return true
+      ahead = -1
     }
     if (ahead === 0) return true
     // A stop that landed while the queue was being read has already fired its
@@ -245,4 +285,27 @@ export async function releaseComfyMemory(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+/**
+ * Release again when a heavy clip's release may have been spent on other work.
+ *
+ * The clip released on an empty queue, but anything sent in the moment
+ * between that release and the clip's own prompt (another tab, a picture from
+ * this page, a job from ComfyUI's own page) is taken first and reads the flag
+ * instead. Called once the clip's prompt is accepted: if ComfyUI lists any
+ * prompt other than `promptId` as running or waiting, the release is sent
+ * again, and ComfyUI applies it after the work in front and before the clip.
+ * One that turns out to be spare costs the next job a model load. Never
+ * throws; a queue that cannot be read is left alone.
+ */
+export async function releaseIfOthersAhead(promptId: string): Promise<void> {
+  let q: QueueState
+  try {
+    q = await readQueue()
+  } catch {
+    return
+  }
+  const others = [...q.running, ...q.pending].some((item) => String(item[1]) !== promptId)
+  if (others) await releaseComfyMemory()
 }

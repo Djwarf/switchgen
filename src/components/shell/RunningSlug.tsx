@@ -17,11 +17,14 @@ import {
   elapsedText,
   headline,
   jobs,
+  needsClock,
   progressOf,
   remainingOf,
   roughText,
+  SENDING,
   useJobs,
   type Job,
+  type JobsSnapshot,
 } from './jobs'
 
 const DESK_LABEL = { images: 'Pictures', video: 'Video', reel: 'Reel' } as const
@@ -30,9 +33,15 @@ function jumpTo(job: Job): void {
   goToSection(sectionForDesk(job.desk))
 }
 
-/** A clock that only ticks while there is something to count. */
-function useNow(live: boolean, ms = 500): number {
+/**
+ * A clock that only ticks while there is something to count: a live job, or
+ * a finished one still shown as news (see needsClock). Once the news is old,
+ * the next tick finds nothing to count and the clock stops until the ledger
+ * changes again.
+ */
+function useClock(snap: JobsSnapshot, ms = 500): number {
   const [now, setNow] = useState(() => Date.now())
+  const live = needsClock(snap, now)
   useEffect(() => {
     if (!live) return
     const t = setInterval(() => setNow(Date.now()), ms)
@@ -47,23 +56,33 @@ export type RunningSlugProps = {
 
 export function RunningSlug({ className = '' }: RunningSlugProps) {
   const snap = useJobs()
-  const anyLive = snap.active.length > 0 || snap.recent.length > 0
-  const now = useNow(anyLive)
+  const now = useClock(snap)
 
   const job = headline(snap, now)
 
-  // Nothing of ours is running, but the card is busy with work started
-  // elsewhere. Say so plainly — there is one queue and one graphics card.
+  // Nothing this page follows is on the press, but the card is busy. Say so
+  // plainly, and say only what is known: this page is not following it. It
+  // may be the reader's own, sent before a reload and not yet picked back up,
+  // or from another tab or ComfyUI's own page; "started outside SwitchGen"
+  // told the reader their own clip was someone else's.
+  //
+  // On a phone the sentence is wider than its row. Left to shrink, "The card
+  // is busy" broke over two lines and the count was cut off before
+  // "following", the word it turns on. So neither phrase breaks inside
+  // itself, and below a wide screen the count takes a line of its own
+  // instead; it is cut short only on a screen too narrow even for that.
   if (!job) {
-    if (snap.server.known && snap.server.running + snap.server.pending > 0) {
-      const n = snap.server.running + snap.server.pending
+    if (snap.server.known && snap.server.foreign > 0) {
+      const n = snap.server.foreign
       return (
-        <p className={`flex items-center gap-2 kicker-quiet ${className}`}>
+        <p
+          className={`flex items-center gap-x-2 gap-y-0.5 whitespace-nowrap kicker-quiet max-lg:flex-wrap ${className}`}
+        >
           <span className="sg-mark sg-mark-live" aria-hidden />
           <span>The card is busy</span>
           <span aria-hidden>·</span>
-          <span>
-            {n} {n === 1 ? 'job' : 'jobs'} started outside SwitchGen
+          <span className="truncate">
+            {n} {n === 1 ? 'job' : 'jobs'} this page is not following
           </span>
         </p>
       )
@@ -72,8 +91,12 @@ export function RunningSlug({ className = '' }: RunningSlugProps) {
   }
 
   const waiting = snap.active.filter((j) => j.id !== job.id).length
+  // Below a wide screen the slug has a row of its own, and Hold to stop goes
+  // to the far end of it, apart from the line a tap on which opens the desk.
+  // Only here: the busy line above is one sentence, and spread across the
+  // row its pieces stood hundreds of pixels apart on a tablet.
   return (
-    <div className={`flex min-w-0 items-center gap-3 ${className}`}>
+    <div className={`flex min-w-0 items-center gap-3 max-lg:justify-between ${className}`}>
       <SlugBody job={job} waiting={waiting} now={now} />
       {/* Keyed by job, so a press armed for one job is not carried over to
           the next one the slug turns to. */}
@@ -106,16 +129,21 @@ function SlugBody({ job, waiting, now }: { job: Job; waiting: number; now: numbe
       className="ring flex min-w-0 items-center gap-2 border-0 bg-transparent p-0 text-left"
     >
       <span className={markClass} aria-hidden />
-      <span className="kicker-quiet shrink-0">{DESK_LABEL[job.desk]}</span>
+      {/* On a phone the slug has one row to itself, and the step it is on
+          matters more than the desk's name, which a screen reader still gets. */}
+      <span className="kicker-quiet shrink-0 max-sm:sr-only">{DESK_LABEL[job.desk]}</span>
       <span className="hidden text-small text-grey-700 sm:inline">·</span>
       <span className="hidden max-w-[12rem] truncate text-small text-ink sm:inline">{job.label}</span>
 
-      <span className="text-small text-grey-700">·</span>
+      <span className="text-small text-grey-700 max-sm:hidden">·</span>
       <span className="truncate text-small text-grey-700">
         {/* A stop asked for is not a stop made: the job may still finish, so
             it reads as stopping until its desk reports how it ended. */}
         {live && job.cancelling && 'Stopping'}
-        {!job.cancelling && job.status === 'submitting' && 'Sending it over'}
+        {/* Not sent yet is not always being sent: a clip can be held behind a
+            lost one until the reader answers, or wait for ComfyUI to come
+            back, and its desk says which. */}
+        {!job.cancelling && job.status === 'submitting' && (job.stage || SENDING)}
         {!job.cancelling && job.status === 'queued' && (waiting > 0 ? 'Waiting its turn' : 'Queued')}
         {!job.cancelling &&
           job.status === 'running' &&

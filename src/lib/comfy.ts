@@ -45,7 +45,17 @@ export type FileRef = {
 }
 
 /** A file a run produced, classified for the UI. */
-export type OutputFile = FileRef & { kind: 'image' | 'video' }
+export type OutputFile = FileRef & {
+  kind: 'image' | 'video'
+  /**
+   * True when ComfyUI answered the node that reported this file from its
+   * cache (it named the node in `execution_cached`). A graph run a second time
+   * unchanged is answered that way, and the file is the one the earlier run
+   * wrote, returned again: not a new file, and already filed if that run was.
+   * Absent otherwise.
+   */
+  cached?: boolean
+}
 
 export type ProgressEvent =
   /** Accepted by the queue. Nothing has started yet. */
@@ -134,6 +144,12 @@ export class ComfyError extends Error {
   readonly nodeType: string | null
   /** ComfyUI's per-node validation detail, when the queue rejected the graph. */
   readonly nodeErrors: Record<string, unknown> | null
+  /**
+   * True when ComfyUI did not answer at all (down, restarting, or the
+   * connection dropped), as opposed to answering with a refusal or a failure.
+   * The job itself was not judged, so nothing about it is to blame.
+   */
+  readonly unreachable: boolean
 
   constructor(
     message: string,
@@ -143,6 +159,7 @@ export class ComfyError extends Error {
       node?: string | null
       nodeType?: string | null
       nodeErrors?: Record<string, unknown> | null
+      unreachable?: boolean
     } = {},
   ) {
     super(message)
@@ -152,20 +169,60 @@ export class ComfyError extends Error {
     this.node = opts.node ?? null
     this.nodeType = opts.nodeType ?? null
     this.nodeErrors = opts.nodeErrors ?? null
+    this.unreachable = opts.unreachable ?? false
   }
 }
+
+/**
+ * What a send says when ComfyUI did not answer it: the proxy's empty 502
+ * while ComfyUI is down or restarting (earlyoom kills it, systemd brings it
+ * back a few seconds later), or any answer that is not ComfyUI's JSON.
+ */
+export const COMFY_NOT_ANSWERING = 'ComfyUI is not answering; it may be restarting. Nothing was queued.'
+
+/**
+ * Where a file with no record is filed from, named as the Archive labels the
+ * control (components/archive/FacetRail.tsx), and where a phone shows it.
+ */
+const FIND_UNFILED =
+  'open the Archive and press “Look for files with no record” (under Index, at the foot of the page on a phone) to file it'
 
 // ---------------------------------------------------------------------------
 // Identity and plain HTTP helpers
 // ---------------------------------------------------------------------------
 
 /**
+ * A random version 4 UUID, lowercase and hyphenated: the only form ComfyUI
+ * accepts as a prompt id from a client (validate_job_id rejects any other
+ * spelling with a 400). crypto.randomUUID exists only in a secure context,
+ * and the phone reaches this page over plain http on a Tailscale address, so
+ * the same thing is built from crypto.getRandomValues, which every context
+ * has. Math.random is the last resort, for a runtime with neither.
+ */
+export function newPromptId(): string {
+  const c = globalThis.crypto
+  if (typeof c?.randomUUID === 'function') {
+    try {
+      return c.randomUUID().toLowerCase()
+    } catch {
+      /* not offered here after all */
+    }
+  }
+  const b = new Uint8Array(16)
+  if (typeof c?.getRandomValues === 'function') c.getRandomValues(b)
+  else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256)
+  b[6] = (b[6] & 0x0f) | 0x40 // version 4
+  b[8] = (b[8] & 0x3f) | 0x80 // the RFC 4122 variant
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+/**
  * One client id for the lifetime of the page. ComfyUI addresses execution
  * messages to the submitting client, so every job in this tab must use it —
  * and exactly one socket may hold it at a time (see rule 1).
  */
-const clientId: string =
-  globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+const clientId: string = newPromptId()
 
 /** Build a browser-loadable URL for a file ComfyUI holds. */
 export function fileUrl(f: FileRef): string {
@@ -182,15 +239,76 @@ export function relPath(f: FileRef): string {
   return f.subfolder ? `${f.subfolder}/${f.filename}` : f.filename
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const r = await fetch(`${HTTP}${path}`)
-  if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`)
-  return r.json() as Promise<T>
+/** How long a small read may take, body included, before it counts as unanswered. */
+const READ_MS = 10_000
+
+/**
+ * Run `work` with a signal that aborts after `ms`, or as soon as `outer` does.
+ *
+ * Every read of ComfyUI goes through here. Without a deadline, a ComfyUI that
+ * keeps its sockets open but stops answering (a machine swapping just before
+ * earlyoom acts) left each poll's request open, a new one went every few
+ * seconds, and together they filled the browser's six connections to this
+ * origin, so the archive, the thumbnails and the plate stopped loading as
+ * well. The deadline covers reading the body, not only the headers.
+ */
+export async function withDeadline<T>(
+  ms: number,
+  outer: AbortSignal | undefined,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), ms)
+  const forward = () => ctl.abort()
+  if (outer?.aborted) ctl.abort()
+  else outer?.addEventListener('abort', forward, { once: true })
+  try {
+    return await work(ctl.signal)
+  } finally {
+    clearTimeout(timer)
+    outer?.removeEventListener('abort', forward)
+  }
 }
 
-/** Node catalogue — used to discover which models and samplers are installed. */
+async function getJson<T>(path: string, opts: { signal?: AbortSignal; ms?: number } = {}): Promise<T> {
+  return withDeadline(opts.ms ?? READ_MS, opts.signal, async (signal) => {
+    const r = await fetch(`${HTTP}${path}`, { signal })
+    if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`)
+    return (await r.json()) as T
+  })
+}
+
+/**
+ * The catalogue is over 2 MB and reaches the phone uncompressed, so it gets
+ * far longer than a queue read: long enough for a slow link, short enough
+ * that a stalled ComfyUI does not hold a connection for good.
+ */
+const INFO_MS = 90_000
+let info: Promise<Record<string, any>> | null = null
+
+/**
+ * Node catalogue — used to discover which models and samplers are installed.
+ *
+ * One download for the whole page. Each desk used to fetch its own copy the
+ * first time it was opened, so a visit to all three moved the same 2 MB three
+ * times. A fetch that fails is forgotten, so the next caller asks again, and
+ * so is the list once a model lands (App wires forgetObjectInfo to
+ * onPlanLanded), since what is installed has changed.
+ */
 export function objectInfo(): Promise<Record<string, any>> {
-  return getJson('/object_info')
+  if (!info) {
+    const p = getJson<Record<string, any>>('/object_info', { ms: INFO_MS })
+    info = p
+    p.catch(() => {
+      if (info === p) info = null
+    })
+  }
+  return info
+}
+
+/** Forget the shared catalogue, so the next objectInfo() asks ComfyUI again. For a desk that reloads its list. */
+export function forgetObjectInfo(): void {
+  info = null
 }
 
 export async function systemStats(): Promise<any> {
@@ -274,7 +392,7 @@ const MOVING_EXT = /\.(webm|mp4|mkv|gif|webp|avi|mov)$/i
  * image, so three independent signals are used and any one is sufficient:
  * the container key, the sibling `animated` flag, and the file extension.
  */
-export function collectFiles(output: Record<string, any> | undefined | null): OutputFile[] {
+export function collectFiles(output: Record<string, any> | undefined | null, cached = false): OutputFile[] {
   const animated = Array.isArray(output?.animated) ? (output.animated as unknown[]) : []
   const anyAnimated = animated.some(Boolean)
   const out: OutputFile[] = []
@@ -292,17 +410,31 @@ export function collectFiles(output: Record<string, any> | undefined | null): Ou
         subfolder: String(f.subfolder ?? ''),
         type: String(f.type ?? 'output'),
         kind: isVideo ? 'video' : 'image',
+        ...(cached ? { cached: true } : {}),
       })
     })
   }
   return out
 }
 
-/** Every file across every node of a history entry's `outputs`. */
-function filesOfOutputs(outputs: Record<string, any> | undefined | null): OutputFile[] {
+/**
+ * Every file across every node of a history entry's `outputs`, keyed by node
+ * id. Files of a node in `cachedNodes` are marked as cached.
+ */
+function filesOfOutputs(
+  outputs: Record<string, any> | undefined | null,
+  cachedNodes: ReadonlySet<string> = new Set(),
+): OutputFile[] {
   const out: OutputFile[] = []
-  for (const node of Object.values(outputs ?? {})) out.push(...collectFiles(node as any))
+  for (const [nodeId, node] of Object.entries(outputs ?? {})) {
+    out.push(...collectFiles(node as any, cachedNodes.has(nodeId)))
+  }
   return out
+}
+
+/** The node ids an `execution_cached` message names. */
+function cachedNodesOf(d: any): string[] {
+  return Array.isArray(d?.nodes) ? d.nodes.map((n: unknown) => String(n)) : []
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +458,8 @@ type PromptState = {
    * /history record has to be read for the full list.
    */
   gap: boolean
+  /** Nodes ComfyUI answered from its cache for this prompt (`execution_cached`). */
+  cachedNodes: Set<string>
   touched: number
   reaper: ReturnType<typeof setTimeout> | null
 }
@@ -369,6 +503,7 @@ function stateFor(promptId: string): PromptState {
       terminal: null,
       settling: false,
       gap: false,
+      cachedNodes: new Set(),
       touched: Date.now(),
       reaper: null,
     }
@@ -598,7 +733,17 @@ function handleText(raw: string) {
     case 'executed': {
       if (!id) return
       const st = stateFor(id)
-      st.files.push(...collectFiles(d.output))
+      st.files.push(...collectFiles(d.output, d.node != null && st.cachedNodes.has(String(d.node))))
+      return
+    }
+
+    case 'execution_cached': {
+      // Sent before any node runs, naming every node answered from the cache.
+      // Their `executed` messages still come, carrying the files an earlier
+      // run wrote, so those are marked as not new.
+      if (!id) return
+      const st = stateFor(id)
+      for (const n of cachedNodesOf(d)) st.cachedNodes.add(n)
       return
     }
 
@@ -629,8 +774,8 @@ function handleText(raw: string) {
       return
 
     default:
-      // progress_state, execution_cached, feature_flags, b_preview and any
-      // future message type. Nothing here needs them.
+      // progress_state, feature_flags, b_preview and any future message
+      // type. Nothing here needs them.
       return
   }
 }
@@ -773,27 +918,135 @@ export function watchConnection(on: (s: ConnectionState) => void): () => void {
   }
 }
 
+/** A pause that ends early, without an error, when `signal` aborts. */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve()
+    const t = setTimeout(done, ms)
+    function done() {
+      clearTimeout(t)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+/** Stop here if `signal` has aborted, with its reason, as fetch would. */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return
+  throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+}
+
+/** Said when the send got no answer and ComfyUI, asked afterwards, has no such job. */
+const NOT_RECEIVED =
+  'The connection dropped while this job was being sent, and ComfyUI did not receive it. Nothing was queued.'
+
+/** Said when the send got no answer and ComfyUI could not be asked afterwards either. */
+const NOT_KNOWN =
+  'The connection dropped while this job was being sent, and ComfyUI could not be asked whether it arrived. If the section bar shows the card busy once the connection is back, it did: let it finish before you send it again.'
+
+/**
+ * Did a send whose answer never came reach the queue anyway? The id is ours,
+ * so ComfyUI can be asked. True when it lists the job, false when it answers
+ * twice in a row that it has none (the second a moment later, because the
+ * request may still be landing: ComfyUI checks a graph before it queues it),
+ * and null when it could not be asked at all.
+ */
+async function landed(promptId: string): Promise<boolean | null> {
+  let absent = false
+  for (let i = 0; i < 5; i++) {
+    if (i) await pause(i < 3 ? 1500 : 3000)
+    try {
+      // Short: each ask is only worth a moment while the send's fate is open.
+      if (await withDeadline(4000, undefined, (signal) => getJob(promptId, { signal }))) return true
+      if (absent) return false
+      absent = true
+    } catch {
+      absent = false
+    }
+  }
+  return absent ? false : null
+}
+
+/** What a send may be told beside its graph. */
+export type SubmitOptions = {
+  /** The prompt id to send, from {@link newPromptId}. One is made here when it is left out. */
+  promptId?: string
+}
+
 /**
  * Queue a workflow. Resolves with the prompt id as soon as ComfyUI accepts it.
  *
  * Throws a {@link ComfyError} carrying ComfyUI's own validation detail when the
- * queue rejects the graph, so the implicated field can be surfaced.
+ * queue rejects the graph, so the implicated field can be surfaced, and one
+ * marked `unreachable` when ComfyUI did not answer at all.
+ *
+ * The prompt id is made here, not by ComfyUI, and sent with the graph. A send
+ * can reach ComfyUI and its answer still be lost on the way back (the phone
+ * switches apps just after Make, or the tailnet drops), and with ComfyUI's own
+ * id there was then no way to find the job: the desk said it could not reach
+ * ComfyUI while the clip rendered unfollowed, and a second Make rendered it
+ * twice. With our own id the job is looked up, and followed if it is there.
+ *
+ * A desk may make the id itself, with {@link newPromptId}, and pass it in
+ * `opts.promptId`: then it can save the job under that id before the send,
+ * and a page thrown away while the send is out (the phone discarding the tab
+ * just after Make) leaves the next page an id to follow, not a job rendering
+ * that nothing on the desk knows about. One fresh id per send: an id ComfyUI
+ * has already been given names that earlier job, not this one.
  */
-export async function submit(workflow: ApiWorkflow): Promise<string> {
+export async function submit(workflow: ApiWorkflow, opts: SubmitOptions = {}): Promise<string> {
   ensureSocket()
+  const id = opts.promptId || newPromptId()
+  // Before the send, so a drop of the socket while it is on its way marks the
+  // prompt as having missed messages (see gap), and a socket that is not open
+  // yet counts as one that missed them: ComfyUI drops what it sends then.
+  const st = stateFor(id)
+  if (connection !== 'open') st.gap = true
+  const forget = () => {
+    const cur = prompts.get(id)
+    if (cur && cur.listeners.size === 0 && !cur.terminal) dropState(id, cur)
+  }
+  const unsent = async (definite: string): Promise<string> => {
+    const there = await landed(id)
+    if (there) {
+      stateFor(id).gap = true
+      return id
+    }
+    forget()
+    throw new ComfyError(there === false ? definite : NOT_KNOWN, { unreachable: true })
+  }
+
   let res: Response
   try {
     res = await fetch(`${HTTP}/prompt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: workflow, client_id: clientId }),
+      body: JSON.stringify({ prompt: workflow, client_id: clientId, prompt_id: id }),
     })
   } catch {
-    throw new ComfyError('We could not reach ComfyUI. It may not be running.')
+    return unsent(NOT_RECEIVED)
   }
 
   if (!res.ok) {
-    const body = await res.json().catch(() => null)
+    const text = await res.text().catch(() => '')
+    let body: any = null
+    try {
+      body = JSON.parse(text)
+    } catch {
+      body = null
+    }
+    // A gateway that gave up waiting may have passed the job on first.
+    if (res.status === 504) return unsent(COMFY_NOT_ANSWERING)
+    // The proxy answers 502 with an empty body while ComfyUI is down, and a
+    // body that is not ComfyUI's JSON did not come from its queue. Neither is
+    // the queue refusing the graph, which is what the sentence below says.
+    if (res.status === 502 || res.status === 503 || !body || typeof body !== 'object') {
+      forget()
+      throw new ComfyError(COMFY_NOT_ANSWERING, { unreachable: true })
+    }
+    forget()
     const nodeErrors = (body?.node_errors ?? null) as Record<string, unknown> | null
     const detail =
       body?.error?.message ??
@@ -814,13 +1067,15 @@ export async function submit(workflow: ApiWorkflow): Promise<string> {
     })
   }
 
-  const body = await res.json()
-  const promptId = String(body.prompt_id)
-  const st = stateFor(promptId)
-  // ComfyUI addresses this prompt's messages to our client id from now on; a
-  // socket that is not open yet drops them.
-  if (connection !== 'open') st.gap = true
-  return promptId
+  const body = await res.json().catch(() => null)
+  if (!body || typeof body !== 'object') return unsent(COMFY_NOT_ANSWERING)
+  // ComfyUI answers with the id it was given. One too old to take an id from
+  // the client makes its own, and that is the one its messages will carry.
+  const answered = typeof body.prompt_id === 'string' && body.prompt_id ? body.prompt_id : id
+  if (answered !== id) forget()
+  const kept = stateFor(answered)
+  if (connection !== 'open' || (answered === id && st.gap)) kept.gap = true
+  return answered
 }
 
 /**
@@ -863,11 +1118,18 @@ export class LostJob extends Error {
   readonly lost = true
   readonly cancelled = false
   readonly promptId: string
+  /**
+   * True when ComfyUI says the job ended but its result never came: it may
+   * have finished, and its file may be on disk with no record yet. The desk
+   * then asks the reader to look before running it again.
+   */
+  readonly mayExist: boolean
 
-  constructor(message: string, promptId: string) {
+  constructor(message: string, promptId: string, opts: { mayExist?: boolean } = {}) {
     super(message)
     this.name = 'LostJob'
     this.promptId = promptId
+    this.mayExist = opts.mayExist ?? false
   }
 }
 
@@ -880,7 +1142,14 @@ const LOST_GRACE_MS = 20_000
 /** Ticks to wait for a history record the server says already exists. */
 const LOST_TERMINAL_WAITS = 3
 
-type Followed = {
+/**
+ * A job ComfyUI says has ended, whose result never arrived. It may have
+ * failed, so "may"; if it finished, its file is on disk with no record, and
+ * the one control that files it is named as the Archive labels it.
+ */
+const ENDED_UNSENT = `ComfyUI says this job has ended but never sent the result. If it finished, its file is on disk: ${FIND_UNFILED}.`
+
+type LossWatch = {
   since: number
   sighted: boolean
   misses: number
@@ -889,7 +1158,7 @@ type Followed = {
 }
 
 /** Every prompt a `run()` is waiting on, checked together on one timer. */
-const followed = new Map<string, Followed>()
+const followed = new Map<string, LossWatch>()
 let lostTimer: ReturnType<typeof setInterval> | null = null
 let lostChecking = false
 
@@ -961,12 +1230,7 @@ async function checkForLoss(): Promise<void> {
         f.misses = 0
         f.terminalWaits += 1
         if (f.terminalWaits < LOST_TERMINAL_WAITS) continue
-        f.lose(
-          new LostJob(
-            'ComfyUI says this job has ended but never sent the result. Look in the archive: the file may be on disk anyway.',
-            id,
-          ),
-        )
+        f.lose(new LostJob(ENDED_UNSENT, id, { mayExist: true }))
         continue
       }
       f.lose(
@@ -992,8 +1256,15 @@ async function checkForLoss(): Promise<void> {
  * Concurrent calls are safe — that is the whole point of the shared socket.
  * There is no AbortSignal: cancellation is `cancelJob(promptId)`, which is the
  * only mechanism that cannot kill somebody else's job.
+ *
+ * `opts.promptId` is sent as the job's id, as {@link submit} takes it, so a
+ * desk can save the job under it before anything goes.
  */
-export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Promise<OutputFile[]> {
+export function run(
+  workflow: ApiWorkflow,
+  on: (e: ProgressEvent) => void,
+  opts: SubmitOptions = {},
+): Promise<OutputFile[]> {
   return new Promise<OutputFile[]>((resolve, reject) => {
     let stop: (() => void) | null = null
     let unfollow: (() => void) | null = null
@@ -1028,7 +1299,7 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
         )
     }
 
-    submit(workflow).then(
+    submit(workflow, { promptId: opts.promptId }).then(
       (id) => {
         promptId = id
         // Register before announcing, so a synchronous consumer cannot miss
@@ -1046,6 +1317,107 @@ export function run(workflow: ApiWorkflow, on: (e: ProgressEvent) => void): Prom
       (err) => finish(() => reject(err)),
     )
   })
+}
+
+// ---------------------------------------------------------------------------
+// Following a prompt without its socket
+// ---------------------------------------------------------------------------
+
+/** How a prompt followed by {@link followPrompt} ended. */
+export type Followed =
+  | { status: 'done'; files: OutputFile[] }
+  | { status: 'error'; message: string; node: string | null; nodeType: string | null }
+  | { status: 'cancelled' }
+  | { status: 'lost' }
+
+/** How often followPrompt asks about its prompt, unless told otherwise. */
+const FOLLOW_MS = 4000
+/** Answers in a row saying there is no such job before it counts as lost. */
+const FOLLOW_ABSENT = 2
+/** Reads that find no record for a job the server says has ended, before giving up on its files. */
+const FOLLOW_RECORD_WAITS = 3
+
+/**
+ * Follow a prompt to its end without a socket: one the page before a reload
+ * sent, whose socket messages went to that page and will never come here.
+ *
+ * Asks ComfyUI about the job (getJob) every `intervalMs`, as the reel does
+ * for a shot it picks up after a reload, and once the job has ended reads its
+ * /history record. The files come from that record exactly as run() takes
+ * them when its socket missed messages, cached ones marked.
+ *
+ * `onState` hears 'queued' and 'running' as the job moves between them.
+ * While ComfyUI does not answer (restarting, or the phone off the network)
+ * it keeps asking, because an unanswered read says nothing about the job.
+ * 'lost' means ComfyUI answered twice in a row that it has no such job, which
+ * after a restart is true of every job it had. A job a stop took out of the
+ * queue leaves no record either, so a caller that asked for a stop should
+ * read 'lost' as the stop having landed.
+ *
+ * Rejects only when `signal` aborts, with its reason.
+ */
+export async function followPrompt(
+  promptId: string,
+  opts: { signal?: AbortSignal; onState?: (s: 'queued' | 'running') => void; intervalMs?: number } = {},
+): Promise<Followed> {
+  const { signal, onState } = opts
+  const every = opts.intervalMs ?? FOLLOW_MS
+  let absent = 0
+  let recordWaits = 0
+  let told: 'queued' | 'running' | null = null
+  const tell = (s: 'queued' | 'running') => {
+    if (s === told) return
+    told = s
+    try {
+      onState?.(s)
+    } catch {
+      /* a throwing listener must not end the follow */
+    }
+  }
+
+  for (let first = true; ; first = false) {
+    if (!first) await pause(every, signal)
+    throwIfAborted(signal)
+
+    let job: ServerJob | null
+    try {
+      job = await getJob(promptId, { signal })
+    } catch {
+      throwIfAborted(signal)
+      continue // could not ask; ask again
+    }
+    if (job === null) {
+      if (++absent >= FOLLOW_ABSENT) return { status: 'lost' }
+      continue
+    }
+    absent = 0
+    if (job.status === 'pending') {
+      tell('queued')
+      continue
+    }
+    if (job.status === 'in_progress') {
+      tell('running')
+      continue
+    }
+    if (job.status === 'cancelled') return { status: 'cancelled' }
+
+    // Ended. Its record says with what, and holds every file it wrote.
+    let past: PastRun | null
+    try {
+      past = await fetchPastRun(promptId, { signal })
+    } catch {
+      throwIfAborted(signal)
+      continue
+    }
+    if (past?.status === 'cancelled') return { status: 'cancelled' }
+    if (job.status === 'failed' || past?.status === 'error') {
+      const f = past ? failureOf(past) : FAILED
+      return { status: 'error', message: f.message, node: f.node, nodeType: f.nodeType }
+    }
+    if (past) return { status: 'done', files: past.files }
+    if (++recordWaits < FOLLOW_RECORD_WAITS) continue
+    return { status: 'error', message: ENDED_UNSENT, node: null, nodeType: null }
+  }
 }
 
 /**
@@ -1085,6 +1457,15 @@ export async function cancelJob(promptId: string): Promise<boolean> {
     const legacy = await fetch(`${HTTP}/interrupt`, { method: 'POST' })
     return legacy.ok
   }
+  // The proxy's empty 502 while ComfyUI is down is not ComfyUI declining to
+  // stop the job: nothing reached it, and a restart ends every job it had.
+  const body = await r.json().catch(() => null)
+  if (r.status === 502 || r.status === 503 || r.status === 504 || !body || typeof body !== 'object') {
+    throw new ComfyError('ComfyUI is not answering; it may be restarting, and a restart ends every job it had.', {
+      promptId,
+      unreachable: true,
+    })
+  }
   throw new ComfyError(`ComfyUI would not stop that job (HTTP ${r.status}).`, { promptId })
 }
 
@@ -1110,14 +1491,14 @@ async function settleIfDequeued(promptId: string): Promise<void> {
 
 /** The server's own view of the queue. */
 export async function listJobs(
-  opts: { status?: ServerJobStatus[]; limit?: number; offset?: number } = {},
+  opts: { status?: ServerJobStatus[]; limit?: number; offset?: number; signal?: AbortSignal } = {},
 ): Promise<ServerJobsPage> {
   const q = new URLSearchParams()
   if (opts.status?.length) q.set('status', opts.status.join(','))
   if (opts.limit !== undefined) q.set('limit', String(opts.limit))
   if (opts.offset !== undefined) q.set('offset', String(opts.offset))
   const suffix = q.toString() ? `?${q}` : ''
-  const page = await getJson<ServerJobsPage>(`/api/jobs${suffix}`)
+  const page = await getJson<ServerJobsPage>(`/api/jobs${suffix}`, { signal: opts.signal })
   return {
     jobs: Array.isArray(page?.jobs) ? page.jobs : [],
     pagination: page?.pagination ?? { offset: 0, limit: null, total: 0, has_more: false },
@@ -1131,11 +1512,13 @@ export async function listJobs(
  * cannot reach ComfyUI answers 502, and reading that as "no such job" would
  * report a job lost while the server was merely down.
  */
-export async function getJob(promptId: string): Promise<ServerJob | null> {
-  const r = await fetch(`${HTTP}/api/jobs/${encodeURIComponent(promptId)}`)
-  if (r.status === 404) return null
-  if (!r.ok) throw new Error(`/api/jobs/${promptId} -> HTTP ${r.status}`)
-  return (await r.json()) as ServerJob
+export async function getJob(promptId: string, opts: { signal?: AbortSignal } = {}): Promise<ServerJob | null> {
+  return withDeadline(READ_MS, opts.signal, async (signal) => {
+    const r = await fetch(`${HTTP}/api/jobs/${encodeURIComponent(promptId)}`, { signal })
+    if (r.status === 404) return null
+    if (!r.ok) throw new Error(`/api/jobs/${promptId} -> HTTP ${r.status}`)
+    return (await r.json()) as ServerJob
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1527,8 @@ export async function getJob(promptId: string): Promise<ServerJob | null> {
 
 /** Raw history page, newest last. Keys are prompt ids. */
 function historyPage(max = 200): Promise<Record<string, any>> {
-  return getJson<Record<string, any>>(`/history?max_items=${Math.max(1, Math.floor(max))}`)
+  // A page of whole records, graphs included, can run to megabytes.
+  return getJson<Record<string, any>>(`/history?max_items=${Math.max(1, Math.floor(max))}`, { ms: 60_000 })
 }
 
 function timestampOf(status: any, event: string): number | null {
@@ -1172,6 +1556,9 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
   const messages: any[] = Array.isArray(raw?.status?.messages) ? raw.status.messages : []
   const interrupted = messages.some((m: any) => Array.isArray(m) && m[0] === 'execution_interrupted')
   const failed = messages.find((m: any) => Array.isArray(m) && m[0] === 'execution_error')?.[1]
+  const cached = new Set(
+    messages.filter((m: any) => Array.isArray(m) && m[0] === 'execution_cached').flatMap((m: any) => cachedNodesOf(m[1])),
+  )
   const status: PastRun['status'] = interrupted
     ? 'cancelled'
     : statusStr === 'success'
@@ -1183,7 +1570,7 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
   return {
     promptId,
     graph: graph as ApiWorkflow,
-    files: filesOfOutputs(raw?.outputs),
+    files: filesOfOutputs(raw?.outputs, cached),
     status,
     startedAt: timestampOf(raw?.status, 'execution_start') ?? tuple[3]?.create_time ?? null,
     finishedAt:
@@ -1205,8 +1592,8 @@ function readPastRun(promptId: string, raw: any): PastRun | null {
  * One past run by prompt id, or null when it is not in history. Throws when
  * ComfyUI could not be asked, which is not the same as having no record.
  */
-export async function fetchPastRun(promptId: string): Promise<PastRun | null> {
-  const page = await getJson<Record<string, any>>(`/history/${encodeURIComponent(promptId)}`)
+export async function fetchPastRun(promptId: string, opts: { signal?: AbortSignal } = {}): Promise<PastRun | null> {
+  const page = await getJson<Record<string, any>>(`/history/${encodeURIComponent(promptId)}`, { signal: opts.signal })
   const raw = page?.[promptId]
   return raw ? readPastRun(promptId, raw) : null
 }

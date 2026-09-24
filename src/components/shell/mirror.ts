@@ -8,7 +8,7 @@
  * App.tsx holds the bridges, since they reach into the desks; the mirror
  * lives here, beside the ledger it writes to.
  */
-import { jobs, type JobDesk } from './jobs'
+import { jobs, type JobDesk, type SamplingPass } from './jobs'
 
 /** The shape every desk's store shares, once the differences are flattened out. */
 export type Reported = {
@@ -20,8 +20,24 @@ export type Reported = {
   prompt: string
   value: number
   max: number
+  /**
+   * The sampling pass `value` and `max` count within, for a family that
+   * samples in two (the Wan 2.2 14B pairs), each counted from one. Null for
+   * one pass; left out by a desk that never runs such a family.
+   */
+  pass?: SamplingPass | null
   entryId: string | null
   error: string | null
+  /**
+   * When the desk started the job, by its own clock, so the slug's clock
+   * agrees with the desk's after a reload instead of counting from it.
+   */
+  startedAt?: number
+  /**
+   * The desk's own line for what the job is doing. The slug shows it for a
+   * job not sent yet, which may be held or waiting rather than on its way.
+   */
+  stage?: string
 }
 
 export type Bridge = {
@@ -76,6 +92,8 @@ export function mirror(bridge: Bridge): () => void {
           prompt: report.prompt,
           promptId: report.promptId,
           steps: report.max || undefined,
+          startedAt: report.startedAt,
+          stage: report.stage,
           stop: stop ? () => stop(key) : undefined,
         })
         seen.set(report.key, id)
@@ -88,27 +106,39 @@ export function mirror(bridge: Bridge): () => void {
       if (report.promptId && ledgerJob.promptId !== report.promptId) {
         jobs.attach(id, report.promptId)
       }
+      // Before the queue has it, a job may wait for hours: a clip held behind
+      // a lost one until the reader answers, or one waiting for ComfyUI to
+      // come back. What it is doing is the desk's to say; the slug said it
+      // was being sent the whole time. (The ledger takes it only while the
+      // job is unsent, so a job just attached above is left alone.)
+      if (report.stage && report.stage !== ledgerJob.stage) jobs.setStage(id, report.stage)
 
       // The desk's ending is the job's ending. It holds the run that settled
       // it, so its word replaces anything the ledger shows, and the ledger
       // takes a new ending only when it differs from the one it has, with
       // one exception below.
       switch (report.status) {
-        case 'running':
+        case 'running': {
+          const pass = report.pass
+          const passMoved =
+            pass !== undefined &&
+            ((pass?.index ?? null) !== (ledgerJob.pass?.index ?? null) ||
+              (pass?.count ?? null) !== (ledgerJob.pass?.count ?? null))
           if (
             LIVE.has(ledgerJob.status) &&
             (ledgerJob.status !== 'running' ||
               ledgerJob.value !== report.value ||
-              ledgerJob.max !== report.max)
+              ledgerJob.max !== report.max ||
+              passMoved)
           ) {
-            jobs.apply(id, {
-              phase: 'running',
-              node: null,
-              value: report.value,
-              max: report.max,
-            })
+            jobs.apply(
+              id,
+              { phase: 'running', node: null, value: report.value, max: report.max },
+              pass === undefined ? {} : { pass },
+            )
           }
           break
+        }
         case 'done':
           // Never over a stop. When a pass ends, the reel puts a stopped
           // shot's earlier clip back, under the same key and marked done.

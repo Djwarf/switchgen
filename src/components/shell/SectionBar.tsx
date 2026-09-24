@@ -10,12 +10,19 @@
  * The middle of the bar is shared: the section's standfirst when the card is
  * idle, and the running job the moment there is one. That is how a clip
  * rendering on the video desk stays visible while you write on Pictures.
+ *
+ * Below a wide screen the running job gets a row of its own, under the tabs.
+ * Squeezed in beside them it had about 30 pixels on a phone, where the step
+ * it was on could not be read and Hold to stop ran off the right edge and
+ * pushed the whole page sideways, and about 130 on a tablet, where its words
+ * were drawn over Hold to stop.
  */
+import { useEffect, useLayoutEffect, useReducer, useRef, type RefObject } from 'react'
 import { useEntryCount } from './Masthead'
 import { RunningSlug } from './RunningSlug'
 import { SettingsToggle } from './SettingsToggle'
 import { openShortcuts } from './Shortcuts'
-import { headline, useJobs } from './jobs'
+import { headline, newsUntil, useJobs, type JobsSnapshot } from './jobs'
 import {
   SECTIONS,
   SECTION_LABEL,
@@ -27,15 +34,60 @@ import {
 
 const KEY: Record<Section, string> = { pictures: '1', video: '2', reel: '3', archive: '4' }
 
+/**
+ * Draw again when the finished job the slug shows stops being news. Nothing
+ * in the ledger changes at that moment, so without this the bar kept the
+ * slug's row open, empty, until the next change.
+ */
+function useNewsExpiry(snap: JobsSnapshot): void {
+  const [, redraw] = useReducer((n: number) => n + 1, 0)
+  const until = newsUntil(snap)
+  useEffect(() => {
+    if (until === null) return
+    const wait = until - Date.now()
+    if (wait <= 0) return
+    const t = setTimeout(redraw, wait + 50)
+    return () => clearTimeout(t)
+  }, [until])
+}
+
+/**
+ * Tell the page how tall the bar really is. The archive's day headings and
+ * the list view's column heads stick beneath it at --sg-bar-h, and the bar is
+ * one row only on a wide screen: on a phone it is two rows idle and three
+ * with a job running, and the headings parked under it, out of sight. The
+ * values in index.css stay as the first paint's guess.
+ */
+function useBarHeight(bar: RefObject<HTMLDivElement | null>): void {
+  useLayoutEffect(() => {
+    const el = bar.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const root = document.documentElement
+    const write = () => root.style.setProperty('--sg-bar-h', `${Math.ceil(el.getBoundingClientRect().height)}px`)
+    write()
+    const watch = new ResizeObserver(write)
+    watch.observe(el)
+    return () => {
+      watch.disconnect()
+      root.style.removeProperty('--sg-bar-h')
+    }
+  }, [bar])
+}
+
 export function SectionBar() {
   const here = useSection()
   const filed = useEntryCount()
   const snap = useJobs()
-  const busy = headline(snap) !== null || (snap.server.known && snap.server.running > 0)
+  const bar = useRef<HTMLDivElement>(null)
+  useNewsExpiry(snap)
+  useBarHeight(bar)
+  // Exactly when the slug has something to say, so a phone never gets an
+  // empty row for it.
+  const busy = headline(snap) !== null || (snap.server.known && snap.server.foreign > 0)
 
   return (
-    <div className="sg-sticky-top z-40 border-b border-grey-300 bg-newsprint px-6">
-      <div className="mx-auto flex w-full max-w-[110rem] flex-wrap items-center gap-x-4 gap-y-1 sm:flex-nowrap sm:gap-6">
+    <div ref={bar} className="sg-sticky-top z-40 border-b border-grey-300 bg-newsprint px-6">
+      <div className="mx-auto flex w-full max-w-[110rem] flex-wrap items-center gap-x-4 gap-y-1 sm:gap-x-6 lg:flex-nowrap">
         <nav aria-label="Sections" className="flex shrink-0 items-baseline gap-6">
           {SECTIONS.map((s) => (
             <a
@@ -53,9 +105,11 @@ export function SectionBar() {
           ))}
         </nav>
 
-        <div className="flex min-w-0 flex-1 items-center justify-center">
+        <div
+          className={`flex min-w-0 flex-1 items-center justify-center ${busy ? 'max-lg:order-last max-lg:basis-full' : ''}`}
+        >
           {busy ? (
-            <RunningSlug className="min-w-0" />
+            <RunningSlug className="min-w-0 max-lg:w-full" />
           ) : (
             <p className="hidden truncate text-small text-grey-500 italic lg:block">
               {SECTION_STANDFIRST[here]}

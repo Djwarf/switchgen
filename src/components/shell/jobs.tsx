@@ -65,6 +65,13 @@ export function stageFor(classType: string | null | undefined): string {
 export type JobStatus = 'submitting' | 'queued' | 'running' | 'done' | 'error' | 'cancelled'
 
 /**
+ * Which sampling pass a job's steps belong to, each counted from one. The Wan
+ * 2.2 14B pairs sample in two KSamplerAdvanced passes, one per model, and
+ * ComfyUI counts each pass's steps from one again.
+ */
+export type SamplingPass = { index: number; count: number }
+
+/**
  * Where a job came from. The two desks, plus the reel, which has no draft
  * store of its own and so is not a `DeskId`, but is its own room: the slug has
  * to send a reader there, not to the video desk, and stopping one of its shots
@@ -88,7 +95,18 @@ export type Job = {
   value: number
   max: number
   /** Dual-model families run two passes; the bar must not jump backwards. */
-  pass: 1 | 2 | null
+  pass: SamplingPass | null
+  /**
+   * When this pass was first seen, and at which step, so an estimate uses
+   * the current pass's own pace rather than a rate that counts model loading
+   * and the other pass. Null while there is no pass.
+   */
+  passAt: number | null
+  passFrom: number
+  /**
+   * What the card is doing, in words. For a job not yet sent, what its desk
+   * says it is doing (see JobInit.stage).
+   */
   stage: string
   previewUrl: string | null
   startedAt: number
@@ -113,6 +131,19 @@ export type JobInit = {
   promptId?: string | null
   /** Total sampler steps, so the rule can start at a sensible width. */
   steps?: number
+  /**
+   * When the desk started the job, by the desk's own clock. A job taken up
+   * again after a reload has been going since before this page opened, and a
+   * clock started when the ledger first heard of it said a clip ten minutes
+   * in had just begun. Now, when it is left out.
+   */
+  startedAt?: number
+  /**
+   * What the desk says a job it has not sent yet is doing: held behind a lost
+   * clip, waiting for ComfyUI to come back, waiting its turn. Left out, the
+   * job is said to be on its way over.
+   */
+  stage?: string
   /**
    * How to stop it, when stopping means more than cancelling one prompt. The
    * desk that owns the job does the stopping and reports the outcome back
@@ -148,6 +179,9 @@ const isLive = (j: Job) => LIVE.includes(j.status)
 
 /** How long a finished job keeps its place in the slug. */
 export const RECENT_MS = 8000
+
+/** What a job not yet on ComfyUI's queue is doing, when its desk says nothing more. */
+export const SENDING = 'Sending it over'
 
 // ---------------------------------------------------------------------------
 // State
@@ -298,9 +332,11 @@ function start(init: JobInit): string {
     value: 0,
     max: init.steps ?? 0,
     pass: null,
-    stage: 'Queued',
+    passAt: null,
+    passFrom: 0,
+    stage: init.promptId ? 'Queued' : init.stage || SENDING,
     previewUrl: null,
-    startedAt: Date.now(),
+    startedAt: init.startedAt ?? Date.now(),
     finishedAt: null,
     error: null,
     cancelling: false,
@@ -333,8 +369,37 @@ function attach(id: string, promptId: string): void {
   schedule()
 }
 
+/**
+ * The desk's word for what a job it has not sent yet is doing. Only such a
+ * job's: once the queue has it, the ledger's own stages take over.
+ */
+function setStage(id: string, stage: string): void {
+  if (!stage) return
+  patch(id, (j) => (j.status === 'submitting' && j.stage !== stage ? { ...j, stage } : j))
+}
+
+/** The pass a sampler node runs, in a graph that samples in two. Null for any other node. */
+function passOf(graph: ApiWorkflow | undefined, node: string | null): SamplingPass | null {
+  const n = node ? graph?.[node] : undefined
+  if (!n || n.class_type !== 'KSamplerAdvanced' || !graph) return null
+  const passes = Object.values(graph).filter((x) => x.class_type === 'KSamplerAdvanced').length
+  if (passes < 2) return null
+  return { index: n.inputs.return_with_leftover_noise === 'enable' ? 1 : 2, count: 2 }
+}
+
+const samePass = (a: SamplingPass | null, b: SamplingPass | null) =>
+  a === b || (a !== null && b !== null && a.index === b.index && a.count === b.count)
+
+/**
+ * What a desk knows beside the event: the graph, so stages get their node's
+ * name, and the sampling pass, when the desk has worked it out itself. A pass
+ * left out is kept as it was; null says the steps belong to no pass.
+ */
+export type ApplyContext = { graph?: ApiWorkflow; pass?: SamplingPass | null }
+
 /** Fold one ComfyUI progress event into the job. */
-function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
+function apply(id: string, e: ProgressEvent, context: ApplyContext = {}): void {
+  const { graph } = context
   switch (e.phase) {
     case 'queued':
       attach(id, e.promptId)
@@ -343,25 +408,33 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
     case 'running': {
       const node = e.node ? graph?.[e.node] : undefined
       const cls = node?.class_type ?? null
-      let pass: 1 | 2 | null = null
-      if (cls === 'KSamplerAdvanced' && node) {
-        pass = node.inputs.return_with_leftover_noise === 'enable' ? 1 : 2
-      }
-      const stage = pass ? `Drawing, ${pass === 1 ? 'first' : 'second'} pass` : stageFor(cls)
+      const found = passOf(graph, e.node)
+      const told = context.pass !== undefined
       // A report that arrives after the ending must not bring the job back:
       // that re-enabled Stop on finished work and froze its clock.
-      patch(id, (j) =>
-        isLive(j)
-          ? {
-              ...j,
-              status: 'running',
-              value: e.value,
-              max: e.max || j.max,
-              pass: pass ?? j.pass,
-              stage,
-            }
-          : j,
-      )
+      patch(id, (j) => {
+        if (!isLive(j)) return j
+        const pass = told ? (context.pass ?? null) : (found ?? j.pass)
+        // A node starting reports 0 of 1; only a sampler's steps are drawing.
+        const stepping = e.max > 1
+        // The pace is timed from the first step seen in this pass, not from
+        // the node starting: the pass's model loads in between.
+        const changed = pass !== null && !samePass(pass, j.pass)
+        const startsNow = stepping && (changed || j.passAt === null)
+        return {
+          ...j,
+          status: 'running',
+          value: e.value,
+          max: e.max || j.max,
+          pass,
+          passAt: pass === null ? null : startsNow ? Date.now() : changed ? null : j.passAt,
+          passFrom: pass === null ? 0 : startsNow ? e.value : changed ? 0 : j.passFrom,
+          stage:
+            pass && stepping && (found !== null || told)
+              ? `Drawing, pass ${pass.index} of ${pass.count}`
+              : stageFor(cls),
+        }
+      })
       // ComfyUI checks for a stop before it reports a step, so steps still
       // coming well after one was asked for mean it did not take. A node
       // starting (value 0) proves nothing: ComfyUI announces the next node
@@ -405,7 +478,7 @@ function apply(id: string, e: ProgressEvent, graph?: ApiWorkflow): void {
  * Pass the instantiated graph and the stage names become specific.
  */
 function handler(id: string, graph?: ApiWorkflow): (e: ProgressEvent) => void {
-  return (e) => apply(id, e, graph)
+  return (e) => apply(id, e, { graph })
 }
 
 /**
@@ -563,13 +636,13 @@ async function sendCancel(id: string, promptId: string): Promise<void> {
     stopped = await cancelJob(promptId)
   } catch (err) {
     stopAsking(id)
-    const reason = err instanceof ComfyError ? err.message : 'We could not reach ComfyUI.'
-    postNotice({
-      key: notice,
-      tone: 'error',
-      title: 'Could not stop that job',
-      body: `${reason} It may still be running. Try again in a moment.`,
-    })
+    // ComfyUI not answering is not ComfyUI declining: it is likely restarting,
+    // which ends the job anyway, so "it may still be running" would mislead.
+    const body =
+      err instanceof ComfyError && err.unreachable
+        ? `${err.message} If it comes back with this job still going, hold Stop again.`
+        : `${err instanceof ComfyError ? err.message : 'We could not reach ComfyUI.'} It may still be running. Try again in a moment.`
+    postNotice({ key: notice, tone: 'error', title: 'Could not stop that job', body })
     return
   }
   // A refusal from an earlier try is no longer news once one gets through.
@@ -629,6 +702,7 @@ export const jobs = {
   snapshot: () => snapshot,
   start,
   attach,
+  setStage,
   handler,
   apply,
   succeed,
@@ -660,12 +734,15 @@ export function useJob(id: string | null): Job | null {
 // ---------------------------------------------------------------------------
 
 /** Fraction done, 0–1, or null when the job has not said yet. */
-export function progressOf(job: Job): number | null {
+export function progressOf(job: Pick<Job, 'value' | 'max' | 'pass'>): number | null {
   if (!job.max) return null
-  const within = Math.min(1, job.value / job.max)
-  if (job.pass === null) return within
-  // Two passes, reported as one rule that only ever moves forward.
-  return (job.pass - 1 + within) / 2
+  const within = Math.min(1, Math.max(0, job.value / job.max))
+  const pass = job.pass
+  if (!pass || pass.count < 2) return within
+  // Each pass counts its steps from one again, so step 5 of 10 is a quarter
+  // of the way in the first pass and three quarters in the second.
+  const index = Math.min(Math.max(pass.index, 1), pass.count)
+  return Math.min(1, (index - 1 + within) / pass.count)
 }
 
 /** `2:04`, `11.4 s`. Plain, tabular, never a spinner's worth of precision. */
@@ -688,9 +765,32 @@ export function roughText(ms: number): string {
 /**
  * What is left, measured from this run's own rate — never invented.
  * Null until there is enough of a sample to mean anything.
+ *
+ * A job that samples in passes is timed by the pass it is in: its steps so
+ * far in this pass, over the time since the pass was first seen, give the
+ * pace, and the steps left are this pass's and one pass's worth for each pass
+ * still to come. Timed from the job's start instead, the rate counted model
+ * loading and the first pass's load against the second, and the estimate
+ * swung each time a pass began. It counts sampling only; the decode after it
+ * is not included, which is what "at this rate" says.
  */
-export function remainingOf(job: Job, now = Date.now()): number | null {
-  if (job.status !== 'running' || !job.max || job.value < 3) return null
+export function remainingOf(
+  job: Pick<Job, 'status' | 'value' | 'max' | 'pass' | 'passAt' | 'passFrom' | 'startedAt'>,
+  now = Date.now(),
+): number | null {
+  if (job.status !== 'running' || !job.max) return null
+  const pass = job.pass
+  if (pass && pass.count >= 2) {
+    if (job.passAt === null || job.max <= 1) return null
+    const stepsSeen = job.value - job.passFrom
+    if (stepsSeen < 2) return null
+    const perStep = (now - job.passAt) / stepsSeen
+    const index = Math.min(Math.max(pass.index, 1), pass.count)
+    const stepsLeft = Math.max(0, job.max - job.value) + (pass.count - index) * job.max
+    const left = perStep * stepsLeft
+    return left > 2000 ? left : null
+  }
+  if (job.value < 3) return null
   const done = progressOf(job)
   if (done === null || done <= 0.02 || done >= 1) return null
   const spent = now - job.startedAt
@@ -710,4 +810,26 @@ export function headline(snap: JobsSnapshot, now = Date.now()): Job | null {
   const last = snap.recent[0]
   if (last && last.finishedAt !== null && now - last.finishedAt < RECENT_MS) return last
   return null
+}
+
+/**
+ * When the finished job the slug shows stops being news, or null when there
+ * is no such job: something is still live, or nothing finished recently.
+ */
+export function newsUntil(snap: Pick<JobsSnapshot, 'active' | 'recent'>): number | null {
+  if (snap.active.length) return null
+  const last = snap.recent[0]
+  return last?.finishedAt != null ? last.finishedAt + RECENT_MS : null
+}
+
+/**
+ * Whether the slug's clock has anything to count: a live job, or a finished
+ * one still shown as news. Every finished job the ledger keeps (up to fifty)
+ * used to count, so after the first job of a session the clock ticked twice a
+ * second for as long as the page was open, with nothing on screen changing.
+ */
+export function needsClock(snap: Pick<JobsSnapshot, 'active' | 'recent'>, now = Date.now()): boolean {
+  if (snap.active.length) return true
+  const until = newsUntil(snap)
+  return until !== null && now < until
 }
