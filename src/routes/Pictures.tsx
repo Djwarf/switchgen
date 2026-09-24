@@ -45,7 +45,29 @@ import { clamp } from '../lib/num'
 import { ServerDown } from '../components/ServerDown'
 import { onPlanLanded } from '../lib/downloads'
 import { annotatedRef } from '../lib/continuation'
-import { holdAwake } from '../lib/wakeLock'
+import { WAITS_ON_SERVER, holdAwake } from '../lib/wakeLock'
+import {
+  deviceId,
+  fallbackLine,
+  follow,
+  forgetGivenUp,
+  givenUpBatches,
+  holdCovers,
+  outboxPending,
+  recordTemplate,
+  runnerAvailable,
+  runnerStore,
+  stopGroup,
+  submitGroup,
+  waitLine,
+  withdraw,
+  type FollowEvent,
+  type FollowResult,
+  type RunnerJob,
+  type RunnerSnapshot,
+  type SubmitBody,
+  type SubmitResult,
+} from '../lib/runner'
 import { thumbSrcSet, thumbUrl } from '../lib/thumbs'
 import { Kicker, Link, Notice } from '../components/type'
 import {
@@ -102,6 +124,7 @@ import {
 import {
   add as fileRecord,
   all as allRecords,
+  get as getRecord,
   search as searchRecords,
   star as starRecord,
   subscribe as subscribeRecords,
@@ -166,6 +189,7 @@ import {
   STOPPING,
   SourceWell,
   Choice,
+  type RunJob,
 } from '../components/compose'
 import {
   AdvancedPanel,
@@ -498,20 +522,53 @@ type DeskJob = {
    * heading then stated that as how long a picture takes.
    */
   ranAt: number | null
+  /**
+   * A picture of a batch the SwitchGen server is sending (see the server's
+   * batch below), from this page or another device. The section bar reports
+   * it from the server's own list, so App's bridge for this desk leaves it
+   * out rather than report it twice.
+   */
+  runner?: boolean
+  /** What the server says about the wait, when it has more to say than the stage. */
+  note?: string | null
+  /**
+   * What of this batch the hold on the server's lane covers: the picture on
+   * the press, and how many after it. Null when it covers none of it. See
+   * laneHoldOf.
+   */
+  onHold?: LaneHold | null
 }
+
+/** A batch's pictures held on the server until the reader says, as laneHoldOf counts them. */
+type LaneHold = { press: boolean; rest: number }
+
+/**
+ * A fault as the press shows it. A batch the server would not take was never
+ * sent, so it carries its own title and tone rather than the ones a failed
+ * picture gets.
+ */
+type PressFault = DeskFault & { title?: string; tone?: 'correction' | 'warning' | 'error' }
 
 type PressState = {
   job: DeskJob | null
   /** Everything this desk has made since the page loaded, newest first. */
   results: HistoryEntry[]
   current: HistoryEntry | null
-  fault: DeskFault | null
+  fault: PressFault | null
   /** Duration of the last finished run, for the button's quiet receipt. */
   lastMs: number | null
   /** What the page before this one never sent of its batch, in a line (see batchRestLine). */
   unsent: string | null
   /** Pictures an earlier page in this tab sent and did not hand on, which this page follows only at the reader's word. */
   left: SentPicture[]
+  /** Why the last batch was sent from this page although the server keeps a queue, in a line, or null. */
+  fellBack: string | null
+  /**
+   * This desk's batch that the server keeps while its queue is off, or stands
+   * back for another server, in a line, or null. Shown and not taken up: the
+   * press stays free for the page's own work meanwhile (see parkedLine).
+   */
+  parked: string | null
 }
 
 export type RunPlan = {
@@ -534,7 +591,17 @@ export type RunPlan = {
 /** What a record is filed from: the plan, less the graph that ran. */
 type Filing = Pick<RunPlan, 'composition' | 'seed' | 'familyLabel' | 'modelLabel' | 'variant' | 'passes' | 'loras'>
 
-let press: PressState = { job: null, results: [], current: null, fault: null, lastMs: null, unsent: null, left: [] }
+let press: PressState = {
+  job: null,
+  results: [],
+  current: null,
+  fault: null,
+  lastMs: null,
+  unsent: null,
+  left: [],
+  fellBack: null,
+  parked: null,
+}
 const pressListeners = new Set<() => void>()
 
 function emit(patch: Partial<PressState>) {
@@ -836,15 +903,34 @@ function landPicture(files: OutputFile[], filing: Filing, promptId: string, dura
 }
 
 /**
- * Put a batch on the press. Exported for the tests: the desk's own Run button
- * is the only caller in the app.
+ * Put a batch on the press. Exported for the tests: the desk's own buttons are
+ * the only callers in the app.
+ *
+ * It resolves with the id the press shows the batch's first picture under, so
+ * a caller that needs to know which job is its own (the region bench) is told
+ * rather than reading whatever the press holds by then; null when the press
+ * was busy and nothing was put on it. It never rejects.
+ *
+ * Every batch is offered to the server's queue first (see viaServer), which
+ * asks whether the queue runs now rather than going by what the page last
+ * heard. A queue that was off when the page loaded, with nothing in it, sends
+ * the page no word when it comes back, and the page used to send every batch
+ * itself from then on, until the tab was hidden and shown again. Where the
+ * queue does not take it, the batch is this page's to send, one picture at a
+ * time, as it was before the server had a queue.
  */
-export function startRuns(plans: RunPlan[]) {
-  if (driving || !plans.length) return
+export function startRuns(plans: RunPlan[]): Promise<string | null> {
+  if (driving || handing || viewing || !plans.length) return Promise.resolve(null)
+  // A new press answers what the last page never sent, so the line goes, and
+  // with it the word on why the last batch was sent from here.
+  if (press.unsent || press.fellBack) emit({ unsent: null, fellBack: null })
+  return viaServer(plans)
+}
+
+/** The batch as this page sends it itself. */
+function runInPage(plans: RunPlan[]): void {
   queue = [...plans]
   stopped = false
-  // A new press answers what the last page never sent, so the line goes.
-  if (press.unsent) emit({ unsent: null })
   void drive()
 }
 
@@ -930,6 +1016,7 @@ async function drive() {
     driving = false
     stopped = false
     letScreenSleep()
+    lookAgain()
   }
 }
 
@@ -962,14 +1049,21 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
   if (ev.phase !== 'running') return
 
   const cls = ev.node ? plan.graph[ev.node]?.class_type : null
-  // A job asked to stop may still report a step or two before the cancel
+  showRunning(cls, ev.value, ev.max, stopped)
+}
+
+/**
+ * A step of the picture on the press, from this page's own socket or from the
+ * server's word on a picture it sent.
+ */
+function showRunning(classType: string | null | undefined, value: number, max: number, stopping: boolean): void {
+  if (!press.job) return
+  // A job asked to stop may still report a step or two before the stop
   // lands. It says it is stopping until it has.
-  const stage = stopped ? STOPPING : stageFor(cls, ev.value, ev.max)
-  const sampling = ev.max > 1
-  const pct = sampling
-    ? clamp(ev.value / ev.max, press.job.pct, 0.97)
-    : Math.max(press.job.pct, 0.02)
-  patchJob({ status: 'running', stage, value: ev.value, max: ev.max, pct, ranAt: press.job.ranAt ?? Date.now() })
+  const stage = stopping ? STOPPING : stageFor(classType, value, max)
+  const sampling = max > 1
+  const pct = sampling ? clamp(value / max, press.job.pct, 0.97) : Math.max(press.job.pct, 0.02)
+  patchJob({ status: 'running', stage, value, max, pct, ranAt: press.job.ranAt ?? Date.now() })
 }
 
 /**
@@ -986,7 +1080,6 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
  * reader decides whether to make it.
  */
 async function followSent(job: SentPicture): Promise<void> {
-  driving = true
   stopped = false
   const rest = batchRestLine(job.index, job.total)
   /** ComfyUI has said it has the picture, so gone later is gone, not unsent. */
@@ -1067,17 +1160,26 @@ async function followSent(job: SentPicture): Promise<void> {
     }
   } finally {
     settleSent(job.id)
-    driving = false
     stopped = false
   }
 }
 
-/** Take pictures up as this page's own, and follow them one after another. */
+/**
+ * Take pictures up as this page's own, and follow them one after another. The
+ * press is held from the first to the last, so nothing of the server's is
+ * taken up in between (see lookAgain).
+ */
 function takeUp(jobs: SentPicture[]): void {
   sent = [...sent.filter((j) => !jobs.some((t) => t.id === j.id)), ...jobs]
   saveSent()
+  driving = true
   void (async () => {
-    for (const job of jobs) await followSent(job)
+    try {
+      for (const job of jobs) await followSent(job)
+    } finally {
+      driving = false
+      lookAgain()
+    }
   })()
 }
 
@@ -1114,7 +1216,7 @@ function restoreSent(): void {
  * The press takes one picture at a time, so only while it is free.
  */
 export function followLeftSent(): void {
-  if (driving || !press.left.length) return
+  if (driving || handing || viewing || !press.left.length) return
   const jobs = press.left
   emit({ left: [] })
   saveLeftSent()
@@ -1129,6 +1231,9 @@ export function forgetLeftSent(): void {
 }
 
 async function stopRun() {
+  // A batch on the server is stopped there, never by cancelling its prompt
+  // from here: the server is what sends the rest of it.
+  if (handing || viewing || press.job?.runner) return stopOnServer()
   stopped = true
   queue = []
   const id = press.job?.promptId
@@ -1166,6 +1271,8 @@ export function stopPress(): void {
 
 /** Show a finished picture on the plate without re-running anything. */
 function showResult(entry: HistoryEntry) {
+  // The reader's pick stands over a record of the server's still on its way.
+  wantCurrent = null
   emit({ current: entry })
 }
 
@@ -1237,8 +1344,965 @@ if (typeof window !== 'undefined') {
   })
 }
 
+// ---------------------------------------------------------------------------
+// A batch the SwitchGen server sends
+// ---------------------------------------------------------------------------
+
+/**
+ * When the SwitchGen server keeps a queue for this desk (lib/runner.ts), a
+ * batch is handed to it whole, in one request, and the server sends each
+ * picture to ComfyUI in turn, files its record and goes on to the next while
+ * this page is closed or the phone is locked. The rest of a batch used to
+ * wait in the page, and a phone that locked its screen sent nothing more
+ * until it woke.
+ *
+ * The page then only watches. It shows the picture on the press, its
+ * progress and its ending, whichever device sent the batch, and its Stop asks
+ * the server to stop the batch. Nothing here sends to ComfyUI, files a record
+ * or keeps the screen on for such a batch, and nothing is kept for the tab
+ * under SENT_KEY: the server has it, and a page that took it up from there
+ * would send and file it a second time.
+ *
+ * Everything above (drive, SENT_KEY, followSent, the hold on the screen) is
+ * the path for a server without the queue, and runs exactly as it did.
+ *
+ * While the queue is off, or stands back for another server, the server
+ * still lists the work it keeps, as it was last saved, and nothing moves it
+ * on: a Stop answers that the queue is not running. Such a batch is never
+ * taken up then, and one on the press is let go (see letGoWhileOff). It is
+ * said in a line under the desk (parkedLine), without a Stop, and the press
+ * is free for the page's own work. Once the queue is back it is taken up as
+ * any other.
+ */
+
+/** Said on the press while the server has not yet answered for the batch. */
+const HANDING = 'Handing it to the server'
+/** And under it, once the first asking has had no answer. */
+const HANDING_LINE =
+  'The SwitchGen server has not answered yet. The batch is handed to it as soon as it does, and is never sent from this page as well, since the server may already have it.'
+/** The server's answer when it is already making a batch: one at a time, for every device. */
+export const BATCH_BUSY = 'A batch of pictures is already being made, from this page or another.'
+/**
+ * The batch this tab handed to the server, until a page has shown how it
+ * ended. The server goes on while the page is away, and a phone throws away
+ * a tab it put in the background as a matter of course: the page that loads
+ * next shows how that batch went, its pictures and any fault, rather than a
+ * plate that says nothing of it.
+ */
+const RUNNER_KEY = 'switchgen.pictures.runner.v1'
+/**
+ * Batches the reader stopped before the server had answered for them. The
+ * tab's outbox (lib/runner.ts) sends such a batch no more (see dropHanding),
+ * but a request already sent may reach the server all the same, or have
+ * reached it with only the answer lost, so one that shows up there, in this
+ * page or the next one, is stopped the moment it does.
+ */
+const DROPPED_KEY = 'switchgen.pictures.dropped.v1'
+
+/** A batch on its way to the server, until the server has answered for it. */
+type Handing = {
+  groupId: string
+  body: SubmitBody
+  /** Each picture's plan, by job id, in batch order. */
+  own: Map<string, RunPlan>
+  /** The server has not answered; the tab's outbox asks again when it is next heard from. */
+  pending: boolean
+}
+
+/** The server's batch this page shows on the press, and where it stands in it. */
+type Viewing = {
+  groupId: string
+  /** The job on the press. */
+  jobId: string | null
+  /** Each picture's plan, by job id, when this page sent the batch; null for one taken up. */
+  own: Map<string, RunPlan> | null
+  /** This page asked the server to stop the batch. */
+  stopping: boolean
+  /** Ends the follow of the picture on the press when the batch is let go (see letGoWhileOff). */
+  quit: AbortController
+  /** Let go because the queue went off: nothing of it is shown to its end, and it is taken up again once the queue is back. */
+  letGo: boolean
+}
+
+let handing: Handing | null = null
+let viewing: Viewing | null = null
+/** Batches this page has shown to their end, so one is never taken up twice. */
+const walked = new Set<string>()
+/** Records the server filed that this page has not pulled yet, by id. */
+const unpulled = new Set<string>()
+/** A record to put on the plate the moment it is pulled, unless the reader picks another first. */
+let wantCurrent: string | null = null
+/**
+ * The plans of a batch this page sent and then let go while the queue was
+ * off, by group id, so the batch is shown with them once it is taken up again.
+ */
+const parkedPlans = new Map<string, Map<string, RunPlan>>()
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function readDropped(): Set<string> {
+  try {
+    const list: unknown = JSON.parse(tabStore.get(DROPPED_KEY) ?? '[]')
+    return new Set(Array.isArray(list) ? list.filter((id): id is string => typeof id === 'string' && UUID.test(id)) : [])
+  } catch {
+    return new Set()
+  }
+}
+
+let dropped = readDropped()
+/** Stops asked for dropped batches and not yet answered. */
+const stopsOut = new Set<string>()
+
+/** Ask the server to stop a dropped batch, unless that is already being asked. */
+function askStop(groupId: string): void {
+  if (stopsOut.has(groupId)) return
+  stopsOut.add(groupId)
+  void stopGroup(groupId).finally(() => stopsOut.delete(groupId))
+}
+
+function keepDropped(): void {
+  // A handful at most: the reader stopped each while the server was silent.
+  if (dropped.size > 20) dropped = new Set([...dropped].slice(-20))
+  if (dropped.size) tabStore.set(DROPPED_KEY, JSON.stringify([...dropped]))
+  else tabStore.remove(DROPPED_KEY)
+}
+
+/** The same string, no longer than the server takes. */
+const upTo = (text: string, n: number) => (text.length > n ? text.slice(0, n) : text)
+
+/**
+ * What of a batch the server never sent, in a line, once the batch ended at
+ * picture `endedAt`: the server ends a batch at the first picture that fails
+ * (one that wrote no file aside) and sends none of the rest. Null when
+ * nothing was left.
+ */
+export function serverRestLine(first: number, last: number, endedAt: number): string | null {
+  if (![first, last, endedAt].every(Number.isInteger) || first < 1 || last < first) return null
+  const one = first === last
+  const which = one ? `Picture ${first} was` : `Pictures ${first} ${last === first + 1 ? 'and' : 'to'} ${last} were`
+  const it = one ? 'it' : 'them'
+  return `${which} never sent, because picture ${endedAt} failed and a batch ends at the first picture that fails. Make ${it} again from the desk if you want ${it}.`
+}
+
+/**
+ * The line under a batch the server is sending, or null when nothing of it
+ * waits. The page's own line (RunButton's waitingLine) says the rest waits in
+ * this page and goes nowhere while the phone is locked, which for such a
+ * batch is the opposite of the truth, so the button is handed the job without
+ * its place in the batch (see buttonJob) and this is said instead.
+ *
+ * While the hold on the server's lane covers any of the batch (onHold), the
+ * line says which of it is held, and that the notice about held work, which
+ * the shell shows on every page whenever the lane is held, sends it or calls
+ * it off; it does not say the batch is sent in turn, which it is not until
+ * the reader says.
+ *
+ * Nor does it say so while the queue is not running (`queueOn` false): work
+ * that waited while it was off is held when it comes back, not carried on,
+ * and the press says the queue is off in its own note. (A batch on the press
+ * is let go when the queue goes off, see letGoWhileOff, so this is for the
+ * moment in between.)
+ */
+export function serverWaitingLine(
+  job: Pick<DeskJob, 'status' | 'stage' | 'index' | 'total' | 'runner' | 'note' | 'onHold'> | null,
+  queueOn: boolean = runnerStore.snapshot().available,
+): string | null {
+  if (!job?.runner || job.stage === STOPPING) return null
+  const waiting = job.status === 'submitting'
+  if (job.stage === HANDING) return waiting ? HANDING_LINE : null
+  if (!waiting && job.status !== 'queued' && job.status !== 'running') return null
+  // Only a picture still waiting is held; the one on the press says so in its own note.
+  const pressHeld = waiting && job.onHold?.press === true
+  const restHeld = job.onHold?.rest ?? 0
+  const left = Math.max(job.total - job.index, restHeld)
+  const rest =
+    restHeld > 0
+      ? heldRestLine(left, restHeld, pressHeld)
+      : left === 1
+        ? 'One more picture waits on the SwitchGen server and is sent when this one is done.'
+        : left > 1
+          ? `${left} more pictures wait on the SwitchGen server and are sent one at a time.`
+          : null
+  if (!rest && !waiting) return null
+  const held = (pressHeld ? 1 : 0) + restHeld
+  const after =
+    held === 0
+      ? queueOn
+        ? WAITS_ON_SERVER
+        : null
+      : held === 1
+        ? 'The notice about held work sends it, or calls it off, with any other work held.'
+        : 'The notice about held work sends them, or calls them off, with any other work held.'
+  return [waiting ? job.note : null, rest, after].filter(Boolean).join(' ') || null
+}
+
+/**
+ * The line under the desk for a batch of this desk's that the server keeps
+ * while its queue is off, or stands back for another server: `left` of its
+ * pictures are not finished, and `reason` is the server's own sentence for
+ * why its queue is not running. A stop asked of it then is answered that the
+ * queue is not running, so none is offered; `stopAsked` says this tab asked
+ * for one all the same, before the queue went off, and asks again once it is
+ * back (see onStore).
+ */
+function serverParkedLine(label: string, left: number, reason: string | null, stopAsked = false): string {
+  const name = label.trim() ? `“${label.trim()}”` : 'A batch of pictures'
+  const it = left === 1 ? 'it' : 'them'
+  let why = (reason ?? '').trim() || 'The queue on the server is not running.'
+  if (!/[.!?]$/.test(why)) why += '.'
+  const then = stopAsked
+    ? `You asked to stop ${it}, and this tab asks the server again once its queue is back.`
+    : `This page does not send ${it}, and cannot stop ${it} until the queue is back. Pictures you make meanwhile are sent from this page.`
+  return `${name}: ${left === 1 ? 'one picture waits' : `${left} pictures wait`} on the SwitchGen server, whose queue is off. ${why} ${then}`
+}
+
+/** The pictures after the one on the press, `n` of which (of `left`) the hold on the server's lane covers. */
+function heldRestLine(left: number, n: number, pressHeld: boolean): string {
+  if (n < left) {
+    return `${left} more pictures wait on the SwitchGen server, and ${n === 1 ? 'one of them is' : `${n} of them are`} held until you say.`
+  }
+  const which = left === 1 ? 'One more picture waits' : `${left} more pictures wait`
+  if (pressHeld) return `${which} on the SwitchGen server and ${left === 1 ? 'is' : 'are'} held with it.`
+  return `${which} on the SwitchGen server, held until you say.`
+}
+
+/** The job as the Run button is handed it: its place in the batch goes into the stage. */
+function buttonJob(job: DeskJob | null): RunJob | null {
+  if (!job?.runner) return job
+  return {
+    stage: job.total > 1 ? `Picture ${job.index} of ${job.total} · ${job.stage}` : job.stage,
+    pct: job.pct,
+    status: job.status,
+  }
+}
+
+const findJob = (id: string, snap: RunnerSnapshot = runnerStore.snapshot()): RunnerJob | undefined =>
+  snap.jobs.find((j) => j.id === id)
+
+/**
+ * What of the batch of `job`, the picture on the press, the hold on the
+ * server's lane covers, counted as the server counts it and as the notice
+ * about held work does (holdCovers): a picture still waiting, with the hold
+ * on all work or the picture a heavy one, whatever its own wait says. A
+ * picture of the batch waiting besides the one on the press comes after it,
+ * since each waits for the one before. Null when the lane is not held, or the
+ * hold covers none of the batch.
+ */
+function laneHoldOf(snap: RunnerSnapshot, job: RunnerJob): LaneHold | null {
+  const h = snap.lane.held
+  if (!h) return null
+  let press = false
+  let rest = 0
+  for (const j of snap.jobs) {
+    if (j.groupId !== job.groupId || j.status !== 'waiting' || !holdCovers(h, j)) continue
+    if (j.id === job.id) press = true
+    else rest += 1
+  }
+  return press || rest ? { press, rest } : null
+}
+
+const sameHold = (a: LaneHold | null, b: LaneHold | null): boolean =>
+  a === b || (!!a && !!b && a.press === b.press && a.rest === b.rest)
+
+/**
+ * A picture's place in its batch, counted from one, as the desk that sent it
+ * wrote it, or null. (The server numbers a group's jobs from one as well, in
+ * the order the desk handed them over.)
+ */
+function placeIn(job: RunnerJob | undefined, key: 'index' | 'total'): number | null {
+  const n: unknown = job?.meta?.[key]
+  return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : null
+}
+
+/** The group id this tab handed to the server and no page has yet shown to its end, or null. */
+function keptGroup(): string | null {
+  const id = tabStore.get(RUNNER_KEY)
+  return id && UUID.test(id) ? id : null
+}
+
+function forgetKept(groupId: string): void {
+  if (keptGroup() === groupId) tabStore.remove(RUNNER_KEY)
+}
+
+/** Stopped before it was sent, in the words a stop is always given. */
+function stoppedBeforeSent(groupId: string): void {
+  forgetKept(groupId)
+  emit({ fault: faultOf({ message: 'Stopped before it was sent.', cancelled: true }) })
+  patchJob({ status: 'cancelled', finishedAt: Date.now() })
+}
+
+/** The server would not take the batch: nothing of it was kept, and nothing was sent. */
+function refusalOf(answer: { error: string; busy?: 'images' | 'reel' }): PressFault {
+  const busyHere = answer.busy === 'images'
+  return {
+    message: busyHere ? BATCH_BUSY : answer.error,
+    cancelled: false,
+    lost: false,
+    node: null,
+    nodeType: null,
+    detail: null,
+    title: 'Not sent',
+    tone: busyHere ? 'correction' : 'error',
+  }
+}
+
+/**
+ * Hand a batch to the server. The press shows the first picture at once, so
+ * the button turns to Stop and a second press does nothing while the server
+ * is asked. The asking (runnerAvailable) does not go by the page's last word
+ * alone: where the server said its queue was off, and nothing streams its
+ * word here, the queue is read again, so one that came back since is found.
+ * A queue that does not take the batch has it sent from this page instead,
+ * as it always was. Resolves with the id the press shows the batch under (see
+ * startRuns).
+ */
+async function viaServer(plans: RunPlan[]): Promise<string | null> {
+  const own = new Map<string, RunPlan>()
+  let body: SubmitBody
+  try {
+    const total = plans.length
+    body = {
+      v: 1,
+      group: {
+        id: newPromptId(),
+        desk: DESK,
+        kind: 'batch',
+        label: upTo(total > 1 ? `${plans[0].label}, ${total} pictures` : plans[0].label, 200),
+        device: deviceId(),
+      },
+      jobs: plans.map((plan, i) => {
+        const id = newPromptId()
+        own.set(id, plan)
+        return {
+          id,
+          label: upTo(plan.label, 200),
+          prompt: upTo(plan.composition.prompt ?? '', 4000),
+          kind: 'image' as const,
+          primary: 'image' as const,
+          orFirst: true,
+          // Said and passed over, and the batch goes on, as on this page (see
+          // landPicture).
+          noFile: 'fail' as const,
+          heavy: false,
+          graph: plan.graph,
+          record: recordTemplate(plan.composition, {
+            seed: plan.seed,
+            familyLabel: plan.familyLabel,
+            modelLabel: plan.modelLabel,
+            variant: plan.variant,
+            passes: plan.passes,
+            loras: plan.loras,
+          }),
+          meta: { index: i + 1, total },
+        }
+      }),
+    }
+  } catch {
+    // A plan the server's record cannot be made from goes from here, where
+    // it always could.
+    return inPage(plans)
+  }
+  const h: Handing = { groupId: body.group.id, body, own, pending: false }
+  const shownAs = body.jobs[0].id
+  handing = h
+  // Kept from before it goes: the server may take it with the page already gone.
+  tabStore.set(RUNNER_KEY, h.groupId)
+  emit({
+    fault: null,
+    job: {
+      id: shownAs,
+      promptId: null,
+      status: 'submitting',
+      stage: 'Sending the job',
+      value: 0,
+      max: 0,
+      pct: 0,
+      previewUrl: null,
+      label: plans[0].label,
+      index: 1,
+      total: plans.length,
+      startedAt: Date.now(),
+      finishedAt: null,
+      ranAt: null,
+      runner: true,
+    },
+  })
+  let can = { ok: false }
+  try {
+    can = await runnerAvailable(DESK)
+  } catch {
+    /* no answer is no queue: the page sends it */
+  }
+  // Stopped meanwhile (see dropHanding): nothing has been sent.
+  if (handing !== h) return shownAs
+  if (!can.ok) {
+    handing = null
+    forgetKept(h.groupId)
+    return inPage(plans)
+  }
+  let answer: SubmitResult
+  try {
+    answer = await submitGroup(h.body)
+  } catch {
+    // submitGroup answers every failure in words. A throw all the same is
+    // taken as no answer: the outbox has the batch, and it is never sent from
+    // here as well, since the server may have it.
+    answer = { ok: false, fallback: false, pending: true }
+  }
+  // Stopped meanwhile: a batch the server took after all is stopped the
+  // moment it shows up there (see onStore).
+  if (handing !== h) return shownAs
+  if (answer.ok) {
+    handing = null
+    takeUpServerBatch(h.groupId, h.body.jobs.map((j) => j.id), h.own)
+    return shownAs
+  }
+  if (answer.fallback) {
+    handing = null
+    forgetKept(h.groupId)
+    emit({ fellBack: fallbackLine(answer.reason) })
+    return inPage(plans)
+  }
+  if ('pending' in answer) {
+    // No answer: the batch waits in the tab's outbox, which sends it again
+    // when the server is next heard from, and the press waits with it (see
+    // onStore). It is never sent from this page: the server may have it.
+    h.pending = true
+    patchJob({ stage: HANDING })
+    return shownAs
+  }
+  handing = null
+  forgetKept(h.groupId)
+  emit({ fault: refusalOf(answer) })
+  patchJob({ status: 'error', finishedAt: Date.now() })
+  // Refused as busy, the batch in the way is shown on the press, under the
+  // refusal (see driveRunner), rather than at the server's next word.
+  lookAgain()
+  return shownAs
+}
+
+/** Sent from this page after all, under the id drive() gives its first picture. */
+function inPage(plans: RunPlan[]): string | null {
+  runInPage(plans)
+  return press.job?.id ?? null
+}
+
+/**
+ * Let go of a batch the server has not answered for, at the reader's Stop.
+ * The desk is free at once: the answer can take a minute to come, and a stop
+ * that waited for it held the button for as long.
+ *
+ * The tab's outbox is told to send it no more (withdraw), from this page or
+ * the next. Sent again later, as it used to be, its first picture reached
+ * ComfyUI before the stop could, and the reader's next batch was refused as
+ * busy. A
+ * request already sent may reach the server all the same, or have reached it
+ * with only the answer lost, so the server is told now as well, and the batch
+ * is stopped the moment it shows up there (see onStore).
+ */
+function dropHanding(h: Handing): void {
+  if (handing === h) handing = null
+  withdraw(h.groupId)
+  dropped.add(h.groupId)
+  keepDropped()
+  // A queue that is not running answers a stop that it is not; the stop is
+  // asked once it is back (see onStore).
+  if (runnerStore.snapshot().available) askStop(h.groupId)
+  stoppedBeforeSent(h.groupId)
+  lookAgain()
+}
+
+/** The desk's Stop, for a batch on the server or on its way there. */
+async function stopOnServer(): Promise<void> {
+  if (handing) return dropHanding(handing)
+  const v = viewing
+  if (!v) {
+    // A picture of the server's with nothing following it: its batch is
+    // stopped all the same, and never by cancelling its prompt from here.
+    const job = press.job ? findJob(press.job.id) : undefined
+    if (job) await stopGroup(job.groupId)
+    return
+  }
+  v.stopping = true
+  patchJob({ stage: STOPPING })
+  if ((await stopGroup(v.groupId)) || viewing !== v) return
+  // The server did not take the stop (it may be restarting). The press says
+  // what the picture is really doing again, at once rather than at its next
+  // step, and Stop can be asked again.
+  v.stopping = false
+  syncFromStore()
+  // ComfyUI's number can reach the press before the server's list says the
+  // picture is queued, and that wait is not syncFromStore's to show.
+  const cur = press.job
+  if (cur?.status === 'queued' && cur.stage === STOPPING && !findJob(cur.id)?.stopRequested) patchJob({ stage: 'Queued' })
+}
+
+/**
+ * Show a batch the server is sending, one picture after another, to its end.
+ * `own` holds the plans when this page sent it; a batch taken up from another
+ * device, or from the page before this one, has none, and its records are
+ * shown once the archive has them. `freedJust`: it is taken up in the look
+ * made the moment the press came free (see lookAgain).
+ */
+async function driveRunner(
+  groupId: string,
+  jobIds: readonly string[],
+  sentWith: Map<string, RunPlan> | null,
+  freedJust = false,
+): Promise<void> {
+  // The plans of a batch this page sent and let go while the queue was off.
+  const own = sentWith ?? parkedPlans.get(groupId) ?? null
+  parkedPlans.delete(groupId)
+  const v: Viewing = { groupId, jobId: null, own, stopping: false, quit: new AbortController(), letGo: false }
+  viewing = v
+  if (own) tabStore.set(RUNNER_KEY, groupId)
+  try {
+    for (let i = 0; i < jobIds.length; i += 1) {
+      const id = jobIds[i]
+      const known = findJob(id)
+      if (known?.status === 'skipped') break
+      const plan = own?.get(id) ?? null
+      const index = placeIn(known, 'index') ?? i + 1
+      v.jobId = id
+      // Each picture clears the last one's fault, as on this page. A batch
+      // taken up rather than sent from here leaves two kinds standing. One is
+      // the server's answer that it was already making a batch: cleared, the
+      // reader's press seemed to have started someone else's. The other is
+      // the fault the press ended on just now: the batch is taken up the
+      // moment the press is free (see lookAgain), and would wipe the fault of
+      // the reader's own picture before it was read. An older fault goes, or
+      // it would read as the new batch's.
+      const standing = i === 0 && !own && (freedJust || press.fault?.message === BATCH_BUSY) ? press.fault : null
+      emit({
+        fault: standing,
+        job: {
+          id,
+          promptId: known?.promptId ?? null,
+          status: 'submitting',
+          stage: v.stopping ? STOPPING : known ? waitLine(known, DESK).stage : 'Sending the job',
+          value: 0,
+          max: 0,
+          pct: 0,
+          previewUrl: null,
+          label: known?.label ?? plan?.label ?? '',
+          index,
+          total: placeIn(known, 'total') ?? jobIds.length,
+          startedAt: known?.createdAt ?? Date.now(),
+          finishedAt: null,
+          ranAt: null,
+          runner: true,
+        },
+      })
+      syncFromStore()
+      try {
+        const out = await follow(id, (ev) => onServerEvent(v, id, ev), { words: { 'no-file': NO_FILE }, signal: v.quit.signal })
+        // Let go meanwhile: the press may hold the page's own picture by now.
+        if (v.letGo) return
+        landFromServer(out, plan)
+      } catch (err) {
+        if (v.letGo) return
+        const fault = faultOf(err)
+        const ended = findJob(id)
+        const finishedAt = ended?.endedAt ?? Date.now()
+        if (ended?.error?.code === 'no-file' || fault.message === NO_FILE) {
+          // As on this page, a picture that wrote no file is said and the
+          // batch goes on to the next; the server does the same.
+          emit({ fault: { message: NO_FILE, cancelled: false, lost: false, node: null, nodeType: null, detail: null } })
+          patchJob({ status: 'error', finishedAt })
+          continue
+        }
+        // Anything else ends the batch, as it does on this page, and the
+        // server sends none of the rest. A stop needs no line saying so.
+        const rest = fault.cancelled ? null : restLine(jobIds.slice(i + 1), index)
+        emit({ fault, ...(rest ? { unsent: rest } : {}) })
+        patchJob({ status: fault.cancelled ? 'cancelled' : 'error', finishedAt })
+        break
+      }
+    }
+  } finally {
+    // One let go is not shown to its end: it is taken up again once the queue is back.
+    if (!v.letGo) {
+      walked.add(groupId)
+      forgetKept(groupId)
+    }
+    if (viewing === v) {
+      viewing = null
+      lookAgain()
+    }
+  }
+}
+
+/** The pictures after the one that ended a batch, which the server never sent, in a line, or null. */
+function restLine(later: readonly string[], endedAt: number): string | null {
+  const snap = runnerStore.snapshot()
+  const places: number[] = []
+  later.forEach((id, k) => {
+    const job = findJob(id, snap)
+    // Still waiting is skipped a moment later: the server ends the batch and
+    // skips the rest in one change, which may reach this page a job at a time.
+    if (job && job.status !== 'skipped' && job.status !== 'waiting') return
+    places.push(placeIn(job, 'index') ?? endedAt + 1 + k)
+  })
+  if (!places.length) return null
+  return serverRestLine(Math.min(...places), Math.max(...places), endedAt)
+}
+
+/** A picture the server finished, on the plate. */
+function landFromServer(out: FollowResult, plan: RunPlan | null): void {
+  if (out.repeatOf) {
+    // ComfyUI answered from its cache with a file already on record: that
+    // record, with its own real time. No receipt: a lookup is not a run.
+    showFiled(out.repeatOf, null)
+  } else if (out.entryId && out.primary) {
+    const primary = out.primary
+    // Until the archive's pull brings the record the server filed, the same
+    // record made here from the plan, under the server's id and number.
+    const provisional: HistoryEntry | null = plan
+      ? {
+          ...recordOf(plan.composition, {
+            file: primary,
+            files: out.files.length > 1 ? out.files : undefined,
+            kind: primary.kind,
+            promptId: press.job?.promptId ?? '',
+            durationMs: out.durationMs,
+            seed: plan.seed,
+            familyLabel: plan.familyLabel,
+            modelLabel: plan.modelLabel,
+            variant: plan.variant,
+            passes: plan.passes,
+            loras: plan.loras,
+          }),
+          id: out.entryId,
+          no: out.entryNo ?? 0,
+          at: out.finishedAt,
+        }
+      : null
+    showFiled(out.entryId, provisional)
+    // A picture whose run was not timed leaves the last receipt alone.
+    if (out.durationMs > 0) emit({ lastMs: out.durationMs })
+  }
+  // With neither, it is done with nothing filed: the reader removed its
+  // record while it was being filed, and a removed record is not brought back.
+  patchJob({ status: 'done', pct: 1, stage: 'Done', finishedAt: out.finishedAt })
+}
+
+/** Put the record `id` on the plate: as filed when this page has it, else `provisional` until it is pulled. */
+function showFiled(id: string, provisional: HistoryEntry | null): void {
+  const filed = getRecord(id)
+  const entry = filed ?? provisional
+  if (!filed) unpulled.add(id)
+  wantCurrent = entry ? null : id
+  if (entry) emit({ results: [entry, ...press.results.filter((r) => r.id !== id)], current: entry })
+}
+
+/** The server's word on the picture on the press, as follow() passes it on. */
+function onServerEvent(v: Viewing, jobId: string, ev: FollowEvent): void {
+  const cur = press.job
+  if (viewing !== v || !cur || cur.id !== jobId) return
+  const stopping = v.stopping || findJob(jobId)?.stopRequested === true
+  if (ev.phase === 'queued') {
+    if (cur.status === 'submitting') patchJob({ promptId: ev.promptId, status: 'queued', stage: stopping ? STOPPING : 'Queued' })
+    return
+  }
+  if (ev.phase === 'preview') {
+    patchJob({ previewUrl: ev.url })
+    return
+  }
+  const node = ev.node ? v.own?.get(jobId)?.graph[ev.node]?.class_type : null
+  showRunning(ev.classType ?? node ?? null, ev.value, ev.max, stopping)
+}
+
+/**
+ * The press brought into line with the server's list, for what follow()
+ * does not report: the wait before a picture is sent (its turn, ComfyUI's own
+ * queue, a held lane, a server with no room), a stop asked from another page,
+ * and filing. It never moves a picture back: one ComfyUI has is not waiting
+ * again, and the steps of one running are follow()'s to report, though a
+ * stop the server did not take is taken back here at once rather than at the
+ * next step, which on a long one can be minutes away.
+ */
+function syncFromStore(snap: RunnerSnapshot = runnerStore.snapshot()): void {
+  const v = viewing
+  const cur = press.job
+  if (!v || !cur?.runner || cur.id !== v.jobId) return
+  const job = findJob(cur.id, snap)
+  if (!job) return
+  const onHold = laneHoldOf(snap, job)
+  if (!sameHold(cur.onHold ?? null, onHold)) patchJob({ onHold })
+  const stopping = v.stopping || job.stopRequested
+  switch (job.status) {
+    case 'waiting':
+    case 'releasing':
+    case 'sending': {
+      if (cur.status !== 'submitting') return
+      const line = waitLine(job, DESK)
+      const stage = stopping ? STOPPING : line.stage
+      if (cur.stage !== stage || (cur.note ?? null) !== line.note) patchJob({ stage, note: line.note })
+      return
+    }
+    case 'queued':
+    case 'running': {
+      const p = snap.progress[job.id]
+      if (cur.status === 'running') {
+        // follow() has reported a step, whichever of the two the list says.
+        if (stopping) {
+          if (cur.stage !== STOPPING) patchJob({ stage: STOPPING })
+        } else if (cur.stage === STOPPING) {
+          const node = p?.node ? v.own?.get(job.id)?.graph[p.node]?.class_type : null
+          patchJob({ stage: stageFor(p?.classType ?? node ?? null, p?.value ?? cur.value, p?.max ?? cur.max) })
+        }
+        return
+      }
+      if (job.status === 'queued') {
+        if (cur.status === 'submitting') {
+          patchJob({ status: 'queued', promptId: job.promptId ?? cur.promptId, stage: stopping ? STOPPING : 'Queued' })
+        } else if (cur.status === 'queued') {
+          const stage = stopping ? STOPPING : 'Queued'
+          if (cur.stage !== stage) patchJob({ stage })
+        }
+        return
+      }
+      if (job.promptId && cur.promptId !== job.promptId) patchJob({ promptId: job.promptId })
+      const node = p?.node ? v.own?.get(job.id)?.graph[p.node]?.class_type : null
+      showRunning(p?.classType ?? node ?? null, p?.value ?? 0, p?.max ?? 0, stopping)
+      return
+    }
+    case 'filing': {
+      const stage = waitLine(job, DESK).stage
+      if (cur.status !== 'running' || cur.stage !== stage) patchJob({ status: 'running', stage })
+      return
+    }
+    default:
+      // Endings are follow()'s to report.
+      return
+  }
+}
+
+/** A job the server has not finished with. */
+const UNFINISHED: ReadonlySet<RunnerJob['status']> = new Set(['waiting', 'releasing', 'sending', 'queued', 'running', 'filing'])
+
+/**
+ * This desk's batches the server keeps while its queue is not running, in the
+ * line under the desk (serverParkedLine), or null. Not the one still being
+ * handed over, which the press shows, nor one this page has shown to its end.
+ */
+function parkedLine(snap: RunnerSnapshot): string | null {
+  if (snap.available) return null
+  const lines: string[] = []
+  for (const g of snap.groups) {
+    if (g.desk !== DESK || g.state !== 'active' || walked.has(g.id) || g.id === handing?.groupId) continue
+    const left = snap.jobs.filter((j) => j.groupId === g.id && UNFINISHED.has(j.status)).length
+    if (left) lines.push(serverParkedLine(g.label, left, snap.reason, dropped.has(g.id)))
+  }
+  return lines.length ? lines.join(' ') : null
+}
+
+function showParked(snap: RunnerSnapshot = runnerStore.snapshot()): void {
+  const parked = parkedLine(snap)
+  if (parked !== press.parked) emit({ parked })
+}
+
+/** The press, free again, when it shows a picture of the server's that is not finished. */
+function freePress(): void {
+  if (press.job?.runner && busy(press)) emit({ job: null })
+}
+
+/**
+ * The queue went off, or stood back for another server, with a batch on the
+ * press. The server lists it as it was last saved and nothing there moves it
+ * on, and a Stop is answered that the queue is not running, so a press that
+ * followed it would hold every Make and every rerun until the queue came
+ * back. It is let go: the press is free for the page's own work, and the
+ * batch is said in the line under the desk (parkedLine), without a Stop.
+ * A stop this page asked for that the server had not taken is asked again
+ * once the queue is back (see dropped), and the batch is taken up again then,
+ * with its plans when this page sent it.
+ */
+function letGoWhileOff(): void {
+  const v = viewing
+  if (!v) return
+  viewing = null
+  v.letGo = true
+  v.quit.abort()
+  if (v.own) parkedPlans.set(v.groupId, v.own)
+  if (v.stopping) {
+    dropped.add(v.groupId)
+    keepDropped()
+  }
+  freePress()
+}
+
+/**
+ * A batch the server has, as this page answers for it: on the press to its
+ * end while the queue runs; while it does not, in the line under the desk,
+ * with the press free (see letGoWhileOff).
+ */
+function takeUpServerBatch(groupId: string, jobIds: readonly string[], own: Map<string, RunPlan> | null): void {
+  if (runnerStore.snapshot().available) {
+    void driveRunner(groupId, jobIds, own)
+    return
+  }
+  if (own) parkedPlans.set(groupId, own)
+  freePress()
+  showParked()
+}
+
+/**
+ * Whenever the server's list changes: bring the press into line, settle a
+ * batch the server had not answered for, and take up a batch the server is
+ * sending when the press is free. There is one such batch at a time for the
+ * whole server, and every device's desk shows it, with Stop.
+ *
+ * While the queue is not running, none is taken up and one on the press is
+ * let go (letGoWhileOff): the batch is said in the line under the desk
+ * instead, and the press is free.
+ */
+function onStore(): void {
+  const snap = runnerStore.snapshot()
+  // Only the first look after the press came free is that moment; a later one is any word of the server's.
+  const freedJust = pressFreed
+  pressFreed = false
+  if (!snap.available) letGoWhileOff()
+  syncFromStore(snap)
+  showParked(snap)
+
+  // Hand-overs from this tab the outbox gave up on: too old when a page came
+  // back, or refused when it was made again. Each is said once.
+  const given = givenUpBatches().filter((g) => g.desk === DESK)
+  if (given.length) {
+    const mine = handing?.pending ? given.find((g) => g.groupId === handing?.groupId) : undefined
+    if (mine) {
+      handing = null
+      patchJob({ status: 'error', finishedAt: Date.now() })
+    }
+    for (const g of given) forgetKept(g.groupId)
+    emit({ unsent: given.map((g) => `${g.label}: ${g.line}`).join(' ') })
+    // After this change has been told to every subscriber, not in the middle of it.
+    queueMicrotask(() => given.forEach((g) => forgetGivenUp(g.groupId)))
+  }
+
+  for (const g of snap.groups) {
+    if (!dropped.has(g.id)) continue
+    if (g.state !== 'active') {
+      dropped.delete(g.id)
+      keepDropped()
+    } else if (snap.available) {
+      // Kept until the server says the batch has ended, so a stop it did not
+      // take is asked again at its next word. A queue that is not running
+      // answers that it is not, so the stop waits for it to be back.
+      askStop(g.id)
+    }
+  }
+
+  const h = handing
+  if (h) {
+    // It reached the server after all, sent again by the outbox, or with only
+    // the answer lost.
+    if (h.pending && snap.groups.some((g) => g.id === h.groupId)) {
+      handing = null
+      takeUpServerBatch(h.groupId, h.body.jobs.map((j) => j.id), h.own)
+    }
+    return
+  }
+
+  // Nothing is taken up from a queue that is not running (see parkedLine),
+  // nor is its list taken at its word about what the server has not got: a
+  // server that cannot read its saved list lists nothing.
+  if (!snap.available) return
+  if (driving || viewing) return
+  const kept = keptGroup()
+  const take =
+    snap.groups.find((g) => g.desk === DESK && g.state === 'active' && !walked.has(g.id) && !dropped.has(g.id)) ??
+    (kept ? snap.groups.find((g) => g.id === kept && !walked.has(g.id)) : undefined)
+  if (take) {
+    void driveRunner(take.id, take.jobIds, null, freedJust)
+    return
+  }
+  // The server has answered and has not got it, nor is the outbox still
+  // handing it over: there is nothing to show.
+  if (
+    kept &&
+    (snap.connected || snap.boot) &&
+    !snap.groups.some((g) => g.id === kept) &&
+    !outboxPending().some((e) => e.groupId === kept)
+  ) {
+    tabStore.remove(RUNNER_KEY)
+  }
+  // The plans of a batch let go while the queue was off, once the server has it going no longer.
+  for (const id of [...parkedPlans.keys()]) {
+    if (!snap.groups.some((g) => g.id === id && g.state === 'active')) parkedPlans.delete(id)
+  }
+}
+
+/**
+ * The press is free again, so the server's list is looked at now rather than
+ * at its next word. A batch the server lists while the press is busy is not
+ * taken up (see onStore), and one held on its lane, or waiting on a queue that
+ * came back while the page made its own pictures, may bring no further word
+ * for hours: the desk said nothing of it meanwhile, and the next Make was
+ * refused as busy. It runs once the caller is done, so the caller's last
+ * change to the press (a picture marked done, stopped or refused) lands on
+ * its own picture, not on the batch taken up after it.
+ */
+function lookAgain(): void {
+  pressFreed = true
+  queueMicrotask(onStoreSafely)
+}
+
+/** Set by lookAgain until the next look at the server's list (see driveRunner's fault). */
+let pressFreed = false
+
+/** A change that lands while one is being taken is taken after it, never inside it. */
+let inStore = false
+let storeAgain = false
+
+function onStoreSafely(): void {
+  if (inStore) {
+    storeAgain = true
+    return
+  }
+  inStore = true
+  try {
+    do {
+      storeAgain = false
+      try {
+        onStore()
+      } catch {
+        /* the desk's own path is untouched either way */
+      }
+    } while (storeAgain)
+  } finally {
+    inStore = false
+  }
+}
+
+// A record the server filed reaches this page with the archive's pull. It
+// replaces the one made here in the meantime, and goes on the plate if the
+// press was waiting for it.
+subscribeRecords(() => {
+  if (!unpulled.size) return
+  let { results, current } = press
+  let changed = false
+  for (const id of [...unpulled]) {
+    const record = getRecord(id)
+    if (!record) continue
+    unpulled.delete(id)
+    changed = true
+    results = results.some((r) => r.id === id) ? results.map((r) => (r.id === id ? record : r)) : [record, ...results]
+    if (current?.id === id || wantCurrent === id) current = record
+    if (wantCurrent === id) wantCurrent = null
+  }
+  if (changed) emit({ results, current })
+})
+
 // Last in the engine, so everything it calls is defined.
 restoreSent()
+
+// A batch the server is sending is taken up now, and whenever the server's
+// word changes. App starts the store; until it has answered there is nothing
+// to take up.
+runnerStore.subscribe(onStoreSafely)
+onStoreSafely()
 
 // ---------------------------------------------------------------------------
 // Small shared pieces
@@ -1760,6 +2824,7 @@ export function Pictures() {
   const dragDepth = useRef(0)
 
   const running = busy(state)
+  const serverLine = serverWaitingLine(state.job)
 
   // --- the catalogue ------------------------------------------------------
   const load = useCallback((reload = false) => {
@@ -2311,7 +3376,7 @@ export function Pictures() {
     }
 
     setSeed0(first)
-    startRuns(plans)
+    void startRuns(plans)
   }, [plan, settled, c.mode, uploading, style])
 
   // Ctrl/⌘+Enter runs, and is the one shortcut that works inside the prompt.
@@ -2505,7 +3570,7 @@ export function Pictures() {
         hand: !!entry.passes?.hand || kind === 'hand',
         hires: !!entry.passes?.hires || kind === 'hires',
       }
-      startRuns([
+      void startRuns([
         {
           graph,
           composition: { ...composition, positive: params.positive },
@@ -2995,8 +4060,7 @@ export function Pictures() {
           prompt: positive,
           seed,
         })
-        const before = press.job?.id ?? null
-        startRuns([
+        const mine = await startRuns([
           {
             graph,
             composition,
@@ -3014,14 +4078,14 @@ export function Pictures() {
             loras: sent,
           },
         ])
-        // drive() announces the new job before its first await, so the live
-        // singleton already holds it. startRuns refuses while another run is
-        // going (one may have started during the mask upload), and then the
-        // job there is not ours and nothing is followed. Nor is a pass whose
-        // bench was closed or moved to another picture during the upload.
-        const queued = press.job
-        if (queued && queued.id !== before && refineToken.current === token) {
-          refineJob.current = queued.id
+        // startRuns names the job the pass is shown under: at once when this
+        // page sends it, and once the server has answered when the server
+        // does, by which time the press may hold something else. It names
+        // none while another run is going (one may have started during the
+        // mask upload), and then nothing is followed. Nor is a pass whose
+        // bench was closed or moved to another picture meanwhile.
+        if (mine && refineToken.current === token) {
+          refineJob.current = mine
           awaitingRefine.current = true
         }
       } catch (err) {
@@ -3206,7 +4270,7 @@ export function Pictures() {
             onRun={start}
             onStop={() => void stopRun()}
             running={running}
-            job={state.job}
+            job={buttonJob(state.job)}
             queuedAhead={ahead}
             lastMs={state.lastMs}
             reducedMotion={reduced}
@@ -3283,7 +4347,7 @@ export function Pictures() {
             onRun={start}
             onStop={() => void stopRun()}
             running={running}
-            job={state.job}
+            job={buttonJob(state.job)}
             queuedAhead={ahead}
             lastMs={state.lastMs}
             promptRef={promptRef}
@@ -3293,6 +4357,13 @@ export function Pictures() {
             onMoreOpenChange={(open) => settings.patch({ expert: open })}
           />
         )}
+
+        {serverLine && <p className="mt-5 text-caption leading-snug text-grey-700">{serverLine}</p>}
+
+        {/* A batch the server keeps while its queue is off: said, never followed, and with no Stop (see parkedLine). */}
+        {state.parked && <p className="mt-5 text-caption leading-snug text-grey-700">{state.parked}</p>}
+
+        {state.fellBack && <p className="mt-5 text-caption italic leading-snug text-grey-500">{state.fellBack}</p>}
 
         {state.unsent && (
           <div className="mt-5">
@@ -3572,7 +4643,7 @@ function EditDesk({
   onRun: () => void
   onStop: () => void
   running: boolean
-  job: DeskJob | null
+  job: RunJob | null
   queuedAhead: number
   lastMs: number | null
   reducedMotion: boolean
@@ -3720,10 +4791,11 @@ function LeftSent({ left, running }: { left: SentPicture[]; running: boolean }) 
  * way, or whose error was missed on the socket and settled from its history,
  * was not rejected. The Video desk already said "did not finish" for those.
  */
-function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }) {
+function Fault({ fault, onDismiss }: { fault: PressFault; onDismiss: () => void }) {
   const title =
-    fault.message === NO_FILE ? 'No picture came back' : fault.message === NOT_SENT ? 'The picture was not sent' : faultTitle(fault)
-  const tone = fault.cancelled ? 'correction' : fault.lost ? 'warning' : 'error'
+    fault.title ??
+    (fault.message === NO_FILE ? 'No picture came back' : fault.message === NOT_SENT ? 'The picture was not sent' : faultTitle(fault))
+  const tone = fault.tone ?? (fault.cancelled ? 'correction' : fault.lost ? 'warning' : 'error')
   const oom = title === 'The card ran out of memory'
   // The shared wording for memory mentions a shorter clip, which this desk
   // does not make.

@@ -24,6 +24,13 @@
  *
  * Cancellation is `cancelJob(promptId)` and nothing else, so stopping a clip
  * can never stop somebody else's picture.
+ *
+ * Where the SwitchGen server runs its queue, the desk builds each clip's graph
+ * and record as before and hands the lot to the server in one request; the
+ * server then waits, releases, sends and files, and the desk only watches
+ * (see "The queue on the server" below). Everything the page does itself, the
+ * lane, the tab's saved clips and the wake lock, is kept unchanged for a
+ * server without the queue.
  */
 
 import { OfferList } from '../components/result/ResultActions'
@@ -33,7 +40,38 @@ import { drawingLeft, drawnFraction, nextPace, passOf, refusalsFor, type Samplin
 import { EMPTY_LIBRARY, loadLoraLibrary, loadStack, missingTriggers, resolveStack, saveStack, targetFor, type LoraLibrary, type LoraStack } from '../lib/loras'
 import { chainVideoStack, restoreRack, videoLorasToRun } from '../lib/videoLoras'
 import { clipMemory, releaseComfyMemory, releaseIfOthersAhead, waitForIdleComfy } from '../lib/clipMemory'
-import { WAITS_IN_PAGE, holdAwake, wakeLockAvailable } from '../lib/wakeLock'
+import { WAITS_IN_PAGE, WAITS_ON_SERVER, holdAwake, wakeLockAvailable } from '../lib/wakeLock'
+import {
+  HELD_AFTER_PAUSE,
+  HELD_AFTER_RESTART,
+  deviceId,
+  dismiss as dismissOnServer,
+  fallbackLine,
+  follow,
+  forgetGivenUp,
+  givenUpBatches,
+  laneWord,
+  outboxPending,
+  recordTemplate,
+  reportedOf,
+  runnerAvailable,
+  runnerFault,
+  runnerStore,
+  stage as stageHandOver,
+  stopJob as stopOnServer,
+  submitGroup,
+  waitLine,
+  withdraw,
+  type FollowEvent,
+  type FollowResult,
+  type GivenUp,
+  type RunnerJob,
+  type RunnerLane,
+  type RunnerProgress,
+  type RunnerSnapshot,
+  type SubmitBody,
+  type SubmitResult,
+} from '../lib/runner'
 import { copyText } from '../lib/clipboard'
 import { thumbUrl } from '../lib/thumbs'
 import { annotatedRef } from '../lib/continuation'
@@ -55,7 +93,9 @@ import {
   type ReactNode,
 } from 'react'
 import { useHoldToConfirm } from '../components/shell/hotkeys'
+import { heldCounts } from '../components/shell/RunnerHold'
 import { onPlanLanded } from '../lib/downloads'
+import { useServerCapabilities, type ServerCapabilities } from '../lib/capabilities'
 
 import {
   ComfyError,
@@ -105,8 +145,10 @@ import { history, type HistoryEntry } from '../lib/history'
 import {
   applyDefaults,
   clearTouched,
+  compositionFromEntry,
   deskStore,
   needsSource,
+  newComposition,
   randomSeed,
   recordOf,
   reuseIntoDesk,
@@ -249,10 +291,14 @@ const STAGES: Record<string, string> = {
   SaveImage: 'Writing the file',
 }
 
+/** The stage a node of this class is, by its class alone. */
+function stageFor(classType: string | null | undefined): string {
+  return (classType && STAGES[classType]) || 'Working'
+}
+
 function stageOf(graph: ApiWorkflow, nodeId: string | null): string {
   if (!nodeId) return 'Working'
-  const cls = graph[nodeId]?.class_type
-  return (cls && STAGES[cls]) || 'Working'
+  return stageFor(graph[nodeId]?.class_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +829,27 @@ export type VideoJob = {
    * sent a prompt, so this one has neither.
    */
   resumed: boolean
+  /**
+   * True for a clip the queue on the SwitchGen server sends and files. The
+   * page only watches it: none of the lane, the tab's saved clips, the wake
+   * lock or the filing below applies, and the section bar hears of it from
+   * the queue, not from this desk.
+   */
+  runner?: boolean
+  /** For a queued clip, whether this browser sent it (by its device id) or another did. */
+  sentHere?: boolean
+  /**
+   * For a queued clip this page did not make: taken up from the server's
+   * list, after a reload or from another device. Its settings and graph are
+   * on the server, not here, so its composition is only a placeholder.
+   */
+  adopted?: boolean
+  /**
+   * For a clip an earlier page in this tab handed over without hearing back,
+   * shown from the tab's outbox until the server lists it: only its label is
+   * known here, and its settings are nowhere this page can read them.
+   */
+  handedBefore?: boolean
 }
 
 let jobs: VideoJob[] = []
@@ -987,8 +1054,13 @@ function readSent(raw: string | null): { writer: string; released: boolean; jobs
 /** The id a clip is in ComfyUI's hands under, or on its way there under; null before it goes. */
 const sentUnder = (j: VideoJob): string | null => j.promptId ?? j.sendingAs
 
-/** True for a clip sent, or on its way, and not settled: one a later page would have to follow. */
-const outThere = (j: VideoJob): boolean => sentUnder(j) !== null && unfinished(j)
+/**
+ * True for a clip sent, or on its way, and not settled: one a later page
+ * would have to follow. Never a clip of the queue on the server: the server
+ * follows and files it, and a later page following it too would file it a
+ * second time.
+ */
+const outThere = (j: VideoJob): boolean => !j.runner && sentUnder(j) !== null && unfinished(j)
 
 /** The clips a page has in ComfyUI's hands or on their way there, oldest first: sent and not settled. */
 function sentClipsOf(list: readonly VideoJob[]): SentClip[] {
@@ -1103,8 +1175,16 @@ function holdLane(): void {
   announce()
 }
 
-/** The reader's word: send the held clips after all. */
+/**
+ * The reader's word: send the held clips after all. The page's own hold
+ * first; with none, the hold on the server's queue, which is said there, and
+ * which goes for everything it keeps back, of this desk or not.
+ */
 function sendHeld(): void {
+  if (!laneHold && serverHold) {
+    sendHeldOnServer(serverHold.since)
+    return
+  }
   const hold = laneHold
   laneHold = null
   hold?.release()
@@ -1112,8 +1192,12 @@ function sendHeld(): void {
   announce()
 }
 
-/** The reader's word: call the held clips off. */
+/** The reader's word: call the held clips off, the page's own or, with none, the server's. */
 function stopHeld(): void {
+  if (!laneHold && !laneClips.length && serverHold) {
+    stopHeldOnServer(serverHold.since)
+    return
+  }
   for (const c of laneClips) void stopJob(c.id)
 }
 
@@ -1270,18 +1354,40 @@ export const videoJobs = {
   held: (): boolean => laneHold !== null,
   sendHeld,
   stopHeld,
+  /** The queue on the server holding clips of this desk until the reader says; null when it holds none. */
+  heldOnServer: (): ServerHold | null => serverHold,
+  sendHeldOnServer,
+  stopHeldOnServer,
+  /**
+   * "This page sends the work itself: …", when the last clips made here went
+   * by the page's own lane for a reason the server or the page gave; null
+   * otherwise.
+   */
+  sendsItself: (): string | null => fellBack,
+  /** Hand-overs of this desk an earlier page in the tab left, which were never sent, each with why. */
+  givenUp: (): GivenUp[] => givenUpHere,
+  forgetGivenUp: forgetGivenUpHere,
 }
 
 /**
  * Stop one clip from outside the desk, as the section bar does. It is the
  * desk's own stop, so a clip still waiting in the lane is called off before
  * it is ever sent, where cancelling a prompt could not reach it: it has none.
+ * A clip of the queue on the server is stopped there, whatever it is doing.
  */
 export function stopVideoJob(id: string): void {
   void stopJob(id)
 }
 
 function dismissJob(id: string): void {
+  const job = jobById(id)
+  if (job?.runner) {
+    dismissedHere.add(id)
+    unfollowRunner(id)
+    // Put away on the server too, so no other page shows it again. Only a
+    // clip that has ended can be, and only one the server has.
+    if (!unfinished(job) && listedRunner.has(id)) void dismissOnServer([id]).catch(() => false)
+  }
   jobs = jobs.filter((j) => j.id !== id)
   announce()
 }
@@ -1289,6 +1395,33 @@ function dismissJob(id: string): void {
 async function stopJob(id: string): Promise<void> {
   const job = jobById(id)
   if (!job || !unfinished(job)) return
+  if (job.runner) {
+    patchJob(id, { cancelRequested: true, stage: 'Stopping' })
+    // One the server has not listed is still in the tab's outbox, waiting its
+    // turn or its answer. Taken out, it is never handed over again, by this
+    // page or by the next one in the tab.
+    const handing = listedRunner.has(id) ? undefined : outboxPending().find((g) => g.jobIds.includes(id))
+    if (handing) withdraw(handing.groupId, [id])
+    // No request ever carried it, so nothing is left to stop.
+    if (handing && !handing.sent) {
+      failFromRunner(id, new ComfyError(STOPPED_UNSENT, { cancelled: true }))
+      return
+    }
+    // The server does the rest in whatever state the clip is in: never sent
+    // when it still waits, cancelled the moment ComfyUI has it otherwise.
+    // Its ending arrives through the queue like any other. Until the stop
+    // lands it is kept in the tab, and asked again as soon as the server
+    // lists the clip: one handed over without an answer may be there.
+    keepStop(id)
+    if (await stopOnServer(id).catch(() => false)) {
+      forgetStop(id)
+      return
+    }
+    // This page waits on no request for it (its answer came back pending, or
+    // an earlier page in the tab sent it), so nothing else would settle it.
+    if (handing && unanswered.has(handing.groupId) && !listedRunner.has(id)) stoppedUnanswered(id)
+    return
+  }
   if (!job.promptId) {
     // Still in flight to the queue. Mark it, and the queued handler stops it
     // the moment ComfyUI hands us an id. One still waiting its turn is never
@@ -1307,6 +1440,17 @@ async function stopJob(id: string): Promise<void> {
   } catch (err) {
     patchJob(id, { error: (err as Error).message })
   }
+}
+
+/**
+ * A clip of the queue stopped while its hand-over had no answer, which no
+ * request of this page carries any more: shown stopped. Should the server
+ * list it after all, its view takes the card's place (see fromOutbox), and
+ * the stop kept for it is asked there.
+ */
+function stoppedUnanswered(id: string): void {
+  fromOutbox.add(id)
+  failFromRunner(id, new ComfyError(STOPPED_UNANSWERED, { cancelled: true }))
 }
 
 type StartOptions = {
@@ -1506,8 +1650,10 @@ function fail(id: string, err: unknown): void {
   })
   saveSent()
   // Before the lane lets the next heavy clip go: see laneHold. Not for a clip
-  // that may never have reached ComfyUI, which says nothing of its memory.
-  if (f.lost && job?.release && !notSent) holdLane()
+  // that may never have reached ComfyUI, which says nothing of its memory,
+  // and never for a clip of the server's queue, which holds its own lane in
+  // the same step as it records the loss.
+  if (f.lost && job?.release && !notSent && !job.runner) holdLane()
 }
 
 function startJob(opts: StartOptions): string {
@@ -1575,10 +1721,11 @@ function startJob(opts: StartOptions): string {
       // ours sent in the moment between its release and its prompt runs first
       // and leaves its models behind. ComfyUI applies a release after the job
       // it is running, so one sent now lands between this job and that clip.
-      // A spare one costs only a reload.
+      // A spare one costs only a reload. The server's clips are not counted:
+      // the server releases for its own.
       if (
         current.status !== 'running' &&
-        jobs.some((j) => j.id !== id && j.release && (j.status === 'queued' || j.status === 'submitting'))
+        jobs.some((j) => j.id !== id && !j.runner && j.release && (j.status === 'queued' || j.status === 'submitting'))
       ) {
         void releaseComfyMemory()
       }
@@ -1612,7 +1759,7 @@ function startJob(opts: StartOptions): string {
       waiting.set(id, stop)
       const stopped = () => new ComfyError('Stopped before it was sent.', { cancelled: true })
       try {
-        if (jobs.some((j) => j.id !== id && j.release && unfinished(j))) {
+        if (jobs.some((j) => j.id !== id && !j.runner && j.release && unfinished(j))) {
           patchJob(id, {
             stage: 'Waiting its turn',
             waitNote: 'Waits for the clip before it to finish, so that one’s memory can be released before this starts.',
@@ -1762,6 +1909,9 @@ function followSent(s: SentClip): void {
     .finally(() => leaveLane())
 }
 
+/** A clip the page sent, or will send, itself and that has not settled: not one of the server's queue. */
+const sentByPage = (j: VideoJob) => !j.runner && unfinished(j)
+
 /**
  * Read ComfyUI's own queue every five seconds while a clip is unfinished, so
  * the desk can say honestly how many clips are ahead of this one.
@@ -1772,9 +1922,13 @@ function followSent(s: SentClip): void {
  * there is no record at all, which the catch in startJob reports; followPrompt
  * does the same for a clip taken up after a reload. A second watch here raced
  * them and called a finished clip lost.
+ *
+ * Only for clips the page sent itself (sentByPage). The server says where
+ * each of its own clips waits, and a phone showing only those has no reason
+ * to keep asking.
  */
 function managePoll(): void {
-  const live = jobs.some(unfinished)
+  const live = jobs.some(sentByPage)
   if (live && !pollTimer) pollTimer = setInterval(() => void reconcile(), 5000)
   if (!live && pollTimer) {
     clearInterval(pollTimer)
@@ -1791,7 +1945,7 @@ function managePoll(): void {
 let reconciling = false
 
 async function reconcile(): Promise<void> {
-  if (reconciling || !jobs.some(unfinished)) return
+  if (reconciling || !jobs.some(sentByPage)) return
   reconciling = true
   try {
     let listed: ServerJob[]
@@ -1805,7 +1959,7 @@ async function reconcile(): Promise<void> {
     // Read again after the await: a job may have settled while the list was on
     // its way, and its place in line is then nobody's business. A clip that is
     // drawing has no place in line; its progress events keep it at 0.
-    for (const job of jobs.filter(unfinished)) {
+    for (const job of jobs.filter(sentByPage)) {
       if (!job.promptId || job.status === 'running') continue
       const ahead = jobsAhead(listed, job.promptId)
       if (ahead !== null && ahead !== job.queuePos) patchJob(job.id, { queuePos: ahead })
@@ -1829,6 +1983,919 @@ function jobsAhead(listed: readonly ServerJob[], promptId: string): number | nul
   return listed.filter(
     (j) => j.id !== promptId && (j.status === 'in_progress' || (j.status === 'pending' && order(j) < order(mine))),
   ).length
+}
+
+// ---------------------------------------------------------------------------
+// The queue on the server
+// ---------------------------------------------------------------------------
+//
+// A clip waiting in the page's lane is sent only while the page is awake to
+// send it, and a phone that locks suspends the page. Where the SwitchGen
+// server runs its queue, Make hands the clips to it in one request instead,
+// and the page only watches. The server keeps one heavy lane for every
+// device and every desk, waits for ComfyUI's queue to empty, releases, sends
+// and files, whatever the page is doing. It files each clip once, under the
+// clip's own id, and the archive brings the record to every page, so nothing
+// here files anything.
+//
+// Every clip of this desk the queue lists is shown here, from any device and
+// after any reload: the page that made a clip may be long gone, and the clip
+// is not lost from sight with it.
+
+/**
+ * The queue's hold, as this desk shows it: why it holds, the clip whose loss
+ * set it, and how many waiting jobs it keeps back, of this desk and of the
+ * others (one hold covers the reel's heavy shots too, and after a reboot, or
+ * a spell with the queue off, everything). Counted as the queue counts what
+ * a word on the hold answers for, and as the shell's hold notice counts it.
+ */
+export type ServerHold = {
+  why: NonNullable<RunnerLane['held']>['why']
+  jobId: string | null
+  clips: number
+  others: number
+  /**
+   * When the server set this hold. The word given on it names it, so a word
+   * given on a notice that is out of date is refused rather than taken for a
+   * newer hold the reader has not seen.
+   */
+  since: number
+}
+
+/** One clip as Make built it, ready to go by either road. */
+export type PlannedClip = {
+  /** The composition as sent, with the positive prompt the graph carries. */
+  composition: Composition
+  graph: ApiWorkflow
+  familyLabel: string
+  modelLabel: string
+  loras?: HistoryEntry['loras']
+  /** Needs ComfyUI's memory released before it starts: see lib/clipMemory.ts. */
+  release: boolean
+}
+
+/** Where one press of Make went. `pending` says the server has not answered yet. */
+export type SentClips =
+  | { road: 'server'; ids: string[]; pending: boolean }
+  | { road: 'page'; ids: string[] }
+  | { road: 'refused'; error: string }
+
+/** The stage a clip shows while it is being handed over. */
+const HANDING = 'Handing it to the server'
+
+const NOT_ANSWERED =
+  'The SwitchGen server has not answered yet, so this clip may not have reached it. It shows here as soon as the server lists it.'
+
+/** Under a clip an earlier page in this tab handed over without hearing back, until the server lists it. */
+const HANDED_BEFORE =
+  'An earlier page in this tab handed this clip over and did not hear back, so this page asks the server again. It shows here as soon as the server lists it.'
+
+/**
+ * Under a clip Make made on an earlier page in this tab, which went before its
+ * turn to be handed over came: nothing of it was sent.
+ */
+const PRESSED_BEFORE =
+  'Make was pressed on an earlier page in this tab, which went before it handed this clip over, so this page hands it over now. It shows here as soon as the server lists it.'
+
+/** A clip stopped before any request carried it to the server. */
+const STOPPED_UNSENT = 'Stopped before it was sent.'
+
+/**
+ * A clip stopped while its hand-over had no answer: the server may have it,
+ * and then it is asked to stop it as soon as it lists it (see stopAgain).
+ */
+const STOPPED_UNANSWERED = 'Stopped before the server answered for it.'
+
+/**
+ * Why a press made while ComfyUI was not answering, on the word that the
+ * queue on the server would take it, is refused after all: the page would
+ * have to send it itself, and cannot until ComfyUI answers.
+ */
+const OFFLINE_NO_QUEUE = 'ComfyUI is not answering, and the queue on the server is not taking these clips, so nothing can be queued.'
+
+/** Why clips made while the page's lane has work go by that lane, as fallbackLine takes a reason. */
+const BEHIND_HERE = 'the clips already waiting in this page go first, and new ones wait behind them here'
+
+/** How a clip on the server can end. Every other status is under way. */
+const SERVER_ENDED: ReadonlySet<RunnerJob['status']> = new Set(['done', 'failed', 'stopped', 'lost', 'unsent', 'skipped'])
+
+/** Clips of the queue followed from here, so each is followed once and can be let go. */
+const followingRunner = new Map<string, AbortController>()
+/**
+ * Clips the queue has listed. A clip it has stopped listing is then told
+ * from one being handed over, which it has not listed yet.
+ */
+const listedRunner = new Set<string>()
+/** Clips put away here, kept off the desk while the server's list catches up. */
+const dismissedHere = new Set<string>()
+/**
+ * Stops that did not reach the server, asked again as soon as it lists the
+ * clip. Kept in the tab, so a page the browser throws away before the server
+ * lists a clip the reader stopped leaves the stop to the next page: the
+ * server may have the clip even when it never answered for it.
+ */
+const STOPS_KEY = 'switchgen.videostops.v1'
+
+function readStops(): Set<string> {
+  try {
+    const list: unknown = JSON.parse(tabStore.get(STOPS_KEY) ?? '[]')
+    return new Set(Array.isArray(list) ? list.filter((id): id is string => typeof id === 'string' && id.length <= 64) : [])
+  } catch {
+    return new Set()
+  }
+}
+
+let stopAgain = readStops()
+
+function keepStops(): void {
+  // A handful at most: each is a clip stopped while the server had not listed it.
+  if (stopAgain.size > 50) stopAgain = new Set([...stopAgain].slice(-50))
+  if (stopAgain.size) tabStore.set(STOPS_KEY, JSON.stringify([...stopAgain]))
+  else tabStore.remove(STOPS_KEY)
+}
+
+function keepStop(id: string): void {
+  if (stopAgain.has(id)) return
+  stopAgain.add(id)
+  keepStops()
+}
+
+/** @returns whether a stop was waiting for the clip. */
+function forgetStop(id: string): boolean {
+  if (!stopAgain.delete(id)) return false
+  keepStops()
+  return true
+}
+
+/** Ask the server to stop a clip it lists, keeping the stop for the next change should it not land. */
+function stopListed(id: string): void {
+  forgetStop(id)
+  void stopOnServer(id).then(
+    (landed) => {
+      if (!landed) keepStop(id)
+    },
+    () => keepStop(id),
+  )
+}
+
+/**
+ * Clips shown before the server listed them, whose cards the server's view of
+ * them replaces once it does: those shown from the tab's outbox
+ * (takeUpOutbox), and those stopped while their hand-over had no answer
+ * (stoppedUnanswered), which the server may have after all.
+ */
+const fromOutbox = new Set<string>()
+/**
+ * Hand-overs the server has not answered yet, by group, with the clips shown
+ * for each. The tab keeps the request and sends it again when the server is
+ * next heard from; if that is given up, these clips say so.
+ */
+const unanswered = new Map<string, string[]>()
+/** The queue's hold over clips of this desk, or null. Replaced only when it changes, for useSyncExternalStore. */
+let serverHold: ServerHold | null = null
+/** Hand-overs of this desk from an earlier page in the tab that were never sent. Replaced only when they change. */
+let givenUpHere: GivenUp[] = []
+/** "This page sends the work itself: …", when the last clips made here went by the page's lane for a reason. */
+let fellBack: string | null = null
+/** One hand-over at a time, so clips made by two quick presses reach the server in the order they were made. */
+let handing: Promise<unknown> = Promise.resolve()
+
+let device: string | null = null
+const thisDevice = (): string => (device ??= deviceId())
+
+const cap = (s: string, n: number) => (s.length > n ? s.slice(0, n) : s)
+
+/**
+ * A clip waiting on the server to be sent. Not one still being handed over,
+ * which the server may not have yet.
+ */
+const waitsOnServer = (j: VideoJob): boolean => !!j.runner && unfinished(j) && !j.promptId && listedRunner.has(j.id)
+
+function runnerJobOf(id: string): RunnerJob | undefined {
+  return runnerStore.snapshot().jobs.find((j) => j.id === id)
+}
+
+/** A pass worth naming: one of two or more, never "pass 1 of 1". */
+function passFrom(p: { pass?: SamplingPass | null } | undefined): SamplingPass | null {
+  const pass = p?.pass
+  return pass && pass.count > 1 ? { index: pass.index, count: pass.count } : null
+}
+
+/** What a clip on the server is doing, in the desk's words, until it ends. */
+function stageOnServer(
+  rj: RunnerJob,
+  p: RunnerProgress | undefined,
+  stopping: boolean,
+): Pick<VideoJob, 'stage' | 'waitNote'> {
+  // Filing goes on after a late stop: the file was made, and it is kept. So
+  // it says Filing, where waitLine would say Stopping.
+  if (rj.status === 'filing') return { stage: 'Filing', waitNote: null }
+  if (stopping) return { stage: 'Stopping', waitNote: null }
+  if (rj.status === 'running') return { stage: p?.classType ? stageFor(p.classType) : 'Running', waitNote: null }
+  const line = waitLine(rj)
+  return { stage: line.stage, waitNote: rj.status === 'queued' ? null : line.note }
+}
+
+/** A clip that did not land, as fail() settles one. */
+function endedBy(rj: RunnerJob | undefined, f: Fault): Pick<VideoJob, 'status' | 'error' | 'fault' | 'stage'> {
+  return {
+    status: f.cancelled ? 'cancelled' : 'error',
+    error: f.message || 'Something went wrong.',
+    fault: f,
+    stage: f.cancelled ? 'Stopped' : rj?.status === 'unsent' ? 'Not sent' : f.lost ? 'Lost' : 'Failed',
+  }
+}
+
+/** A clip of the queue this page did not make, as the desk shows its clips. */
+function jobFromRunner(rj: RunnerJob, p: RunnerProgress | undefined): VideoJob {
+  const meta = isObj(rj.meta) ? rj.meta : {}
+  const frames = typeof meta.frames === 'number' ? meta.frames : 0
+  const fps = typeof meta.fps === 'number' ? meta.fps : 0
+  const shown = reportedOf(rj, p)
+  const job: VideoJob = {
+    ...newJob({
+      id: rj.id,
+      startedAt: rj.createdAt,
+      composition: newComposition('video', { prompt: rj.prompt, length: frames || null, fps: fps || null }),
+      graph: {},
+      familyLabel: rj.label,
+      modelLabel: '',
+      release: rj.heavy,
+    }),
+    promptId: rj.promptId,
+    status: shown.status,
+    value: shown.value,
+    max: shown.max,
+    pass: passFrom(p),
+    ranAt: rj.ranAt,
+    files: rj.files,
+    entryId: rj.entryId,
+    repeatOf: rj.repeatOf,
+    frames,
+    fps,
+    cancelRequested: rj.stopRequested,
+    stopLanded: rj.stopLanded,
+    runner: true,
+    sentHere: rj.device === thisDevice(),
+    adopted: true,
+  }
+  if (rj.status === 'done') {
+    return {
+      ...job,
+      stage: 'Done',
+      finishedAt: rj.finishedAt ?? rj.endedAt,
+      // 0 is a time the server did not measure, not a clip made in no time.
+      tookMs: rj.durationMs > 0 ? rj.durationMs : null,
+    }
+  }
+  if (SERVER_ENDED.has(rj.status)) {
+    return { ...job, ...endedBy(rj, faultOf(runnerFault(rj))), finishedAt: rj.endedAt ?? rj.createdAt }
+  }
+  return { ...job, ...stageOnServer(rj, p, rj.stopRequested) }
+}
+
+/** Patch only what differs, so the queue's frequent changes do not redraw the desk for nothing. */
+function patchIfChanged(id: string, patch: Partial<VideoJob>): void {
+  const current = jobById(id)
+  if (!current) return
+  const keys = Object.keys(patch) as (keyof VideoJob)[]
+  if (keys.some((k) => current[k] !== patch[k])) patchJob(id, patch)
+}
+
+/** How far along a clip that has not ended is, so what the queue says never moves one back. */
+const ALONG: Record<'submitting' | 'queued' | 'running', number> = { submitting: 0, queued: 1, running: 2 }
+
+/**
+ * Bring a clip under way into line with the queue's list. Progress, stage
+ * and preview of a running clip come from follow(), report by report; its
+ * ending too, which is why nothing here settles a clip.
+ */
+function applyRunner(current: VideoJob, rj: RunnerJob, p: RunnerProgress | undefined): void {
+  if (SERVER_ENDED.has(rj.status) || !unfinished(current)) return
+  const cancelRequested = current.cancelRequested || rj.stopRequested
+  const patch: Partial<VideoJob> = {
+    cancelRequested,
+    stopLanded: rj.stopLanded,
+    // The server may count a clip heavier than the page did, never lighter.
+    release: rj.heavy,
+    sentHere: rj.device === thisDevice(),
+  }
+  if (rj.promptId !== null) patch.promptId = rj.promptId
+  // As ComfyUI said it began, when this page did not hear it itself.
+  if (current.ranAt === null && rj.ranAt !== null) patch.ranAt = rj.ranAt
+  const status = rj.status === 'running' || rj.status === 'filing' ? 'running' : rj.status === 'queued' ? 'queued' : 'submitting'
+  const from = ALONG[current.status as keyof typeof ALONG]
+  // A progress report can arrive before the list says the clip runs.
+  if (ALONG[status] >= from) {
+    patch.status = status
+    if (status === 'running') patch.queuePos = 0
+    if (status !== 'running' || current.status !== 'running' || rj.status === 'filing') {
+      Object.assign(patch, stageOnServer(rj, p, cancelRequested))
+    }
+  }
+  patchIfChanged(current.id, patch)
+}
+
+/** Take a clip off the desk without a word to the server. */
+function dropRunnerJob(id: string): void {
+  unfollowRunner(id)
+  if (!jobById(id)) return
+  jobs = jobs.filter((j) => j.id !== id)
+  announce()
+}
+
+function unfollowRunner(id: string): void {
+  followingRunner.get(id)?.abort()
+  followingRunner.delete(id)
+}
+
+/** Put clips into the desk's list, newest first, where they belong by when they were made. */
+function placeByAge(list: readonly VideoJob[], add: readonly VideoJob[]): VideoJob[] {
+  const out = [...list]
+  for (const job of add) {
+    const at = out.findIndex((j) => j.startedAt < job.startedAt)
+    if (at < 0) out.push(job)
+    else out.splice(at, 0, job)
+  }
+  return out
+}
+
+/**
+ * The queue's hold as this desk shows it, or null when it keeps nothing back.
+ *
+ * Counted by the shell's own count (heldCounts), which counts as the queue's
+ * covers() does and so as Send and Stop answer: every waiting job when the
+ * hold is on everything, every waiting heavy one otherwise, whatever its wait
+ * says. Its wait is no guide: the next job of a group says it waits for the
+ * one before, and the job at the head of the lane keeps its own wait, yet the
+ * hold keeps both back and Stop stops both.
+ */
+function holdOf(snap: RunnerSnapshot): ServerHold | null {
+  const held = snap.lane.held
+  if (!held) return null
+  const counts = heldCounts(snap)
+  const clips = counts.video
+  const others = Object.values(counts).reduce((sum, n) => sum + n, 0) - clips
+  return clips + others > 0 ? { why: held.why, jobId: held.jobId, clips, others, since: held.since } : null
+}
+
+const sameHold = (a: ServerHold | null, b: ServerHold | null) =>
+  a === b ||
+  (!!a &&
+    !!b &&
+    a.why === b.why &&
+    a.jobId === b.jobId &&
+    a.clips === b.clips &&
+    a.others === b.others &&
+    a.since === b.since)
+
+/**
+ * Mirror the queue's clips of this desk into the desk's list: take up the
+ * ones it has not shown yet, from any device, keep the ones under way in line
+ * with it, and let go of those the queue no longer lists or that were put
+ * away on some device.
+ */
+function syncRunner(): void {
+  const snap = runnerStore.snapshot()
+  const listed = new Set<string>()
+  const taken: VideoJob[] = []
+  for (const rj of snap.jobs) {
+    if (rj.desk !== 'video') continue
+    listed.add(rj.id)
+    // A stop pressed in this tab before the server listed the clip, by this
+    // page or one before it. One that has ended wants none. Not while the
+    // queue is off: it answers no stop then, and one asked again at every
+    // change would only be refused. The change that says it runs again asks it.
+    const stopAsked = stopAgain.has(rj.id)
+    if (SERVER_ENDED.has(rj.status)) forgetStop(rj.id)
+    else if (stopAsked && !queueOff(snap)) stopListed(rj.id)
+    const current = jobById(rj.id)
+    if (rj.dismissed || dismissedHere.has(rj.id)) {
+      // Put away on some device, which the server allows only once a clip
+      // has ended. A card here still under way is one whose ending never
+      // reached this page: one it handed over without hearing back, or one
+      // shown from the tab's outbox. Nothing else would settle it (the list
+      // names it, so it is not given up, and a clip put away is not
+      // followed), so it goes with the rest.
+      if (current?.runner && (!unfinished(current) || SERVER_ENDED.has(rj.status))) {
+        fromOutbox.delete(rj.id)
+        dropRunnerJob(rj.id)
+      }
+      continue
+    }
+    listedRunner.add(rj.id)
+    if (!current || fromOutbox.delete(rj.id)) {
+      // A clip taken up from the list, or one whose card was shown before
+      // the server listed it and knew only the label, or said stopped before
+      // an answer came: the server's view takes its place, keeping a Stop
+      // pressed on it meanwhile. Even one said not sent: the server has it
+      // after all.
+      const job = jobFromRunner(rj, snap.progress[rj.id])
+      const stopping = unfinished(job) && (stopAsked || !!current?.cancelRequested)
+      const shown = stopping ? { ...job, cancelRequested: true, ...stageOnServer(rj, snap.progress[rj.id], true) } : job
+      if (current) {
+        jobs = jobs.map((j) => (j.id === rj.id ? shown : j))
+        announce()
+      } else taken.push(shown)
+      if (unfinished(job)) followRunner(rj.id)
+      continue
+    }
+    // Ids are random, so one the page gave a clip of its own is never the server's.
+    if (!current.runner || !unfinished(current)) continue
+    applyRunner(current, rj, snap.progress[rj.id])
+    followRunner(rj.id)
+  }
+  // Only a list the server answered with is taken at its word about what is
+  // missing from it; one not in yet, or from a server whose queue is not
+  // running, says nothing. An ended clip it no longer lists was put away or
+  // cleared out on the server. One under way is follow()'s to settle, which
+  // asks the server once more before it calls the clip gone.
+  if (snap.connected && snap.available) {
+    for (const j of [...jobs]) {
+      if (j.runner && !unfinished(j) && !listed.has(j.id) && listedRunner.has(j.id)) dropRunnerJob(j.id)
+    }
+  }
+  if (taken.length) {
+    jobs = placeByAge(jobs, taken)
+    announce()
+  }
+  for (const [group, ids] of unanswered) {
+    if (ids.every((id) => listed.has(id))) unanswered.delete(group)
+  }
+  settleGivenUp()
+  const hold = holdOf(snap)
+  if (!sameHold(hold, serverHold)) {
+    serverHold = hold
+    announce()
+  }
+}
+
+/**
+ * Hand-overs of this desk the tab sent again and then gave up on, as too old
+ * or refused. A clip still shown from this page says so itself; one from an
+ * earlier page in the tab, which this page never showed, is kept for the
+ * desk's notice.
+ */
+function settleGivenUp(): void {
+  const given = givenUpBatches().filter((g) => g.desk === 'video')
+  const handled = new Set<string>()
+  const onServer = new Set(runnerStore.snapshot().jobs.map((j) => j.groupId))
+  for (const g of given) {
+    const ids = unanswered.get(g.groupId)
+    // One the server lists after all took the hand-over and lost only its
+    // answer: its clips show from the list, and nothing is said of it.
+    if (!ids && !onServer.has(g.groupId)) continue
+    unanswered.delete(g.groupId)
+    handled.add(g.groupId)
+    for (const id of ids ?? []) {
+      const current = jobById(id)
+      if (!current || !unfinished(current) || listedRunner.has(id)) continue
+      patchJob(id, {
+        status: 'error',
+        error: g.line,
+        fault: faultOf(new ComfyError(g.line)),
+        stage: 'Not sent',
+        finishedAt: Date.now(),
+        previewUrl: null,
+        queuePos: null,
+        waitNote: null,
+      })
+    }
+  }
+  // Said on the clips, so not again in the notice. Put away once the store
+  // has finished telling of this change, since doing so tells of another.
+  if (handled.size) queueMicrotask(() => handled.forEach((g) => forgetGivenUp(g)))
+  const rest = given.filter((g) => !handled.has(g.groupId))
+  const same = rest.length === givenUpHere.length && rest.every((g, i) => g.groupId === givenUpHere[i]?.groupId)
+  if (!same) {
+    givenUpHere = rest
+    announce()
+  }
+}
+
+/** The reader has read that a hand-over from an earlier page was never sent. */
+function forgetGivenUpHere(groupId: string): void {
+  forgetGivenUp(groupId)
+}
+
+/**
+ * Clips an earlier page in this tab handed over without hearing back, or
+ * made and went before handing over, which the tab's outbox keeps and sends
+ * as the page loads. Each is shown as being handed over, as the page that
+ * made it showed it, until the server lists it (syncRunner then puts the
+ * server's view in its place) or it is given up (settleGivenUp then says so
+ * on it). Until then only the label is known here: the rest of what was
+ * handed over is in the outbox.
+ */
+function takeUpOutbox(): void {
+  const shown: VideoJob[] = []
+  for (const g of outboxPending()) {
+    if (g.desk !== 'video') continue
+    const ids = g.jobIds.filter((id) => !jobById(id) && !runnerJobOf(id))
+    if (!ids.length) continue
+    unanswered.set(g.groupId, [...(unanswered.get(g.groupId) ?? []), ...ids])
+    // The newest first, as handOver shows one press.
+    for (const id of [...ids].reverse()) {
+      fromOutbox.add(id)
+      shown.push({
+        ...newJob({
+          id,
+          startedAt: g.at,
+          composition: newComposition('video'),
+          graph: {},
+          familyLabel: g.label,
+          modelLabel: g.label,
+          release: false,
+        }),
+        stage: HANDING,
+        waitNote: g.sent ? HANDED_BEFORE : PRESSED_BEFORE,
+        runner: true,
+        sentHere: true,
+        handedBefore: true,
+      })
+    }
+  }
+  if (!shown.length) return
+  jobs = placeByAge(jobs, shown)
+  announce()
+}
+
+/**
+ * Follow one clip of the queue to its ending. Started once the store has
+ * finished telling its listeners of the change that listed the clip, never
+ * from inside that telling.
+ */
+function followRunner(id: string): void {
+  if (followingRunner.has(id)) return
+  const stop = new AbortController()
+  followingRunner.set(id, stop)
+  const done = () => {
+    if (followingRunner.get(id) === stop) followingRunner.delete(id)
+  }
+  void Promise.resolve()
+    .then(() => (stop.signal.aborted ? null : follow(id, (e) => onRunnerEvent(id, e), { signal: stop.signal })))
+    .then(
+      (ending) => {
+        done()
+        if (ending) finishFromRunner(id, ending)
+      },
+      (err: unknown) => {
+        done()
+        if (stop.signal.aborted) return
+        // A watch that broke while the server still has the clip in hand
+        // says nothing of the clip: the queue's next change follows it again.
+        const rj = runnerJobOf(id)
+        if (rj && !SERVER_ENDED.has(rj.status)) return
+        failFromRunner(id, err)
+      },
+    )
+}
+
+/**
+ * The page's own onEvent, for a clip the server sent: the same stage, pass
+ * and pace. The stage and the pass come from the class of the node the
+ * server reports, since a clip made on another device has no graph here.
+ * Nothing is cancelled or released from here; the server does both.
+ */
+function onRunnerEvent(id: string, e: FollowEvent): void {
+  const current = jobById(id)
+  if (!current || !unfinished(current)) return
+  if (e.phase === 'queued') {
+    patchJob(id, {
+      promptId: e.promptId,
+      sendingAs: null,
+      // A report of progress can come before the word that it was queued.
+      ...(current.status === 'running' ? {} : { status: 'queued' as const, stage: current.cancelRequested ? 'Stopping' : 'Queued' }),
+      waitNote: null,
+    })
+  } else if (e.phase === 'running') {
+    const now = Date.now()
+    const stage = e.classType ? stageFor(e.classType) : stageOf(current.graph, e.node)
+    const drawing = stage === 'Drawing' && e.max > 1
+    const nodePass = passFrom(e) ?? passOf(current.graph, e.node)
+    patchJob(id, {
+      status: 'running',
+      value: e.value,
+      max: e.max,
+      stage,
+      pass: nodePass ?? current.pass,
+      pace: nextPace(current, { pass: nodePass, drawing, value: e.value }, now),
+      ranAt: current.ranAt ?? now,
+      samplingAt: drawing && current.samplingAt === null ? now : current.samplingAt,
+      queuePos: 0,
+      waitNote: null,
+    })
+  } else if (e.phase === 'preview') {
+    patchJob(id, { previewUrl: e.url })
+  }
+}
+
+/**
+ * A clip the server filed. Its record reaches every page through the
+ * archive, so nothing is added here. The time is ComfyUI's own, from the
+ * start of the run to its end; 0 means it was not measured, and is shown as
+ * no time at all.
+ */
+function finishFromRunner(id: string, r: FollowResult): void {
+  const current = jobById(id)
+  if (!current || !unfinished(current)) return
+  patchJob(id, {
+    status: 'done',
+    files: r.files,
+    entryId: r.entryId,
+    repeatOf: r.repeatOf,
+    finishedAt: r.finishedAt,
+    tookMs: r.durationMs || null,
+    stage: 'Done',
+    previewUrl: null,
+    queuePos: null,
+    waitNote: null,
+  })
+}
+
+/**
+ * A clip of the queue that did not land. Never holds the page's lane: the
+ * server holds its own, in the same step as it records the loss, for every
+ * device at once.
+ */
+function failFromRunner(id: string, err: unknown): void {
+  unfollowRunner(id)
+  const current = jobById(id)
+  if (!current || !unfinished(current)) return
+  const rj = runnerJobOf(id)
+  patchJob(id, {
+    ...endedBy(rj, faultOf(err)),
+    finishedAt: rj?.endedAt ?? Date.now(),
+    previewUrl: null,
+    queuePos: null,
+    waitNote: null,
+  })
+}
+
+/**
+ * The reader's word on the queue's hold, from this desk. It answers for every
+ * job the hold covers, and names the hold the desk showed (by default the one
+ * it shows now), so the server refuses it if another hold has taken that
+ * one's place meanwhile; the page then reads the server's state again, and
+ * the desk shows the new hold for the reader's word on it.
+ */
+function sendHeldOnServer(since: number | undefined = serverHold?.since): void {
+  if (since === undefined) return
+  void laneWord('send', since).catch(() => false)
+}
+
+function stopHeldOnServer(since: number | undefined = serverHold?.since): void {
+  if (since === undefined) return
+  void laneWord('stop', since).catch(() => false)
+}
+
+/**
+ * Send the clips one press of Make built: to the queue on the server where
+ * it runs, else by the page's own lane, exactly as without a queue.
+ *
+ * Clips the page is still sending itself go first, and clips made behind
+ * them wait behind them in the same lane. A lane in the page and a lane on
+ * the server would each wait for an empty queue, release and send, and two
+ * heavy clips could then run together.
+ *
+ * Make calls it; it is exported for the desk's tests, which cannot mount the
+ * desk.
+ */
+// oxlint-disable-next-line react/only-export-components -- exported for the desk's tests, which cannot mount the desk
+export async function sendClips(clips: readonly PlannedClip[], opts: SendOptions = {}): Promise<SentClips> {
+  if (!clips.length) return { road: 'page', ids: [] }
+  let offer: { ok: boolean; reason: string | null }
+  try {
+    offer = await runnerAvailable('video')
+  } catch {
+    offer = { ok: false, reason: null }
+  }
+  const behindHere = laneClips.length > 0 || jobs.some(sentByPage)
+  if (!offer.ok || behindHere) {
+    if (pageCannotSend(opts)) return { road: 'refused', error: OFFLINE_NO_QUEUE }
+    const why = !offer.ok ? offer.reason : BEHIND_HERE
+    fellBack = why ? fallbackLine(why) : null
+    return { road: 'page', ids: clips.map((c) => startJob(c)) }
+  }
+  fellBack = null
+  return handOver(clips, opts)
+}
+
+/** How Make pressed. */
+type SendOptions = {
+  /**
+   * Pressed while ComfyUI was not answering, on the word that the queue on
+   * the server would take the clips (queueTakesClips). Should they go by the
+   * page after all, they are refused as the press would have been.
+   */
+  offline?: boolean
+}
+
+/** A press made while ComfyUI was not answering that would go by the page, while it still is not. */
+const pageCannotSend = (opts: SendOptions): boolean => !!opts.offline && connectionState() === 'closed'
+
+/**
+ * Whether the queue on the server takes the next clips made here, as far as
+ * the page can tell without asking (sendClips asks): the server said its
+ * queue takes this desk's clips, the queue's own state, as the page last
+ * heard it, says it is running, and nothing the page sends itself is ahead of
+ * them. Then a clip made while ComfyUI is not answering waits on the server,
+ * which sends it once ComfyUI answers, and Make is not refused for it. Not
+ * sure is no.
+ */
+function queueTakesClips(caps: ServerCapabilities | null): boolean {
+  if (!caps?.runner || !caps.runnerDesks.includes('video')) return false
+  return queueRunning() && !laneClips.length && !jobs.some(sentByPage)
+}
+
+/** The queue's state, as the page last heard it, says it is running. */
+function queueRunning(): boolean {
+  const s = runnerStore.snapshot()
+  return s.connected && s.available && s.boot !== ''
+}
+
+/**
+ * The server has said where its queue stands, and it is not running (turned
+ * off, standing back for another server, or stopped after faults). It still
+ * lists the clips it keeps, as they were last saved, but takes no word on
+ * them: a stop, or a word on its hold, is refused until it runs again.
+ */
+const queueOff = (s: RunnerSnapshot): boolean => s.boot !== '' && !s.available
+
+/** Why the queue on the server is not running, in its own words; null while it runs, or before it has said. */
+function queueOffReason(): string | null {
+  const s = runnerStore.snapshot()
+  return queueOff(s) ? (s.reason ?? QUEUE_NOT_RUNNING) : null
+}
+
+const QUEUE_NOT_RUNNING = 'The queue on the server is not running.'
+
+/**
+ * A clip the queue on the server keeps while it is off: shown as it was last
+ * saved, which nothing here can move on or stop. Not one this page is still
+ * handing over, which the server has not listed.
+ */
+const parkedOnServer = (j: VideoJob): boolean => !!j.runner && unfinished(j) && listedRunner.has(j.id)
+
+/** One request to the queue for the clips of one press, shown on the desk from the moment of the press. */
+async function handOver(clips: readonly PlannedClip[], opts: SendOptions = {}): Promise<SentClips> {
+  runnerStore.start()
+  const startedAt = Date.now()
+  const placed = clips.map((clip) => ({ clip, id: newPromptId() }))
+  const ids = placed.map((p) => p.id)
+  // Shown at once, as a clip the page sends is: the answer can take a while,
+  // and the reader has pressed Make. The newest first, as startJob puts them.
+  const shown = placed.map(
+    ({ clip, id }): VideoJob => ({ ...newJob({ id, startedAt, ...clip }), stage: HANDING, runner: true, sentHere: true }),
+  )
+  jobs = [...shown.reverse(), ...jobs]
+  announce()
+
+  const first = clips[0]!
+  const group = newPromptId()
+  const body: SubmitBody = {
+    v: 1,
+    group: {
+      id: group,
+      desk: 'video',
+      kind: 'clips',
+      label: cap(first.modelLabel || first.familyLabel, 200),
+      device: thisDevice(),
+    },
+    jobs: placed.map(({ clip, id }) => ({
+      id,
+      label: cap(clip.modelLabel || clip.familyLabel, 200),
+      prompt: cap(clip.composition.prompt, 4000),
+      kind: 'video',
+      primary: 'video',
+      // A family that writes its clip as frames has no video file; its first
+      // file is what it made.
+      orFirst: true,
+      // A clip that wrote no file is done with nothing to show, as a clip the
+      // page sent is.
+      noFile: 'done',
+      heavy: clip.release,
+      graph: clip.graph,
+      record: recordTemplate(clip.composition, {
+        seed: clip.composition.seed,
+        familyLabel: clip.familyLabel,
+        modelLabel: clip.modelLabel,
+        ...(clip.loras ? { loras: clip.loras } : {}),
+      }),
+      meta: { frames: clip.composition.length ?? 0, fps: clip.composition.fps ?? 0 },
+    })),
+  }
+
+  // Kept in the tab's outbox now, before any request goes: a press made while
+  // an earlier hand-over still waits for its answer (which can take the whole
+  // time a phone sleeps) waits its turn below, and a tab the browser throws
+  // away meanwhile would otherwise lose it without a word. The next page in
+  // the tab then shows it and hands it over, in the order the presses were
+  // made. A clip stopped before its turn is taken out of it (see stopJob),
+  // and a press whose every clip was stopped is not handed over at all.
+  stageHandOver(body)
+  const turn = handing.then(() => (ids.every((id) => jobById(id)?.cancelRequested) ? null : submitGroup(body)))
+  handing = turn.catch(() => undefined)
+  let r: SubmitResult | null
+  try {
+    r = await turn
+  } catch {
+    // Never sent by the page instead: the request may have reached the
+    // server, and a clip the server has would then run twice.
+    r = { ok: false, fallback: false, pending: true }
+  }
+  if (!r) return { road: 'server', ids: [], pending: false }
+
+  if (r.ok) {
+    for (const answered of r.jobs) {
+      const current = jobById(answered.id)
+      if (current) applyRunner(current, runnerJobOf(answered.id) ?? answered, undefined)
+    }
+    // The server's group names every clip it keeps of the press. One it does
+    // not name was stopped and taken out before any request that reached it.
+    const taken = new Set(r.group.jobIds)
+    for (const id of ids) {
+      if (taken.has(id) || !jobById(id)?.cancelRequested) continue
+      forgetStop(id)
+      failFromRunner(id, new ComfyError(STOPPED_UNSENT, { cancelled: true }))
+    }
+    if (![...taken].every((id) => runnerJobOf(id))) void runnerStore.refresh().catch(() => undefined)
+    return { road: 'server', ids, pending: false }
+  }
+
+  if (r.fallback) {
+    // Nothing was stored. A press the page could not have sent itself is
+    // refused as it would have been, and the clips go.
+    if (pageCannotSend(opts)) {
+      for (const id of ids) forgetStop(id)
+      jobs = jobs.filter((j) => !ids.includes(j.id))
+      announce()
+      return { road: 'refused', error: OFFLINE_NO_QUEUE }
+    }
+    // Otherwise the page sends them itself, as with no queue, under the same
+    // ids and from the same press. One stopped meanwhile is never sent.
+    fellBack = fallbackLine(r.reason)
+    const stopped = new Set(ids.filter((id) => jobById(id)?.cancelRequested))
+    jobs = jobs.filter((j) => !ids.includes(j.id) || stopped.has(j.id))
+    announce()
+    const sent: string[] = []
+    for (const { clip, id } of placed) {
+      forgetStop(id)
+      if (stopped.has(id)) failFromRunner(id, new ComfyError(STOPPED_UNSENT, { cancelled: true }))
+      else sent.push(startJob({ ...clip, id, startedAt }))
+    }
+    return { road: 'page', ids: sent }
+  }
+
+  if ('pending' in r) {
+    unanswered.set(group, ids)
+    for (const id of ids) {
+      const current = jobById(id)
+      if (!current || !unfinished(current) || listedRunner.has(id)) continue
+      // Stopped while the request was out: the tab no longer hands it over,
+      // so nothing else would settle it.
+      if (current.cancelRequested) stoppedUnanswered(id)
+      else patchIfChanged(id, { waitNote: NOT_ANSWERED })
+    }
+    return { road: 'server', ids, pending: true }
+  }
+
+  // Refused, and nothing stored: the desk says why, and the clips go.
+  for (const id of ids) forgetStop(id)
+  jobs = jobs.filter((j) => !ids.includes(j.id))
+  announce()
+  return { road: 'refused', error: r.error }
+}
+
+/**
+ * The settings a clip of the queue was made with, read back from the record
+ * the server keeps for it, as a record from the archive is read back: for a
+ * clip this page did not make, whose settings are not here.
+ */
+async function runnerSettingsOf(id: string): Promise<Pick<VideoJob, 'composition' | 'loras'> | null> {
+  try {
+    const res = await fetch(`/api/runner/jobs/${encodeURIComponent(id)}`, { headers: { Accept: 'application/json' } })
+    if (!res.ok || !(res.headers.get('content-type') ?? '').includes('json')) return null
+    const record = ((await res.json()) as { record?: unknown }).record
+    if (!isObj(record) || typeof record.familyId !== 'string' || typeof record.prompt !== 'string') return null
+    // The record the server files is this one with its file added; none is needed to read the settings.
+    const entry = {
+      ...record,
+      id,
+      no: 0,
+      at: 0,
+      kind: 'video',
+      file: { filename: '', subfolder: '', type: 'output' },
+      promptId: '',
+      durationMs: 0,
+    } as unknown as HistoryEntry
+    return {
+      composition: compositionFromEntry(entry).composition,
+      loras: Array.isArray(record.loras) ? (record.loras as HistoryEntry['loras']) : undefined,
+    }
+  } catch {
+    return null
+  }
 }
 
 if (typeof window !== 'undefined') {
@@ -1866,6 +2933,13 @@ if (typeof window !== 'undefined') {
 // the lane's clips see them ahead in ComfyUI's queue.
 restoreSent()
 restoreLane()
+// The queue's clips of this desk, whichever device sent them, for as long as
+// the page lives. Listening starts nothing: the shell starts the queue's
+// stream, and until it has, the list is empty.
+runnerStore.subscribe(syncRunner)
+syncRunner()
+// Then what this tab still has to hand over, which the server has not listed.
+takeUpOutbox()
 
 // ---------------------------------------------------------------------------
 // Hooks
@@ -2078,7 +3152,9 @@ const store = deskStore('video')
 /**
  * Why the press cannot run yet, in the reader's words. Null means it can.
  * `addOns` is how many rack files the clip would chain; see clipMemory.
- * `offline` is true while ComfyUI's socket is closed.
+ * `offline` is true while ComfyUI's socket is closed and the page would send
+ * the clip itself: a clip the queue on the server takes waits there until
+ * ComfyUI answers (queueTakesClips), so it is not refused for this.
  */
 function reasonFor(
   family: VideoFamily | null,
@@ -2103,10 +3179,10 @@ function reasonFor(
   if (c.mode === 'i2v' && c.source && VIDEO_EXT.test(c.source.ref?.filename ?? c.source.name.replace(/ \[\w+\]$/, ''))) {
     return 'The start frame is a whole clip, not one frame of it. Clear it and use one frame.'
   }
-  // While ComfyUI restarts, a clip pressed anyway fails at once, unless it is
-  // heavy and waits in the lane for ComfyUI to answer. Last, because it
-  // passes by itself and the rest still stand when it does. Said as the
-  // Pictures desk and the reel say it.
+  // While ComfyUI restarts, a clip the page sends is pressed in vain: it
+  // fails at once, unless it is heavy and waits in the lane for ComfyUI to
+  // answer. Last, because it passes by itself and the rest still stand when
+  // it does. Said as the Pictures desk and the reel say it.
   if (offline) return 'ComfyUI is not answering, so nothing can be queued.'
   return null
 }
@@ -2167,6 +3243,19 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const leftOver = useSyncExternalStore(videoJobs.subscribe, videoJobs.leftOver)
   const leftSent = useSyncExternalStore(videoJobs.subscribe, videoJobs.leftSent)
   const laneHeld = useSyncExternalStore(videoJobs.subscribe, videoJobs.held)
+  const serverHold = useSyncExternalStore(videoJobs.subscribe, videoJobs.heldOnServer)
+  // Whether the queue on the server would take a clip made now (queueTakesClips).
+  const caps = useServerCapabilities()
+  const capsRef = useRef(caps)
+  useEffect(() => {
+    capsRef.current = caps
+  }, [caps])
+  const queueUp = useSyncExternalStore(runnerStore.subscribe, queueRunning, queueRunning)
+  // Why the queue on the server is not running, when it has said it is not.
+  // Its clips then show as it keeps them, with no Stop and no word on its
+  // hold, which it would refuse, and the press is free for clips of the page's own.
+  const queueOffWhy = useSyncExternalStore(runnerStore.subscribe, queueOffReason, queueOffReason)
+  const givenUp = useSyncExternalStore(videoJobs.subscribe, videoJobs.givenUp)
 
   const [cat, setCat] = useState<Catalogue | null>(null)
   const [catError, setCatError] = useState<string | null>(null)
@@ -2308,13 +3397,20 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
   const myJobs = allJobs
   const live = useMemo(() => myJobs.filter(unfinished), [myJobs])
+  // Clips the queue on the server keeps while it is off (parkedOnServer): shown, never stopped from here.
+  const parked = (j: VideoJob): boolean => queueOffWhy !== null && parkedOnServer(j)
+  // What the press is busy with: not those, which wait for the queue on the server and hold nothing up here.
+  const moving = useMemo(
+    () => (queueOffWhy === null ? live : live.filter((j) => !parkedOnServer(j))),
+    [live, queueOffWhy],
+  )
   // Clips in the lane that ComfyUI has not been handed yet. Read from the
   // lane itself, which a clip leaves just before its prompt goes; every change
   // to it comes with a change to the jobs, which renders this again.
   const waitingHere = videoJobs.waitingCount()
   // The one drawing, when one is. A heavy clip waiting for the queue to empty
   // can be older than a light clip that went straight in and is drawing now.
-  const runningJob = live.find((j) => j.status === 'running') ?? live[live.length - 1] ?? null
+  const runningJob = moving.find((j) => j.status === 'running') ?? moving[moving.length - 1] ?? null
   const now = useNow(live.length > 0)
 
   // The plate shows the newest finished clip unless the reader is reading an
@@ -2573,9 +3669,14 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   // From the rack and library this render shows, which are the ones the
   // press will read: `stack` follows `family` (see above).
   const addOns = useMemo(() => (family ? addOnCount(rackToRun(family, lib, stack).ran) : 0), [family, lib, stack])
+  // ComfyUI not answering refuses a clip the page would send itself, not one
+  // the queue on the server takes and sends once ComfyUI answers. Read each
+  // render: the page's own lane and clips decide it too, and they come with
+  // the desk's jobs.
+  const onQueue = queueUp && queueTakesClips(caps)
   const blockedReason = useMemo(
-    () => reasonFor(family, composition, hardware, addOns, connection === 'closed'),
-    [family, composition, hardware, addOns, connection],
+    () => reasonFor(family, composition, hardware, addOns, connection === 'closed' && !onQueue),
+    [family, composition, hardware, addOns, connection, onQueue],
   )
   const memory = useMemo(
     () => (family ? clipMemory(family.def, clipOf(family, composition), hardware, addOns) : null),
@@ -2630,13 +3731,26 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     }
     const chained = addOnCount(resolvedLoras(fam).ran)
     // Read afresh, not from this render: `Make another` and the shortcut run
-    // from callbacks that may predate the last change of connection.
-    if (reasonFor(fam, c, hardware, chained, connectionState() === 'closed')) return false
+    // from callbacks that may predate the last change of connection. Not
+    // answering refuses only clips the page would send itself.
+    if (reasonFor(fam, c, hardware, chained, connectionState() === 'closed' && !queueTakesClips(capsRef.current))) return false
+    // Pressed while ComfyUI is not answering, on the word that the queue takes them.
+    const offline = connectionState() === 'closed'
 
     const runs = c.runs ?? 1
     const first = c.seedLocked ? c.seed : randomSeed()
     const release = clipMemory(fam.def, clipOf(fam, c), hardware, chained).release
 
+    // Every clip is built before any goes, so one press goes as one: to the
+    // queue on the server in one request where it runs, otherwise into the
+    // page's own lane in the order made. Which road is asked of the server,
+    // so the clips go a moment after the press rather than within it.
+    const planned: PlannedClip[] = []
+    const send = () => {
+      void sendClips(planned, { offline }).then((sent) => {
+        if (sent.road === 'refused') setNotice({ kind: 'error', title: 'Nothing was sent', body: sent.error })
+      })
+    }
     for (let i = 0; i < runs; i++) {
       const seed = first + i
       // A start frame left on the desk after switching to words never reaches
@@ -2650,6 +3764,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       }
       const built = buildGraph(fam, snapshot, seed)
       if (!built) {
+        // The ones built before it still go, as they always did.
+        send()
         setNotice({
           kind: 'error',
           title: 'That shape is not available',
@@ -2661,7 +3777,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         return i > 0
       }
       const { ran } = resolvedLoras(fam)
-      startJob({
+      planned.push({
         // The prompt exactly as sent, so the record carries the trigger words
         // the rack added and not only the words the reader typed.
         composition: { ...snapshot, positive: built.positive },
@@ -2676,6 +3792,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
         release,
       })
     }
+    send()
 
     store.patch({ seed: first })
     setViewing(null)
@@ -2785,6 +3902,31 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       promptRef.current?.focus()
     },
     [rackOf, updateStack],
+  )
+
+  /**
+   * The same for a clip of the queue this page did not make: after a reload,
+   * or from another device. Its settings are on the server, in the record it
+   * would have filed, and are read from there first.
+   */
+  const putBackAny = useCallback(
+    (job: VideoJob) => {
+      if (!job.adopted) {
+        putBack(job)
+        return
+      }
+      void runnerSettingsOf(job.id).then((settings) => {
+        if (settings) putBack({ ...job, ...settings })
+        else {
+          setNotice({
+            kind: 'error',
+            title: 'We could not read those settings',
+            body: 'The SwitchGen server did not send the settings this clip was made with. Try again in a moment.',
+          })
+        }
+      })
+    },
+    [putBack],
   )
 
   // Ctrl/⌘+Enter runs, from inside the prompt too — the one deliberate
@@ -3496,7 +4638,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 <button type="button" className="press" disabled={!!blockedReason || uploading} onClick={make}>
                   {justFinished
                     ? duration(justFinished.ms)
-                    : live.length
+                    : moving.length
                       ? 'Make the clip · next in line'
                       : composition.runs > 1
                         ? `Make ${composition.runs} clips`
@@ -3505,7 +4647,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
                 {blockedReason ? (
                   <p className="mt-1 text-caption italic text-grey-700">{blockedReason}</p>
-                ) : live.length ? (
+                ) : moving.length ? (
                   <p className="mt-1 text-caption italic text-grey-700">
                     The press is busy. This one starts when the clip in front of it finishes.
                   </p>
@@ -3599,7 +4741,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 </div>
               ) : null}
 
-              {connection === 'closed' && live.length ? (
+              {/* Only for clips the page is following itself: the server
+                  follows its own whatever this page's connection does. */}
+              {connection === 'closed' && live.some((j) => !j.runner) ? (
                 <div className="mt-4">
                   <Notice tone="correction" title="Correction">
                     We lost the connection to ComfyUI. If your clip is still running, we will pick it up when ComfyUI
@@ -3649,6 +4793,31 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 ·{' '}
                 <button className="underline" onClick={() => videoJobs.forgetLeftOver()}>
                   Forget {leftOver.length === 1 ? 'it' : 'them'}
+                </button>
+              </Notice>
+            </div>
+          ) : null}
+
+          {/* Clips an earlier page handed to the server, which the server never took */}
+          {givenUp.length ? (
+            <div className="mb-4">
+              <Notice tone="warning" title="Clips not sent">
+                A page before this one in this tab handed clips to the SwitchGen server and went before the server
+                answered. When this page offered them again, they were not taken:
+                <ul className="my-1 list-none p-0">
+                  {givenUp.map((g) => (
+                    <li key={g.groupId} className="italic">
+                      {g.label || 'Clips'}, made at {clock(g.at)}: {g.line}
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => {
+                    for (const g of givenUp) videoJobs.forgetGivenUp(g.groupId)
+                  }}
+                >
+                  Dismiss
                 </button>
               </Notice>
             </div>
@@ -3729,10 +4898,70 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               {videoJobs.laneKept()
                 ? `A reload picks ${waitingHere === 1 ? 'it' : 'them'} up again; closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`
                 : `This browser will not let the desk keep ${waitingHere === 1 ? 'it' : 'them'}, so a reload or closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`}{' '}
+              {/* Why the page is sending them itself when the server has a queue, when the server said. */}
+              {videoJobs.sendsItself() ? `${videoJobs.sendsItself()} ` : ''}
               {WAITS_IN_PAGE}
               {/* A held lane lets the screen lock: nothing goes until the reader says. */}
               {wakeLockAvailable() && !laneHeld ? ' The page asks for the screen to stay on while clips wait.' : ''}
             </p>
+          ) : null}
+
+          {/* The queue on the server, holding clips after a heavy one was lost, the machine restarted, or the
+              queue was off while they waited. The shell's hold notice shows the same hold on every room,
+              whatever it covers, with the same word; this one says it where the held clips are. */}
+          {serverHold && serverHold.clips > 0 ? (
+            <div className="mb-4">
+              <Notice tone="warning" title={serverHold.clips === 1 ? 'A clip held back' : 'Clips held back'}>
+                {serverHold.why === 'restart' ? (
+                  <>{HELD_AFTER_RESTART} </>
+                ) : serverHold.why === 'paused' ? (
+                  <>{HELD_AFTER_PAUSE} </>
+                ) : (
+                  <>
+                    {serverHold.why === 'unsent'
+                      ? `The heavy clip before ${serverHold.clips === 1 ? 'this one' : 'these'} may never have reached ComfyUI: the server could not tell whether it got there, and ComfyUI had no record of it. That usually means ComfyUI restarted, as it does when memory runs out. `
+                      : `The heavy clip before ${serverHold.clips === 1 ? 'this one' : 'these'} was lost: ComfyUI no longer knew it, which usually means ComfyUI restarted, as it does when memory runs out. `}
+                    {serverHold.clips === 1
+                      ? 'The clip waiting behind it needs'
+                      : `The ${serverHold.clips} clips waiting behind it need`}{' '}
+                    as much memory, so the desk holds {serverHold.clips === 1 ? 'it' : 'them'} rather than send{' '}
+                    {serverHold.clips === 1 ? 'it' : 'them'} the same way without a word from you.{' '}
+                  </>
+                )}
+                {/* One hold covers every desk's waiting work it keeps back, and so does the word given here. */}
+                {serverHold.others > 0
+                  ? `It also holds ${serverHold.others} waiting ${serverHold.others === 1 ? 'job' : 'jobs'} from the other desks, and your word here goes for ${serverHold.others === 1 ? 'that one' : 'those'} too. `
+                  : null}
+                {/* The word names the hold shown here, so one given on a notice out of date is refused. The
+                    queue takes no word while it is off, so none is offered then. */}
+                {queueOffWhy !== null ? (
+                  `${queueOffWhy} The server takes your word on ${serverHold.clips + serverHold.others === 1 ? 'it' : 'them'} once its queue is running again.`
+                ) : (
+                  <>
+                    <button
+                      className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                      onClick={() => videoJobs.sendHeldOnServer(serverHold.since)}
+                    >
+                      Send {serverHold.clips + serverHold.others === 1 ? 'it' : 'them'}
+                      {serverHold.why === 'lost' || serverHold.why === 'unsent' ? ' anyway' : ''}
+                    </button>{' '}
+                    ·{' '}
+                    <button
+                      className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                      onClick={() => videoJobs.stopHeldOnServer(serverHold.since)}
+                    >
+                      Call {serverHold.clips + serverHold.others === 1 ? 'it' : 'them'} off
+                    </button>
+                  </>
+                )}
+              </Notice>
+            </div>
+          ) : null}
+
+          {/* Where the server's waiting clips live: on the server, so the page may close. Not while its queue
+              is off, when nothing is sent in turn; each card says why instead. */}
+          {moving.some(waitsOnServer) ? (
+            <p className="mb-3 text-caption italic text-grey-700">{WAITS_ON_SERVER}</p>
           ) : null}
 
           {/* Running jobs */}
@@ -3759,7 +4988,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 />
               </div>
 
-              <p className="mt-2 truncate text-small italic text-grey-700">{job.prompt}</p>
+              {/* A clip from the tab's outbox has only its label here until the server lists it. */}
+              <p className="mt-2 truncate text-small italic text-grey-700">
+                {job.handedBefore ? job.familyLabel : job.prompt}
+              </p>
 
               {job.id === runningJob?.id && remaining ? (
                 <p className="mt-1 text-caption italic text-grey-700 tabular-nums">{remaining}</p>
@@ -3782,6 +5014,13 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 </p>
               ) : null}
 
+              {/* The server's clips show on every device, so each says whose it is. */}
+              {job.runner ? (
+                <p className="mt-1 text-caption italic text-grey-700">
+                  {job.sentHere ? 'Sent from this browser.' : 'Sent from another browser.'}
+                </p>
+              ) : null}
+
               {job.previewUrl ? (
                 <img
                   src={job.previewUrl}
@@ -3790,9 +5029,19 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 />
               ) : null}
 
-              <div className="mt-2">
-                <HoldToStop jobId={job.id} label={live.length > 1 ? 'Hold to stop this one' : 'Hold to stop'} />
-              </div>
+              {/* The queue on the server refuses a stop while it is off, so none is offered. */}
+              {parked(job) ? (
+                <p className="mt-1 text-caption italic text-grey-700">
+                  {job.waitNote && !job.promptId ? '' : `${queueOffWhy} `}
+                  {job.cancelRequested
+                    ? 'The stop goes through once the queue on the server is running again.'
+                    : 'It can be stopped here once the queue on the server is running again.'}
+                </p>
+              ) : (
+                <div className="mt-2">
+                  <HoldToStop jobId={job.id} label={live.length > 1 ? 'Hold to stop this one' : 'Hold to stop'} />
+                </div>
+              )}
             </div>
           ))}
 
@@ -3804,19 +5053,25 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 title={faultTitle(failed.fault ?? faultOf(new Error(failed.error ?? '')))}
               >
                 {/* A lost heavy clip holds the lane behind it (see laneHold), so
-                    the desk is not free again, and a second go is not the offer. */}
-                {faultBody(failed.fault ?? faultOf(new Error(failed.error ?? '')), {
+                    the desk is not free again, and a second go is not the offer.
+                    On the server, the hold names the clip whose loss set it, and
+                    is said held only while it keeps something back: the shell's
+                    hold notice then shows on every room with Send and Call off,
+                    even when what it holds is all another desk's. */}
+                {faultBody(failed.fault ?? faultOf(new Error(failed.error ?? '')), failed.runner ? { held: serverHold?.jobId === failed.id } : {
                   held: failed.release && laneHeld,
                 })}{' '}
                 {failed.fault && faultWhere(failed.fault) ? (
                   <span className="block text-caption">{faultWhere(failed.fault)}</span>
                 ) : null}
-                {/* A clip the reader stopped wants no second go offered. */}
-                {failed.status === 'error' ? (
+                {/* A clip the reader stopped wants no second go offered, and one
+                    from the tab's outbox that was never sent has no settings to
+                    put back: they were in the hand-over, and went with it. */}
+                {failed.status === 'error' && !failed.handedBefore ? (
                   <>
                     <button
                       className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
-                      onClick={() => putBack(failed)}
+                      onClick={() => putBackAny(failed)}
                     >
                       Put these settings back
                     </button>{' '}

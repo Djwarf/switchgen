@@ -44,8 +44,18 @@ import {
 } from 'react'
 
 import { connect, fileUrl, objectInfo, type FileRef } from '../lib/comfy'
+import {
+  HELD_AFTER_RESTART,
+  deviceId,
+  fallbackLine,
+  holdCovers,
+  runnerStore,
+  stopGroup,
+  type RunnerGroup,
+  type RunnerLane,
+} from '../lib/runner'
 import { thumbUrl } from '../lib/thumbs'
-import { WAITS_IN_PAGE, wakeLockAvailable } from '../lib/wakeLock'
+import { WAITS_IN_PAGE, WAITS_ON_SERVER, wakeLockAvailable } from '../lib/wakeLock'
 import {
   annotatedRef,
   checkReel,
@@ -97,6 +107,8 @@ import {
   type Shape,
   EmptyStrip
 } from '../components/reel'
+
+import { passMetaOf, waitingOnServer } from '../components/reel/engine'
 
 import type { PlayerSlot } from './Video'
 
@@ -327,6 +339,108 @@ function HeldElsewhere({ elsewhere, order }: { elsewhere: Elsewhere; order: read
   )
 }
 
+/**
+ * The server's queue holds this pass's waiting shots until the reader says:
+ * after a heavy clip was lost, or never reached ComfyUI, since what took
+ * ComfyUI down may take it down again, after the machine itself restarted
+ * while they waited, or after the queue was off while they waited. The word
+ * is the queue's, so it covers everything it holds, the other desks' work
+ * included, and it is given from any page: the shell's notice of held work
+ * offers it on every room, for this pass and for any other. So here the held
+ * shots are named, and the reader is pointed to that notice: one word, under
+ * one pair of names, which says so when it does not get through and names
+ * the hold it answers.
+ *
+ * `count` is this pass's waiting shots the hold covers, counted as the queue
+ * counts them: all of them for a hold on everything, the heavy ones otherwise.
+ */
+function HeldOnServer({ held, count }: { held: NonNullable<RunnerLane['held']>; count: number }) {
+  const one = count === 1
+  const them = one ? 'it' : 'them'
+  const these = one ? 'this shot' : 'these shots'
+  // A heavy job went wrong before them, so the same memory is the worry.
+  const afterHeavy = held.why === 'lost' || held.why === 'unsent'
+  const why =
+    held.why === 'lost'
+      ? `The heavy clip before ${these} was lost: ComfyUI no longer knew it, which usually means ComfyUI restarted, as it does when memory runs out.`
+      : held.why === 'unsent'
+        ? `The heavy clip before ${these} may never have reached ComfyUI: the send got no clear answer, and ComfyUI has no record of it, which usually means ComfyUI restarted.`
+        : held.why === 'restart'
+          ? HELD_AFTER_RESTART
+          : `The queue on the server was off while ${these} waited, so ${one ? 'it is' : 'they are'} held until you say.`
+  return (
+    <div className="notice notice-warning mb-5 text-small">
+      <strong>{one ? 'A shot held back.' : 'Shots held back.'}</strong> {why}{' '}
+      {afterHeavy
+        ? `${one ? 'The shot waiting behind it needs' : `The ${count} shots waiting behind it need`} as much memory, so the server holds ${them} rather than send ${them} the same way without a word from you. `
+        : ''}
+      {`Send ${them} or call ${them} off in the notice “Work held on the server” at the top of the page. Your word there goes for everything the server holds, ${held.scope === 'all' ? 'on every desk' : 'on this desk and the Video desk'}.`}
+    </div>
+  )
+}
+
+/**
+ * A pass the server renders that this page is not following. Mostly one that
+ * is not this strip's: pressed from another browser, whose strip is its own,
+ * or from this one before the strip was laid out afresh. It can be this
+ * strip's (`onStrip`) while this desk's press is taken by work of its own, a
+ * pass walked in the page, say; the desk takes it up once the press is free.
+ * It is said once, with a Stop, since any page may stop it.
+ *
+ * `held` is its waiting shots the lane's hold covers, counted as the queue
+ * counts them. The word to send them is the whole queue's and is offered by
+ * the shell's notice of held work, which shows on every room while anything
+ * is held, so here they are only named.
+ */
+function OtherPass({ group, held, onStrip }: { group: RunnerGroup; held: number; onStrip: boolean }) {
+  const from = group.device === deviceId() ? 'this browser' : 'another browser'
+  return (
+    <p className="notice notice-info mb-5 text-small">
+      {onStrip ? (
+        <>
+          <strong>A pass of this strip is on the press on the server,</strong> sent from {from}. This desk takes it
+          up once its own press is free.{' '}
+        </>
+      ) : (
+        <>
+          <strong>Another reel is on the press on the server,</strong> sent from {from}. Its shots are not on this
+          strip.{' '}
+        </>
+      )}
+      {held > 0
+        ? `The server holds ${held === 1 ? 'one of its shots' : `${held} of its shots`} until someone says. `
+        : ''}
+      <button
+        type="button"
+        className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+        onClick={() => void stopGroup(group.id)}
+      >
+        Stop it
+      </button>
+    </p>
+  )
+}
+
+/**
+ * A reel pass the server keeps while its queue is off, or stands back for
+ * another server. The server lists it as it was last saved, and nothing moves
+ * it on; a Stop would be answered that the queue is not running, so none is
+ * offered. The desk does not take it up meanwhile (see takeUpFromServer and
+ * letGoWhileOff), so its press is free for work rendered in the page, and
+ * once the queue is back the pass is taken up as after a reload. `reason` is
+ * the server's own sentence for why its queue is off.
+ */
+function ParkedPass({ group, reason, onStrip }: { group: RunnerGroup; reason: string | null; onStrip: boolean }) {
+  const from = group.device === deviceId() ? 'this browser' : 'another browser'
+  return (
+    <p className="notice notice-info mb-5 text-small">
+      <strong>{onStrip ? 'A pass of this strip waits on the server,' : 'Another reel waits on the server,'}</strong>{' '}
+      sent from {from}. Nothing moves it on while the queue on the server is off, and it cannot be stopped until
+      the queue is back. {fallbackLine(reason ?? 'The queue on the server is not running.')}
+    </p>
+  )
+}
+
 /** A clock that ticks only while something is running. */
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
@@ -346,6 +460,8 @@ function useNow(active: boolean): number {
 export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
   const draft = useReel()
   const run = useSyncExternalStore(reelRun.subscribe, reelRun.snapshot, reelRun.snapshot)
+  /** The server's queue, which renders a pass wherever it runs (lib/runner). The shell starts it. */
+  const runner = useSyncExternalStore(runnerStore.subscribe, runnerStore.snapshot, runnerStore.snapshot)
   const records = useSyncExternalStore(history.subscribe, history.all, history.all)
   const expert = useExpert()
 
@@ -814,6 +930,43 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
    * ComfyUI already has, and the desk says so while any wait.
    */
   const inPage = waitingInPage(run)
+  /**
+   * Shots of a pass the server renders that it has not sent yet. They go on
+   * whatever this page does, but only once the server lists the pass: until
+   * then the hand-over itself waits in this page.
+   */
+  const taken = run.runnerGroupId !== null && runner.groups.some((g) => g.id === run.runnerGroupId)
+  const onServer = taken ? waitingOnServer(run) : 0
+  const handing = run.status === 'running' && run.runnerGroupId !== null && !taken
+  /**
+   * A pass's waiting shots the server holds after a loss, a restart or a time
+   * with its queue off, until the reader says. Counted as the queue counts
+   * what its hold covers, whatever each shot's own wait says: every waiting
+   * job for a hold on everything, and every heavy one otherwise. The shell's
+   * notice of held work counts the same way.
+   */
+  const lane = runner.lane.held
+  const heldIn = (groupId: string | null): number =>
+    lane && groupId
+      ? runner.jobs.filter((j) => j.groupId === groupId && j.status === 'waiting' && holdCovers(lane, j)).length
+      : 0
+  const heldHere = heldIn(run.runnerGroupId)
+  /**
+   * Passes on the server that this page is not following: not this strip's,
+   * or this strip's while the press here is taken, or any while the queue on
+   * the server is off, when the desk follows none.
+   */
+  const others = runner.groups.filter(
+    (g) => g.desk === 'reel' && g.state === 'active' && !g.dismissed && g.id !== run.runnerGroupId,
+  )
+  /** The server has said its queue is not running, and keeps what it lists as it was last saved. */
+  const queueOff = runner.boot !== '' && !runner.available
+  const stripIds = new Set(order)
+  const onStrip = (g: RunnerGroup): boolean =>
+    g.jobIds.some((id) => {
+      const meta = passMetaOf(runner.jobs.find((j) => j.id === id)?.meta)
+      return meta !== null && stripIds.has(meta.shotId)
+    })
 
   const changedCount = currency.filter((c) => c === 'changed').length
   const staleCount = currency.filter((c) => c === 'stale').length
@@ -858,6 +1011,14 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
       />
 
       {elsewhere ? <HeldElsewhere elsewhere={elsewhere} order={order} /> : null}
+      {lane && heldHere ? <HeldOnServer held={lane} count={heldHere} /> : null}
+      {others.map((g) =>
+        queueOff ? (
+          <ParkedPass key={g.id} group={g} reason={runner.reason} onStrip={onStrip(g)} />
+        ) : (
+          <OtherPass key={g.id} group={g} held={heldIn(g.id)} onStrip={onStrip(g)} />
+        ),
+      )}
 
       {shown && renderPlayer ? (
         <section className="mb-6">
@@ -1083,6 +1244,19 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               <p className="mt-3 text-caption text-grey-700">
                 {inPage === 1 ? 'One shot waits' : `${inPage} shots wait`} in this page to be sent. {WAITS_IN_PAGE}
                 {wakeLockAvailable() ? ' This page asks to keep the screen on meanwhile.' : ''}
+                {!runner.available && runner.reason ? ` ${fallbackLine(runner.reason)}` : ''}
+              </p>
+            ) : null}
+            {onServer ? (
+              <p className="mt-3 text-caption text-grey-700">
+                {onServer === 1 ? 'One shot waits its turn.' : `${onServer} shots wait their turn.`} {WAITS_ON_SERVER}
+              </p>
+            ) : handing ? (
+              <p className="mt-3 text-caption text-grey-700">
+                This pass is being handed to the SwitchGen server. Until the server has it, it waits in this page.
+                {queueOff
+                  ? ' The queue on the server is not running, so it cannot take the pass yet. Stop the reel to call it off, and the desk can then render it in this page.'
+                  : ''}
               </p>
             ) : null}
 

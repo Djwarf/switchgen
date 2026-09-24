@@ -12,6 +12,12 @@
  * finished clips are saved, and a shot that was on the press when the page went
  * away is picked up again from ComfyUI's own queue rather than rendered twice.
  *
+ * Where the SwitchGen server runs its own queue, a press hands the whole pass
+ * to it instead, and the engine only watches: the server sends each shot in
+ * turn, puts each shot's opening frame in once the shot before has landed,
+ * and files each clip, whether or not a page is open. The walk in the page is
+ * kept, unchanged, for a server without that queue.
+ *
  * WHAT THE ENGINE OWNS
  *   the queue, the per shot state, and the handoff frames.
  * WHAT IT DOES NOT OWN
@@ -59,8 +65,33 @@ import {
   type ShotJob,
 } from '../../lib/continuation'
 import { history } from '../../lib/history'
+import {
+  CHAIN_TOKEN,
+  deviceId,
+  dismiss as dismissOnServer,
+  forgetGivenUp,
+  givenUpBatches,
+  OUTBOX_MAX_AGE_MS,
+  outboxPending,
+  previewUrl as serverPreviewUrl,
+  recordTemplate,
+  runnerAvailable,
+  runnerFault,
+  runnerStore,
+  stopGroup,
+  submitGroup,
+  tokenSites,
+  waitLine,
+  withdraw,
+  type RecordTemplate,
+  type RunnerGroup,
+  type RunnerJob,
+  type RunnerProgress,
+  type RunnerSnapshot,
+} from '../../lib/runner'
 import { onStorage, recordOf, store as kv, tabStore, type Composition } from '../../lib/session'
 import { holdAwake } from '../../lib/wakeLock'
+import { reel } from './store'
 
 export type ShotStatus = 'waiting' | 'queued' | 'running' | 'done' | 'error' | 'stopped'
 
@@ -149,6 +180,15 @@ export type RunState = {
    * each other's shots and the one saved shot on the press.
    */
   elsewhere: Elsewhere | null
+  /**
+   * The group on the SwitchGen server's queue that renders this pass, when
+   * the server sends it rather than the page (lib/runner). Null for a pass
+   * this page walks itself. It stays set once the pass has ended, and from
+   * the press on, before the server has answered: the section bar reports the
+   * server's work through a bridge of its own and leaves a run with a group
+   * out of the reel's, so no shot is reported twice.
+   */
+  runnerGroupId: string | null
 }
 
 /** Everything the engine needs from the desk to file a finished clip. */
@@ -201,6 +241,7 @@ const IDLE: RunState = {
   stopRequested: false,
   note: null,
   elsewhere: null,
+  runnerGroupId: null,
 }
 
 let state: RunState = IDLE
@@ -323,9 +364,29 @@ export function drawnFraction(shot: Pick<ShotState, 'status' | 'value' | 'max'> 
  * Only the page sends them, so none goes while it is closed, hidden or the
  * phone is locked, and the desk says so while there are any. A shot ComfyUI
  * has taken carries on whatever the page does.
+ *
+ * None, for a pass the SwitchGen server renders: its shots wait on the
+ * server, which sends them whatever the page does (see waitingOnServer).
  */
-export function waitingInPage(run: Pick<RunState, 'status' | 'queue' | 'states' | 'elsewhere'>): number {
-  if (run.status !== 'running' || run.elsewhere) return 0
+export function waitingInPage(
+  run: Pick<RunState, 'status' | 'queue' | 'states' | 'elsewhere'> & { runnerGroupId?: string | null },
+): number {
+  if (run.status !== 'running' || run.elsewhere || run.runnerGroupId) return 0
+  return unsentOf(run)
+}
+
+/**
+ * Shots of a pass the SwitchGen server renders that it has not yet handed to
+ * ComfyUI. They wait on the server rather than in the page, so the desk says
+ * that they go on while the phone is locked, instead of asking for the screen.
+ */
+export function waitingOnServer(run: Pick<RunState, 'status' | 'queue' | 'states' | 'runnerGroupId'>): number {
+  if (run.status !== 'running' || !run.runnerGroupId) return 0
+  return unsentOf(run)
+}
+
+/** Shots of a pass not reached yet, and the one on the press until ComfyUI has it. */
+function unsentOf(run: Pick<RunState, 'queue' | 'states'>): number {
   return run.queue.filter((id) => {
     const s = run.states[id]
     return s?.status === 'waiting' || (s?.status === 'queued' && !s.promptId)
@@ -549,6 +610,11 @@ function stopWalking(): void {
   keepBeat()
   awake?.()
   awake = null
+  // The press is free again. A pass the server kept for this strip while the
+  // page walked its own is taken up now: once the server holds it, its queue
+  // may say nothing more until the reader's word, so no change would bring it.
+  // A microtask, so the caller has set the run's ending before it is read.
+  queueMicrotask(onRunnerChange)
 }
 
 /**
@@ -962,6 +1028,43 @@ function restore(): void {
   lookElsewhere(saved)
 }
 
+/**
+ * The server's queue changed: bring the pass this page watches up to date, or
+ * take up one it renders for this strip, say which passes this tab handed
+ * over were never sent, and ask again for each Stop the server has not
+ * confirmed. A pass the server has, watched while its queue goes off, is let
+ * go (letGoWhileOff).
+ */
+function onRunnerChange(): void {
+  const snap = runnerStore.snapshot()
+  pruneHanded()
+  if (!followWatched(snap)) {
+    settleHeldFaults(snap)
+    takeUpFromServer(snap)
+    noteGivenUp(snap)
+  }
+  // Last, so a pass taken up just now asks for its own Stop (watchServer).
+  stopWhenListed(snap)
+}
+
+/**
+ * Bring the pass this page watches up to date, or let it go if the queue has
+ * gone off. True when the change went to that pass, and the rest waits for
+ * the next change.
+ */
+function followWatched(snap: RunnerSnapshot): boolean {
+  const w = watched
+  if (!w || w.over) return false
+  const off = queueOff(snap)
+  if (!off || !(w.seen || w.group)) {
+    watchServer(snap)
+    // Listed just now, with the queue already off.
+    if (!off || w.over || !w.seen) return true
+  }
+  letGoWhileOff(w)
+  return false
+}
+
 /** True when the browser threw this tab's last page away (a phone does, to free memory) and this is it loading again. */
 const wasDiscarded = (): boolean =>
   typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
@@ -1189,6 +1292,10 @@ function mirror(saved: Saved | null): void {
   const key = saved?.shotsKey ?? ''
   if (key === mirrored) return
   mirrored = key
+  // A pass the server renders is shown from the server's word on it, which
+  // any other tab watching it saves too; taking that tab's save in here would
+  // only put this tab's live shots back to how that tab last wrote them.
+  if (onServer()) return
   state = saved && Object.keys(saved.states).length ? { ...state, states: saved.states } : IDLE
   emit()
 }
@@ -1453,6 +1560,99 @@ function shotsWord(numbers: readonly number[]): string {
   return `Shots ${numbers.slice(0, -1).join(', ')} and ${numbers[numbers.length - 1]}`
 }
 
+/**
+ * How one shot of a pass came out, for the note that closes the pass.
+ *
+ *   done            a clip landed; `unchanged` when ComfyUI handed back the
+ *                   clip already on disk
+ *   not-sent        the desk would not send it (a plan block or a memory refusal)
+ *   no-frame        it opens on the shot before it, which left no last frame
+ *   failed          it was sent and did not finish; `nextContinues` when the
+ *                   next shot of the pass was going to open on its last frame
+ *   stopped         stopped while it was being made; `kept` when it had a
+ *                   clip from before, which stays
+ *   stopped-before  stopped before it was sent
+ */
+export type ShotOutcome =
+  | { kind: 'done'; unchanged?: boolean }
+  | { kind: 'not-sent' }
+  | { kind: 'no-frame' }
+  | { kind: 'failed'; nextContinues: boolean }
+  | { kind: 'stopped'; kept: boolean }
+  | { kind: 'stopped-before' }
+
+/**
+ * The verdict and the closing note of a pass, from how each of its shots
+ * came out. `indices` are the pass's shots as indices into the reel, in the
+ * order it set out to render them, and `outcomes` lines up with them: null
+ * for a shot the pass never reached. The first shot that did not finish
+ * decides the note, and nothing after it counts.
+ *
+ * One function for both walks, the page's own and the one that watches the
+ * SwitchGen server render the pass, so a pass reads the same whichever sent
+ * it. The notes speak for this pass only. It can be one shot rendered alone,
+ * or the few shots a whole-reel pass found missing, so nothing is said about
+ * shots it never touched, and later shots are said to depend on a failed one
+ * only when the next one really opens on its last frame.
+ */
+export function passNote(
+  indices: readonly number[],
+  outcomes: readonly (ShotOutcome | null | undefined)[],
+): { verdict: 'done' | 'stopped' | 'error'; note: string | null } {
+  /** Shot numbers this pass finished, cached answers included. */
+  const finished: number[] = []
+  const unchanged: number[] = []
+  const finishedLine = () =>
+    finished.length
+      ? ` ${shotsWord(finished)} finished in this pass and ${finished.length === 1 ? 'is' : 'are'} on disk and in the archive.`
+      : ''
+  /** How a note ends when a shot at `position` in the queue stopped the pass. */
+  const restLine = (position: number) => (position + 1 < indices.length ? ', so the rest of this pass was not sent.' : '.')
+
+  for (const [position, index] of indices.entries()) {
+    const outcome = outcomes[position]
+    if (!outcome) continue
+    const n = index + 1
+    switch (outcome.kind) {
+      case 'done':
+        finished.push(n)
+        if (outcome.unchanged) unchanged.push(n)
+        continue
+      case 'stopped-before':
+        return { verdict: 'stopped', note: `Stopped before shot ${n}.${finishedLine()}` }
+      case 'not-sent':
+        return { verdict: 'error', note: `Shot ${n} was not sent to ComfyUI${restLine(position)}` }
+      case 'no-frame':
+        return { verdict: 'error', note: `Shot ${n} had nothing to continue from${restLine(position)}` }
+      case 'stopped':
+        return {
+          verdict: 'stopped',
+          note: `Stopped during shot ${n}.${outcome.kept ? ' Its earlier clip is kept.' : ''}${finishedLine()}`,
+        }
+      case 'failed':
+        return {
+          verdict: 'error',
+          note:
+            outcome.nextContinues && indices[position + 1] === index + 1
+              ? `Shot ${n} failed, and shot ${n + 1} was going to open on its last frame, so the rest of this pass was not sent.`
+              : `Shot ${n} failed${restLine(position)}`,
+        }
+    }
+  }
+
+  if (!unchanged.length) return { verdict: 'done', note: null }
+  const one = unchanged.length === 1
+  return {
+    verdict: 'done',
+    note: `${shotsWord(unchanged)} came back as the ${one ? 'clip' : 'clips'} already on disk. Nothing that decides ${one ? 'it' : 'them'} had changed, the seed included, so ComfyUI handed back what it had already made. Change the shot, or set the seed to Random, for a different take.`,
+  }
+}
+
+/** The sentence for a shot that opens on the one before it, which has no last frame to give. */
+function noFrameLine(index: number): string {
+  return `This shot opens on shot ${index}'s last frame, and shot ${index} has not produced one yet. Render the shot before it, or pin an opening frame here.`
+}
+
 async function walk(pass: Pass): Promise<void> {
   const lost = startWalking()
   // Only this page sends the next shot, and a phone that locks its screen
@@ -1467,31 +1667,16 @@ async function walk(pass: Pass): Promise<void> {
   // while this pass waits for ComfyUI's queue to empty before its first shot.
   persist()
   const { order, jobs, ctx, indices, before } = pass
-  let verdict: RunStatus = 'done'
-  let note: string | null = null
   /** Shots the pass got as far as, and shots it stopped before a new clip landed. */
   const reached = new Set<string>()
   const stopped = new Set<string>()
-  const unchanged: number[] = []
-
-  // The notes speak for this pass only. It can be one shot rendered alone, or
-  // the few shots a whole-reel pass found missing, so nothing is said about
-  // shots it never touched, and later shots are said to depend on a failed one
-  // only when the next one really opens on its last frame.
-  /** Shot numbers this pass finished, cached answers included. */
-  const finished: number[] = []
-  const finishedLine = () =>
-    finished.length
-      ? ` ${shotsWord(finished)} finished in this pass and ${finished.length === 1 ? 'is' : 'are'} on disk and in the archive.`
-      : ''
-  /** How a note ends when a shot at `position` in the queue stopped the pass. */
-  const restLine = (position: number) => (position + 1 < indices.length ? ', so the rest of this pass was not sent.' : '.')
+  /** How each shot of the pass came out, lined up with `indices`. */
+  const outcomes: (ShotOutcome | null)[] = indices.map(() => null)
 
   for (const [position, index] of indices.entries()) {
     if (lost.aborted) break
     if (state.stopRequested) {
-      verdict = 'stopped'
-      note = `Stopped before shot ${index + 1}.${finishedLine()}`
+      outcomes[position] = { kind: 'stopped-before' }
       break
     }
     const shotId = order[index]
@@ -1510,8 +1695,7 @@ async function walk(pass: Pass): Promise<void> {
     const refusal = job.blocked ?? (memory?.level === 'refuse' ? memory.reason : null)
     if (refusal) {
       setShot(shotId, { status: 'error', stage: 'Not sent', error: refusal, detail: null, finishedAt: Date.now() })
-      verdict = 'error'
-      note = `Shot ${index + 1} was not sent to ComfyUI${restLine(position)}`
+      outcomes[position] = { kind: 'not-sent' }
       break
     }
 
@@ -1523,11 +1707,10 @@ async function walk(pass: Pass): Promise<void> {
         setShot(shotId, {
           status: 'error',
           stage: 'Not built',
-          error: `This shot opens on shot ${index}'s last frame, and shot ${index} has not produced one yet. Render the shot before it, or pin an opening frame here.`,
+          error: noFrameLine(index),
           finishedAt: Date.now(),
         })
-        verdict = 'error'
-        note = `Shot ${index + 1} had nothing to continue from${restLine(position)}`
+        outcomes[position] = { kind: 'no-frame' }
         break
       }
     }
@@ -1537,15 +1720,7 @@ async function walk(pass: Pass): Promise<void> {
       job,
       previous,
       ctx,
-      made: {
-        signature: jobSignature(job),
-        seed: job.params.seed,
-        openedOn: previous ? annotatedRef(previous) : null,
-        frames: clipFrames(job),
-        fps: job.params.fps ?? 0,
-        width: job.params.width,
-        height: job.params.height,
-      },
+      made: madeOf(job, previous ? annotatedRef(previous) : null),
       release: memory?.release ?? false,
       label: `Shot ${index + 1}`,
       order,
@@ -1555,23 +1730,16 @@ async function walk(pass: Pass): Promise<void> {
 
     if (result === 'handed') break
     if (result === 'done' || result === 'unchanged') {
-      finished.push(index + 1)
-      if (result === 'unchanged') unchanged.push(index + 1)
+      outcomes[position] = { kind: 'done', unchanged: result === 'unchanged' }
       continue
     }
     if (result === 'stopped') {
       stopped.add(shotId)
-      verdict = 'stopped'
-      const kept = before[shotId]?.status === 'done' ? ' Its earlier clip is kept.' : ''
-      note = `Stopped during shot ${index + 1}.${kept}${finishedLine()}`
+      outcomes[position] = { kind: 'stopped', kept: before[shotId]?.status === 'done' }
       break
     }
-    verdict = 'error'
     const next = indices[position + 1]
-    note =
-      next === index + 1 && jobs[next]?.start.from === 'previous'
-        ? `Shot ${index + 1} failed, and shot ${index + 2} was going to open on its last frame, so the rest of this pass was not sent.`
-        : `Shot ${index + 1} failed${restLine(position)}`
+    outcomes[position] = { kind: 'failed', nextContinues: next !== undefined && jobs[next]?.start.from === 'previous' }
     break
   }
 
@@ -1585,23 +1753,8 @@ async function walk(pass: Pass): Promise<void> {
     handedOver()
     return
   }
-  const states = { ...state.states }
-  for (const shotId of order) {
-    const shot = states[shotId]
-    if (!shot) continue
-    const prior = before[shotId]
-    if (prior?.status === 'done' && (!reached.has(shotId) || stopped.has(shotId))) {
-      states[shotId] = prior
-    } else if (shot.status === 'queued' || shot.status === 'running') {
-      states[shotId] = { ...shot, status: 'waiting', stage: '', previewUrl: null }
-    }
-  }
-  state = { ...state, states }
-
-  if (verdict === 'done' && unchanged.length) {
-    const one = unchanged.length === 1
-    note = `${shotsWord(unchanged)} came back as the ${one ? 'clip' : 'clips'} already on disk. Nothing that decides ${one ? 'it' : 'them'} had changed, the seed included, so ComfyUI handed back what it had already made. Change the shot, or set the seed to Random, for a different take.`
-  }
+  state = { ...state, states: putBack(order, state.states, before, reached, stopped) }
+  const { verdict, note } = passNote(indices, outcomes)
 
   stopWalking()
   setRun({
@@ -1612,6 +1765,1136 @@ async function walk(pass: Pass): Promise<void> {
     note,
   })
   persist()
+}
+
+/** What a clip made from `job` is made from, recorded when it lands. */
+function madeOf(job: ShotJob, openedOn: string | null): Made {
+  return {
+    signature: jobSignature(job),
+    seed: job.params.seed,
+    openedOn,
+    frames: clipFrames(job),
+    fps: job.params.fps ?? 0,
+    width: job.params.width,
+    height: job.params.height,
+  }
+}
+
+/**
+ * The shots of a finished pass as they should stand: one the pass never
+ * reached, or stopped before its new clip landed, goes back to what it was
+ * before the pass, and one left looking in progress goes back to waiting.
+ */
+function putBack(
+  order: readonly string[],
+  now: Readonly<Record<string, ShotState>>,
+  before: Readonly<Record<string, ShotState>>,
+  reached: ReadonlySet<string>,
+  stopped: ReadonlySet<string>,
+): Record<string, ShotState> {
+  const states = { ...now }
+  for (const shotId of order) {
+    const shot = states[shotId]
+    if (!shot) continue
+    const prior = before[shotId]
+    if (prior?.status === 'done' && (!reached.has(shotId) || stopped.has(shotId))) {
+      states[shotId] = prior
+    } else if (shot.status === 'queued' || shot.status === 'running') {
+      states[shotId] = { ...shot, status: 'waiting', stage: '', previewUrl: null }
+    }
+  }
+  return states
+}
+
+// ---------------------------------------------------------------------------
+// A pass the SwitchGen server renders
+//
+// Where the server runs its own queue (lib/runner), a press hands it the whole
+// pass at once and this page only watches. The server sends each shot in turn
+// whatever the page does, so a pass goes on while the phone is locked or the
+// tab is closed, and it files each clip itself. The page still plans every
+// shot and builds every graph, exactly as the walk above does; the one thing
+// it cannot build is a shot that opens on the last frame of a shot in the
+// same pass, since that frame does not exist yet. That shot is sent with a
+// stand-in where the frame goes (CHAIN_TOKEN), and the server puts the real
+// frame in once the shot before has landed.
+//
+// None of the page's holds apply: no claim, no heartbeat, no shot saved as on
+// the press, no wake lock and no prompt before the page closes. Any page of
+// this browser that shows the same strip watches the same pass, and a reload
+// takes it up again from the server.
+// ---------------------------------------------------------------------------
+
+/** The line for a pass the server turned away because a shot of it is already on the press there. */
+export const REEL_BUSY = 'A reel is already being rendered, from this page or another. Stop it there or wait for it to finish.'
+
+/**
+ * What a pass's job carries for the reel beyond its graph: which shot it is,
+ * where that shot stood in the reel, whether it opens on the shot before it in
+ * the same pass, and what its clip is made from. The server keeps it as given
+ * and hands it back with the job, so a page that takes the pass up after a
+ * reload knows each job's shot without anything saved in the browser.
+ */
+export type PassMeta = {
+  shotId: string
+  /** The shot's place in the reel when the pass was pressed, from zero. */
+  index: number
+  /** True when it opens on the last frame of the shot before it in this pass. */
+  chained: boolean
+  /** What the clip is made from. `openedOn` is null for a chained shot: the server names the frame. */
+  made: Made
+}
+
+/** One job of a pass, as the server's intake takes it (lib/runner submitGroup). */
+export type PassJob = {
+  id: string
+  label: string
+  prompt: string
+  kind: 'video'
+  primary: 'video'
+  orFirst: false
+  noFile: 'done'
+  heavy: boolean
+  graph: ApiWorkflow
+  record: RecordTemplate
+  chain?: { after: string; at: [string, string][] }
+  meta: PassMeta
+}
+
+/**
+ * Where a pass stops before the server gets any further: the first shot the
+ * page will not send, and what that shot shows. The shots before it go to the
+ * server; this one and the rest do not.
+ */
+export type PassCut = {
+  position: number
+  index: number
+  shotId: string
+  patch: Partial<ShotState>
+  outcome: ShotOutcome
+}
+
+export type ServerPass = {
+  group: { id: string; desk: 'reel'; kind: 'pass'; label: string; device: string }
+  jobs: PassJob[]
+  cut: PassCut | null
+}
+
+/**
+ * The pass as the server's intake takes it, built from the same plan the walk
+ * renders. `indices` are the shots to render, as indices into `order`, in
+ * order, and `states` the shots as they stand, whose frames a shot opening on
+ * a shot outside the pass opens on.
+ *
+ * It stops at the first shot the walk would stop at before sending anything:
+ * one the plan or the memory verdict refuses, one whose graph cannot be
+ * built, and one that opens on a shot outside the pass that has no last
+ * frame. That shot and the ones after it are not sent, as in the walk.
+ */
+export function buildServerPass(
+  order: readonly string[],
+  jobs: readonly ShotJob[],
+  ctx: RunContext,
+  indices: readonly number[],
+  states: Readonly<Record<string, ShotState>>,
+  opts: { newId?: () => string; device?: string } = {},
+): ServerPass {
+  const newId = opts.newId ?? newPromptId
+  const count = indices.length
+  const group = {
+    id: newId(),
+    desk: 'reel' as const,
+    kind: 'pass' as const,
+    label: count === 1 ? `Reel, shot ${(indices[0] ?? 0) + 1}` : `Reel, ${count} shots`,
+    device: opts.device ?? deviceId(),
+  }
+  const built: PassJob[] = []
+  /** The reel index of the shot built last, which a chained shot follows. */
+  let last: { index: number; id: string } | null = null
+
+  for (const [position, index] of indices.entries()) {
+    const shotId = order[index]
+    const job = jobs[index]
+    if (!shotId || !job) continue
+    const cut = (patch: Partial<ShotState>, outcome: ShotOutcome): ServerPass => ({
+      group,
+      jobs: built,
+      cut: { position, index, shotId, patch: { ...patch, finishedAt: Date.now() }, outcome },
+    })
+
+    const memory = ctx.memory?.(job) ?? null
+    const refusal = job.blocked ?? (memory?.level === 'refuse' ? memory.reason : null)
+    if (refusal) return cut({ status: 'error', stage: 'Not sent', error: refusal, detail: null }, { kind: 'not-sent' })
+
+    const next = indices[position + 1]
+    const failed: ShotOutcome = { kind: 'failed', nextContinues: next !== undefined && jobs[next]?.start.from === 'previous' }
+    const id = newId()
+    let graph: ApiWorkflow
+    let chain: PassJob['chain']
+    let openedOn: string | null = null
+    try {
+      if (job.start.from === 'previous' && last?.index === index - 1) {
+        // The shot before is in this pass, so its last frame does not exist
+        // yet. The server fills in the stand-in once that shot has landed.
+        graph = instantiateShot(job, CHAIN_TOKEN)
+        const at = tokenSites(graph)
+        // The server refuses a graph holding the stand-in anywhere but where
+        // the frame goes, so that is checked here, where it can be named.
+        if (!at.length || JSON.stringify(graph).split(CHAIN_TOKEN).length - 1 !== at.length) {
+          throw new Error(`${job.label} could not be built to open on the shot before it.`)
+        }
+        chain = { after: last.id, at }
+      } else if (job.start.from === 'previous') {
+        const frame = states[order[index - 1] ?? '']?.frame ?? null
+        if (!frame) return cut({ status: 'error', stage: 'Not built', error: noFrameLine(index), detail: null }, { kind: 'no-frame' })
+        graph = instantiateShot(job, frame)
+        openedOn = annotatedRef(frame)
+      } else {
+        graph = instantiateShot(job)
+      }
+    } catch (err) {
+      return cut({ status: 'error', stage: 'Not built', error: (err as Error).message, detail: null }, failed)
+    }
+
+    let record: RecordTemplate
+    try {
+      record = recordTemplate(ctx.compositionFor(job), {
+        seed: job.params.seed,
+        familyLabel: ctx.familyLabel,
+        modelLabel: ctx.modelLabel,
+      })
+    } catch (err) {
+      return cut({ status: 'error', stage: 'Not built', error: (err as Error).message, detail: null }, failed)
+    }
+
+    built.push({
+      id,
+      // The section bar's slug, as the reel's own bridge words it.
+      label: `Shot ${index + 1} of ${order.length}`,
+      // Shown in the section bar only; the graph holds the prompt as sent.
+      prompt: job.params.positive.slice(0, 4000),
+      kind: 'video',
+      primary: 'video',
+      orFirst: false,
+      noFile: 'done',
+      heavy: memory?.release ?? false,
+      graph,
+      record,
+      ...(chain ? { chain } : {}),
+      meta: { shotId, index, chained: chain !== undefined, made: madeOf(job, openedOn) },
+    })
+    last = { index, id }
+  }
+  return { group, jobs: built, cut: null }
+}
+
+const isRunnerLive = (s: RunnerJob['status']): boolean =>
+  s === 'waiting' || s === 'releasing' || s === 'sending' || s === 'queued' || s === 'running' || s === 'filing'
+
+/** A job's PassMeta, or null when it is not a reel shot's. */
+export function passMetaOf(meta: unknown): PassMeta | null {
+  if (!isObject(meta) || !isString(meta.shotId) || !isMade(meta.made)) return null
+  return {
+    shotId: meta.shotId,
+    index: isNumber(meta.index) ? meta.index : -1,
+    chained: meta.chained === true,
+    made: meta.made,
+  }
+}
+
+/**
+ * How a job of the pass shows on its shot while the server has it. Only the
+ * live fields change: the clip, frame, files, record and what the clip was
+ * made from stay as they were until a new clip lands, so a pass that ends
+ * early leaves every earlier clip where it was. `current` is the pass's next
+ * job, the one the server is at.
+ */
+export function liveShotPatch(
+  job: RunnerJob,
+  progress: RunnerProgress | null | undefined,
+  current: boolean,
+): Partial<ShotState> {
+  const status = job.status
+  const drawing = status === 'running' || status === 'filing'
+  // A shot behind the one the server is at waits as it does in the page's
+  // walk, with no stage of its own; the band names the shot at the front.
+  const behind = status === 'waiting' && !current
+  return {
+    status: drawing ? 'running' : behind ? 'waiting' : 'queued',
+    stage: behind ? '' : waitLine(job, 'reel').stage,
+    // Null until ComfyUI has the job: the number is the queue's word that it is there.
+    promptId: job.promptId,
+    value: drawing ? (progress?.value ?? 0) : 0,
+    max: drawing ? (progress?.max ?? 0) : 0,
+    pass: drawing ? (progress?.pass ?? null) : null,
+    previewUrl: drawing && progress && progress.previewN > 0 ? serverPreviewUrl(job.id, progress.previewN) : null,
+    startedAt: job.sentAt ?? job.createdAt,
+    finishedAt: null,
+    error: null,
+    detail: null,
+  }
+}
+
+/**
+ * How a job of the pass that has ended shows on its shot. A clip that landed
+ * replaces the shot's clip, frame and record; any other ending leaves them
+ * alone. `held` says the server holds the heavy work that was waiting behind
+ * this job, because of how it ended. Null for a job the pass never reached.
+ */
+export function endedShotPatch(job: RunnerJob, meta: PassMeta, held = false): Partial<ShotState> | null {
+  const endedAt = job.finishedAt ?? job.endedAt ?? Date.now()
+  switch (job.status) {
+    case 'done':
+      return {
+        status: 'done',
+        stage: 'Done',
+        promptId: job.promptId,
+        files: job.files,
+        clip: job.primary,
+        frame: job.frame,
+        entryId: job.entryId,
+        // The frame the server opened the shot on, which only it knows for a
+        // shot chained within the pass, so currencyOf compares like with like.
+        made: { ...meta.made, openedOn: job.openedOn ?? meta.made.openedOn },
+        // A clip ComfyUI handed back from its cache keeps the time its record
+        // already holds, as it does in the page's walk; nothing new was spent.
+        durationMs: job.repeatOf ? (history.get(job.repeatOf)?.durationMs ?? 0) : job.durationMs,
+        finishedAt: endedAt,
+        previewUrl: null,
+        error: null,
+        detail: null,
+      }
+    case 'stopped':
+      // Stopped before it was sent reads as a shot the pass never reached.
+      if (!job.error?.sent) return null
+      return { status: 'stopped', stage: 'Stopped', error: null, detail: null, previewUrl: null, finishedAt: endedAt }
+    case 'skipped':
+      return null
+    case 'failed':
+    case 'lost':
+    case 'unsent': {
+      const code = job.error?.code ?? null
+      const f = faultOf(runnerFault(job, { 'no-frame': noFrameLine(meta.index) }))
+      return {
+        status: 'error',
+        stage: code === 'no-frame' || code === 'internal' ? 'Not built' : job.status === 'unsent' ? 'Not sent' : 'Failed',
+        error: faultBody(f, { held }),
+        detail: faultWhere(f),
+        previewUrl: null,
+        finishedAt: endedAt,
+      }
+    }
+    default:
+      return null
+  }
+}
+
+/** How a job of the pass came out, for passNote. Null while it is live, and for one the pass never reached. */
+function outcomeOfJob(job: RunnerJob, before: ShotState | undefined, next: PassMeta | null): ShotOutcome | null {
+  switch (job.status) {
+    case 'done':
+      return { kind: 'done', unchanged: job.repeatOf !== null }
+    case 'stopped':
+      return job.error?.sent ? { kind: 'stopped', kept: before?.status === 'done' } : { kind: 'stopped-before' }
+    case 'failed':
+    case 'lost':
+    case 'unsent':
+      if (job.error?.code === 'no-frame') return { kind: 'no-frame' }
+      return { kind: 'failed', nextContinues: next?.chained === true }
+    default:
+      return null
+  }
+}
+
+/** The pass this page watches the server render, if any. */
+type Watched = {
+  groupId: string
+  /** Each shot of the pass as it stood before the pass, to put back what the pass never reached. */
+  before: Record<string, ShotState>
+  /** The pass's shots as reel indices, in order, including any the page kept back. */
+  indices: number[]
+  /** Where the page stopped the pass before sending the rest, if it did. */
+  cut: PassCut | null
+  /** The server's latest word on each of the pass's jobs, by id, and on the group. */
+  jobs: Map<string, RunnerJob>
+  group: RunnerGroup | null
+  /** Jobs whose clip is already taken into the shot. */
+  taken: Set<string>
+  /** Shots that already held a newer clip than the one this pass made for them, which stays. */
+  older: Set<string>
+  /** True once the store has shown the group, so a group gone from it later has really gone. */
+  seen: boolean
+  /** True once the pass has gone to submitGroup, so this tab's outbox may hold it until the server answers. */
+  handed: boolean
+  /** True once Stop has reached the server for this pass. */
+  stopSent: boolean
+  /** True once the pass has ended here and its note is written. */
+  over: boolean
+}
+
+let watched: Watched | null = null
+/** Passes this page has followed to their end, so one is not taken up again before the server forgets it. */
+const ended = new Set<string>()
+
+/**
+ * How long an ended pass stays on the server's list before this page asks it
+ * to forget the pass: long enough for the section bar to show how it ended.
+ * Until then a page that loads takes it up, to show its note.
+ */
+const FORGET_AFTER_MS = 10_000
+
+/** True while the server renders a pass this page is watching. */
+function onServer(): boolean {
+  return watched !== null && !watched.over
+}
+
+/** Apply a patch to a shot, and say so only when something in it changed. */
+function patchShot(shotId: string, patch: Partial<ShotState>): boolean {
+  const current = state.states[shotId]
+  if (!current) return false
+  const changed = (Object.keys(patch) as (keyof ShotState)[]).some((k) => {
+    const a = current[k]
+    const b = patch[k]
+    if (k === 'pass') {
+      const x = a as SamplerPass | null
+      const y = b as SamplerPass | null
+      return (x?.index ?? 0) !== (y?.index ?? 0) || (x?.count ?? 0) !== (y?.count ?? 0)
+    }
+    return a !== b
+  })
+  if (!changed) return false
+  state = { ...state, states: { ...state.states, [shotId]: { ...current, ...patch } } }
+  return true
+}
+
+/**
+ * True once the queue's store has had an answer: the state of the server's
+ * queue (its start, `boot`), or word that nothing serves a queue at this
+ * address (a reason with no start). Before that its `available` is false only
+ * because nothing has been read yet, not because the server said so.
+ */
+function storeAnswered(snap: RunnerSnapshot): boolean {
+  return snap.boot !== '' || snap.reason !== null
+}
+
+/** The server has said its queue is not running: turned off, or standing back for another server. */
+function queueOff(snap: RunnerSnapshot): boolean {
+  return snap.boot !== '' && !snap.available
+}
+
+/**
+ * Press a pass, sending it through the SwitchGen server's queue where that is
+ * running, and walking it in the page as before where it is not.
+ *
+ * The first look is at what the page already knows: the queue's store says
+ * whether the server's queue is running. Where it has said there is no queue
+ * at this address, the walk starts at once, exactly as it always has.
+ * Otherwise the pass is handed over after one more ask (runnerAvailable),
+ * which also checks that the server takes reel work. That ask is made where
+ * the store says the queue is off, too: the store does not keep reading the
+ * queue's state while it is off with nothing on it, so its word may be old,
+ * and the ask reads it afresh. Where the queue is still off, the page walks
+ * the pass.
+ *
+ * Where the store has not answered yet, the press goes the server's way, and
+ * the state is read first (see pressOnServer). A phone's tab thrown away while
+ * the server rendered a pass comes back with the strip as it was before the
+ * pass, and the pass's clips are folded in only once the store has answered
+ * (takeUpFromServer); its first read can fail and then wait up to half a
+ * minute before it asks again, while ComfyUI is already answering. A press then used to walk the pass
+ * in the page and render again every shot the server had made. `again` presses
+ * afresh, from the shots as they then stand.
+ */
+function press(
+  order: string[],
+  jobs: readonly ShotJob[],
+  ctx: RunContext,
+  indices: number[],
+  states: Record<string, ShotState>,
+  again: () => void,
+): void {
+  const snap = runnerStore.snapshot()
+  if (!storeAnswered(snap)) {
+    void pressOnServer(order, jobs, ctx, indices, states, again)
+    return
+  }
+  if (!snap.available && !queueOff(snap)) {
+    startPass(order, jobs, ctx, indices, states)
+    return
+  }
+  void pressOnServer(order, jobs, ctx, indices, states, null, queueOff(snap))
+}
+
+async function pressOnServer(
+  order: string[],
+  jobs: readonly ShotJob[],
+  ctx: RunContext,
+  indices: number[],
+  states: Record<string, ShotState>,
+  again: (() => void) | null,
+  off = false,
+): Promise<void> {
+  const original = { ...states }
+  const prior = state
+  const before = markPass(order, indices, states)
+  const queue = indices.map((i) => order[i]).filter((id): id is string => id !== undefined)
+  const first = queue[0]
+  const handing = { status: 'queued', stage: 'Handing it to the server' } as const
+  // A placeholder group id until the pass is built: from the first moment
+  // the run is the server's, so the section bar leaves it to the queue.
+  const w: Watched = {
+    groupId: newPromptId(),
+    before,
+    indices,
+    cut: null,
+    jobs: new Map(),
+    group: null,
+    taken: new Set(),
+    older: new Set(),
+    seen: false,
+    handed: false,
+    stopSent: false,
+    over: false,
+  }
+  watched = w
+  // Where the store said the queue is off, the page most likely walks the
+  // pass after all, so until the ask says the queue is back the desk reads as
+  // the walk does (`off`), not as handing the pass over.
+  if (!off && first && states[first]) states[first] = { ...states[first], ...handing }
+  state = {
+    id: newRunId(),
+    status: 'running',
+    startedAt: Date.now(),
+    finishedAt: null,
+    order,
+    states,
+    currentShotId: first ?? null,
+    queue,
+    stopRequested: false,
+    note: null,
+    elsewhere: null,
+    runnerGroupId: off ? null : w.groupId,
+  }
+  emit()
+
+  const fallBack = () => {
+    // The server cannot take it after all, so the page walks the pass, as it
+    // did before the server had a queue.
+    watched = null
+    startPass(order, jobs, ctx, indices, original)
+  }
+
+  if (again) {
+    // The store had not answered when this was pressed. What it reads may
+    // hold a pass the server rendered, or is rendering, for this strip.
+    await runnerStore.refresh().catch(() => undefined)
+    // Stopped meanwhile (see stop), or let go.
+    if (watched !== w || w.over) return
+    const snap = runnerStore.snapshot()
+    if (storeAnswered(snap)) {
+      // The desk goes back to how it stood before the press and takes in what
+      // the store says, as it would have had it answered first; the press is
+      // then made again from the shots as they now stand. A pass taken up
+      // that the server is still rendering keeps the desk, and this press goes.
+      watched = null
+      state = { ...prior, elsewhere: state.elsewhere }
+      emit()
+      onRunnerChange()
+      again()
+      return
+    }
+    // Still no answer: the hand-over asks the server itself, and the page's
+    // outbox keeps it until the server has answered, so nothing goes twice.
+  }
+
+  const verdict = await runnerAvailable('reel').catch(() => ({ ok: false, reason: null }))
+  if (watched !== w || w.over) return
+  if (!verdict.ok) {
+    fallBack()
+    return
+  }
+
+  const pass = buildServerPass(order, jobs, ctx, indices, states)
+  w.groupId = pass.group.id
+  w.cut = pass.cut
+  if (off && first) patchShot(first, handing)
+  setRun({ runnerGroupId: pass.group.id })
+
+  if (!pass.jobs.length) {
+    // The first shot is kept back, so nothing goes to the server at all.
+    const cut = pass.cut
+    if (cut) patchShot(cut.shotId, cut.patch)
+    const outcomes: (ShotOutcome | null)[] = indices.map(() => null)
+    if (cut) outcomes[cut.position] = cut.outcome
+    const reached = new Set(cut ? [cut.shotId] : [])
+    finishServerPass(w, passNote(indices, outcomes), reached)
+    return
+  }
+
+  noteHanded(pass.group.id, pass.jobs.map((j) => j.meta.shotId))
+  w.handed = true
+  const result = await submitGroup({ v: 1, group: pass.group, jobs: pass.jobs })
+  // Answered either way, or kept by the outbox, whose pass this still names.
+  if (!('pending' in result)) forgetHanded([pass.group.id])
+  // Stopped while it was being handed over: taken back from the outbox, and
+  // should the server have it all the same, stopped once it lists it (see stop).
+  if (watched !== w || w.over) return
+  if (result.ok) {
+    w.group = result.group
+    for (const job of result.jobs) w.jobs.set(job.id, job)
+    // The server's clock, which its jobs' times are in, so the band counts
+    // a shot finished in this pass against the same clock that stamped it.
+    setRun({ startedAt: result.group.createdAt })
+    watchServer()
+    return
+  }
+  if (result.fallback) {
+    fallBack()
+    return
+  }
+  if ('pending' in result) {
+    // No clear answer, so the server may have it already: the page's outbox
+    // keeps it and hands it over again, under the same ids, until the server
+    // answers, and so does a page loaded after this one. Until the server
+    // lists the pass its first shot reads as being handed over; should the
+    // outbox give it up, watchServer says so, and Stop takes it back (stop).
+    watchServer()
+    return
+  }
+  // Turned away: nothing was stored, and nothing was sent.
+  finishServerPass(w, {
+    verdict: 'stopped',
+    note:
+      result.busy === 'reel'
+        ? REEL_BUSY
+        : `The SwitchGen server did not take this pass: ${(result.error || 'it gave no reason').replace(/\.?$/, '.')}`,
+  })
+}
+
+/** Send Stop for the watched pass, and try again on the next change if it did not reach the server. */
+function sendStop(w: Watched): void {
+  if (w.stopSent) return
+  w.stopSent = true
+  void stopGroup(w.groupId).then(
+    (ok) => {
+      if (ok) forgetStop(w.groupId)
+      else w.stopSent = false
+    },
+    () => {
+      w.stopSent = false
+    },
+  )
+}
+
+/**
+ * Bring the watched pass up to date with the server's word on it: each job's
+ * shot shows where the job is, a clip that landed is taken into its shot and
+ * saved, and once every job has ended the pass ends here with its note.
+ */
+function watchServer(snap: RunnerSnapshot = runnerStore.snapshot()): void {
+  const w = watched
+  if (!w || w.over) return
+  const group = snap.groups.find((g) => g.id === w.groupId) ?? null
+  if (group) {
+    w.group = group
+    w.seen = true
+  } else if (!w.seen && !w.group) {
+    // Still being handed over. The outbox gives a hand-over up only when the
+    // server turned it down or it grew too old to send; either way nothing of
+    // it was sent.
+    const dropped = givenUpBatches().find((g) => g.groupId === w.groupId)
+    if (dropped) {
+      forgetGivenUp(w.groupId)
+      finishServerPass(w, { verdict: 'stopped', note: passLine(dropped.line) })
+    }
+    return
+  } else if (w.seen && snap.available) {
+    // Listed once and gone now: the server forgot it, so there is nothing more to wait for.
+    finishServerPass(w, {
+      verdict: 'stopped',
+      note: 'The SwitchGen server no longer lists this pass, so the desk stopped following it. Every clip that landed is kept.',
+    })
+    return
+  }
+  if (!w.group) return
+  for (const job of snap.jobs) if (job.groupId === w.groupId) w.jobs.set(job.id, job)
+  // Not while the queue is off: it answers that it is not running, and the
+  // pass is let go (letGoWhileOff) with the Stop kept for when it is back.
+  if (state.stopRequested && w.group.state === 'active' && snap.available) sendStop(w)
+
+  const list = w.group.jobIds.map((id) => w.jobs.get(id)).filter((j): j is RunnerJob => j !== undefined)
+  const current = list.find((j) => isRunnerLive(j.status)) ?? null
+  const heldId = snap.lane.held?.jobId ?? null
+  let changed = false
+  let landed = false
+  for (const job of list) {
+    const meta = passMetaOf(job.meta)
+    if (!meta || !state.states[meta.shotId]) continue
+    if (isRunnerLive(job.status)) {
+      const patch = liveShotPatch(job, snap.progress[job.id], job === current)
+      // Stop said here reads at once, before the server's word on it arrives.
+      if (state.stopRequested && job === current) patch.stage = 'Stopping'
+      changed = patchShot(meta.shotId, patch) || changed
+      continue
+    }
+    if (job.status === 'done') {
+      if (w.taken.has(job.id)) continue
+      w.taken.add(job.id)
+      const patch = endedShotPatch(job, meta)
+      if (!patch) continue
+      if (!newerThanKept(w.before[meta.shotId], job)) {
+        w.older.add(meta.shotId)
+        continue
+      }
+      changed = patchShot(meta.shotId, patch) || changed
+      landed = true
+      continue
+    }
+    const patch = endedShotPatch(job, meta, heldId === job.id)
+    if (patch) changed = patchShot(meta.shotId, patch) || changed
+  }
+  const at = current ? (passMetaOf(current.meta)?.shotId ?? null) : null
+  if (state.currentShotId !== at && (at === null || state.states[at])) {
+    state = { ...state, currentShotId: at }
+    changed = true
+  }
+  if (changed) emit()
+  // Each clip is saved as it lands, as the walk saves it, so a page that goes
+  // now still has it after a reload.
+  if (landed) persist()
+
+  if (list.length === w.group.jobIds.length && list.every((j) => !isRunnerLive(j.status))) endWatchedPass(w, list)
+}
+
+/**
+ * False when the shot already holds a clip newer than the one this job made:
+ * a pass taken up long after it ended must not put an older take back over
+ * one rendered since.
+ */
+function newerThanKept(shot: ShotState | undefined, job: RunnerJob): boolean {
+  if (!shot?.clip || !job.primary) return true
+  if (relPath(shot.clip) === relPath(job.primary)) return true
+  const at = job.finishedAt ?? job.endedAt ?? 0
+  return !(shot.finishedAt && at && shot.finishedAt > at)
+}
+
+/** The pass's jobs have all ended: write its note, as the walk does, and put back what it never reached. */
+function endWatchedPass(w: Watched, list: RunnerJob[]): void {
+  const outcomes: (ShotOutcome | null)[] = w.indices.map(() => null)
+  const reached = new Set<string>()
+  const stopped = new Set<string>()
+  const metas = list.map((j) => passMetaOf(j.meta))
+  let allDone = true
+  list.forEach((job, i) => {
+    const meta = metas[i]
+    if (!meta) return
+    const outcome = outcomeOfJob(job, w.before[meta.shotId], metas[i + 1] ?? null)
+    if (job.status !== 'done') allDone = false
+    // A shot keeping a newer clip than this pass made reads as never reached, so that clip stands.
+    if (outcome && outcome.kind !== 'stopped-before' && !w.older.has(meta.shotId)) reached.add(meta.shotId)
+    if (outcome?.kind === 'stopped') stopped.add(meta.shotId)
+    const position = w.indices.indexOf(meta.index)
+    if (position >= 0) outcomes[position] = outcome
+  })
+  // The shot the page kept back counts only when everything before it landed,
+  // as in the walk, which would have reached it only then.
+  if (w.cut && allDone) {
+    patchShot(w.cut.shotId, w.cut.patch)
+    reached.add(w.cut.shotId)
+    outcomes[w.cut.position] = w.cut.outcome
+  }
+  finishServerPass(w, passNote(w.indices, outcomes), reached, stopped, list.map((j) => j.id))
+}
+
+/**
+ * End the watched pass here: put back each shot it never reached, write the
+ * note, save, and once the section bar has shown how it ended, ask the server
+ * to forget it so a later load does not take it up again.
+ */
+function finishServerPass(
+  w: Watched,
+  end: { verdict: 'done' | 'stopped' | 'error'; note: string | null },
+  reached: ReadonlySet<string> = new Set(),
+  stopped: ReadonlySet<string> = new Set(),
+  jobIds: string[] = [],
+): void {
+  w.over = true
+  ended.add(w.groupId)
+  // A shot of a pass taken up after the strip changed may no longer be on it.
+  const shots = [...state.order, ...state.queue]
+  state = { ...state, states: putBack(shots, state.states, w.before, reached, stopped) }
+  setRun({
+    status: end.verdict,
+    // By the server's clock where it said, as the pass's start is: a pass
+    // taken up long after it ended would otherwise read as hours long.
+    finishedAt: w.group?.endedAt ?? Date.now(),
+    currentShotId: null,
+    stopRequested: false,
+    note: end.note,
+  })
+  persist()
+  // Not while the queue is off, which would refuse it. The pass stays listed, and a page that takes it up later asks again.
+  if (jobIds.length) {
+    setTimeout(() => {
+      if (runnerStore.snapshot().available) void dismissOnServer(jobIds).catch(() => false)
+    }, FORGET_AFTER_MS)
+  }
+}
+
+/**
+ * Passes the reader stopped whose Stop the server has not yet confirmed, kept
+ * in the tab so that a page the browser throws away does not take the Stop
+ * with it. Each is asked again whenever the server lists its pass as running
+ * and its queue is on: a pass let go while the queue was off, and one stopped
+ * before the server listed it, whose hand-over may have reached the server
+ * all the same (see stop). A pass taken up again starts out stopping. One the
+ * server has not listed by the time a hand-over would no longer be sent is
+ * let go.
+ */
+const STOPS_KEY = 'switchgen.reel.stops.v1'
+type KeptStop = { groupId: string; at: number }
+
+function readStops(): KeptStop[] {
+  try {
+    const list: unknown = JSON.parse(tabStore.get(STOPS_KEY) ?? '[]')
+    if (!Array.isArray(list)) return []
+    return list.filter((x): x is KeptStop => isObject(x) && isString(x.groupId) && isNumber(x.at))
+  } catch {
+    return []
+  }
+}
+
+let stops: KeptStop[] = readStops()
+
+function keepStops(next: KeptStop[]): void {
+  stops = next
+  if (next.length) tabStore.set(STOPS_KEY, JSON.stringify(next))
+  else tabStore.remove(STOPS_KEY)
+}
+
+function keepStop(groupId: string): void {
+  if (!stops.some((s) => s.groupId === groupId)) keepStops([...stops, { groupId, at: Date.now() }])
+}
+
+function forgetStop(groupId: string): void {
+  if (stops.some((s) => s.groupId === groupId)) keepStops(stops.filter((s) => s.groupId !== groupId))
+}
+
+const stopKept = (groupId: string): boolean => stops.some((s) => s.groupId === groupId)
+
+/** Stops on their way to the server for passes this page does not follow, so a change meanwhile does not send another. */
+const asking = new Set<string>()
+
+/**
+ * Ask the server to stop each kept pass it lists as running, other than the
+ * one this page follows (watchServer asks for that). Not while its queue is
+ * off, which answers that it is not running. A kept pass the server lists as
+ * ended needs no Stop any more.
+ */
+function stopWhenListed(snap: RunnerSnapshot): void {
+  if (!stops.length || !snap.available) return
+  for (const { groupId, at } of stops) {
+    const group = snap.groups.find((g) => g.id === groupId)
+    if (!group) {
+      if (Date.now() - at > OUTBOX_MAX_AGE_MS) forgetStop(groupId)
+      continue
+    }
+    if (group.state !== 'active') {
+      forgetStop(groupId)
+      continue
+    }
+    if ((onServer() && watched?.groupId === groupId) || asking.has(groupId)) continue
+    asking.add(groupId)
+    void stopGroup(groupId).then(
+      (ok) => {
+        asking.delete(groupId)
+        if (ok) forgetStop(groupId)
+      },
+      () => asking.delete(groupId),
+    )
+  }
+}
+
+/**
+ * The queue on the server went off, or stood back for another server, while
+ * this page watched a pass the server has. The server still lists the pass as
+ * it was last saved, but nothing moves it on, and a Stop is answered that the
+ * queue is not running. So the page stops following it rather than hold the
+ * press for work nothing sends: every clip that landed stays, each shot the
+ * pass has not finished goes back to how it was, and the press is free for
+ * the page's own work. The room names the pass as waiting on the server,
+ * without a Stop (Reel.tsx). It is not counted as ended, so once the queue is
+ * back it is taken up again, as after a reload, as soon as the press is free,
+ * and a Stop the reader gave that had not reached the server is given then
+ * (the Stop is kept in the tab; see stopWhenListed).
+ */
+function letGoWhileOff(w: Watched): void {
+  w.over = true
+  watched = null
+  const landed = new Set<string>()
+  for (const id of w.taken) {
+    const meta = passMetaOf(w.jobs.get(id)?.meta)
+    if (meta && !w.older.has(meta.shotId)) landed.add(meta.shotId)
+  }
+  const shots = [...state.order, ...state.queue]
+  state = { ...IDLE, id: newRunId(), states: putBack(shots, state.states, w.before, landed, new Set()) }
+  emit()
+  persist()
+}
+
+/**
+ * Take up a pass the server renders for this strip: one pressed on a page of
+ * this browser that has gone, or on another tab, or one that ended while no
+ * page watched. Its shots overlap the strip, which no other browser's strip
+ * does. A live pass comes first; failing that, the newest that ended and the
+ * server still lists. Only while this page renders nothing of its own.
+ *
+ * A live pass not while the queue on the server is off: nothing would move it
+ * on, a Stop would be answered that the queue is not running, and the press
+ * would be held for it. The room names such a pass instead, and the press
+ * stays free for the page's own work. An ended pass all the same, once every
+ * shot of it has ended (settled): taking in the clips it made sends nothing,
+ * and without them the next press would render again, in the page, every
+ * shot the server has already made.
+ */
+function takeUpFromServer(snap: RunnerSnapshot = runnerStore.snapshot()): void {
+  if (walking || pending || state.elsewhere || state.status === 'running' || onServer()) return
+  // An ended pass only onto a desk showing no pass of its own, so the note of
+  // one that just ended here is not replaced by an older one's.
+  const endedToo = state.status === 'idle'
+  const ids = new Set<string>([...reel.get().shots.map((s) => s.id), ...state.order, ...Object.keys(state.states)])
+  if (!ids.size) return
+  const byId = new Map(snap.jobs.map((j) => [j.id, j]))
+  const ours = snap.groups.filter(
+    (g) =>
+      g.desk === 'reel' &&
+      g.kind === 'pass' &&
+      !g.dismissed &&
+      !ended.has(g.id) &&
+      g.jobIds.some((id) => {
+        const meta = passMetaOf(byId.get(id)?.meta)
+        return meta !== null && ids.has(meta.shotId)
+      }),
+  )
+  const newest = endedToo
+    ? ours.filter((g) => g.state === 'ended').sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0]
+    : undefined
+  const group =
+    (snap.available ? ours.find((g) => g.state === 'active') : undefined) ??
+    (newest && (snap.available || settled(newest, byId)) ? newest : undefined)
+  if (!group) return
+
+  const jobs = group.jobIds.map((id) => byId.get(id)).filter((j): j is RunnerJob => j !== undefined)
+  const metas = jobs.map((j) => passMetaOf(j.meta)).filter((m): m is PassMeta => m !== null)
+  const draft = reel.get().shots.map((s) => s.id)
+  const order = draft.length ? draft : [...state.order]
+  const states: Record<string, ShotState> = { ...state.states }
+  for (const meta of metas) states[meta.shotId] ??= blankShot(meta.shotId, meta.made.frames)
+  const indices = metas.map((m) => m.index)
+  const queue = metas.map((m) => m.shotId)
+  const before = markPass(queue, queue.map((_, i) => i), states)
+  watched = {
+    groupId: group.id,
+    before,
+    indices,
+    cut: null,
+    jobs: new Map(jobs.map((j) => [j.id, j])),
+    group,
+    taken: new Set(),
+    older: new Set(),
+    seen: true,
+    handed: false,
+    stopSent: false,
+    over: false,
+  }
+  state = {
+    ...IDLE,
+    id: newRunId(),
+    status: 'running',
+    startedAt: group.createdAt,
+    order,
+    states,
+    queue,
+    // A Stop the server has not confirmed: given before the queue went off,
+    // say, or by the page before a reload.
+    stopRequested: group.state === 'active' && stopKept(group.id),
+    runnerGroupId: group.id,
+  }
+  emit()
+  watchServer(snap)
+}
+
+/**
+ * True when every job of the pass has ended. The server keeps its list as last
+ * saved while its queue is off, so a pass stopped just before can be listed as
+ * ended with its shot still running; nothing would end that shot here, and
+ * the press would be held for it.
+ */
+function settled(group: RunnerGroup, byId: ReadonlyMap<string, RunnerJob>): boolean {
+  return group.jobIds.every((id) => {
+    const job = byId.get(id)
+    return job !== undefined && !isRunnerLive(job.status)
+  })
+}
+
+/** The outbox words its lines for a batch of pictures; a reel hands over a pass. */
+function passLine(line: string): string {
+  return line.replace(/\bthis batch\b/g, 'this pass')
+}
+
+/** Passes the outbox gave up on that this page has said, so a change before they are let go does not say them twice. */
+const saidGivenUp = new Set<string>()
+
+/**
+ * The shots of each pass this tab handed to the server and has no answer for
+ * yet, kept in the tab beside the queue's outbox (lib/runner). The outbox
+ * keeps the whole hand-over, but says only its label of one it gives up; a
+ * pass given up after a reload is named by the shots it held from this.
+ * An entry goes once the outbox no longer holds or reports its pass.
+ */
+const HANDED_KEY = 'switchgen.reel.handed.v1'
+type Handed = { groupId: string; shots: string[] }
+
+function readHanded(): Handed[] {
+  try {
+    const list: unknown = JSON.parse(tabStore.get(HANDED_KEY) ?? '[]')
+    if (!Array.isArray(list)) return []
+    return list.filter(
+      (h): h is Handed => isObject(h) && isString(h.groupId) && Array.isArray(h.shots) && h.shots.every(isString),
+    )
+  } catch {
+    return []
+  }
+}
+
+let handed: Handed[] = readHanded()
+
+function keepHanded(next: Handed[]): void {
+  handed = next
+  if (next.length) tabStore.set(HANDED_KEY, JSON.stringify(next))
+  else tabStore.remove(HANDED_KEY)
+}
+
+/** Note the shots of a pass as it is handed over. */
+function noteHanded(groupId: string, shots: string[]): void {
+  keepHanded([...handed.filter((h) => h.groupId !== groupId), { groupId, shots }])
+}
+
+/** Let go of the entries for these passes. */
+function forgetHanded(groupIds: readonly string[]): void {
+  if (handed.some((h) => groupIds.includes(h.groupId))) keepHanded(handed.filter((h) => !groupIds.includes(h.groupId)))
+}
+
+/** Let go of each entry whose pass the outbox neither holds nor reports as given up. */
+function pruneHanded(): void {
+  if (!handed.length) return
+  const live = new Set([...outboxPending().map((p) => p.groupId), ...givenUpBatches().map((g) => g.groupId)])
+  if (handed.every((h) => live.has(h.groupId))) return
+  keepHanded(handed.filter((h) => live.has(h.groupId)))
+}
+
+/** " It held shots 2 and 3, and nothing is rendering them.", for a given-up pass whose shots this tab noted; else ''. */
+function heldShotsLine(groupId: string, order: readonly string[]): string {
+  const shots = handed.find((h) => h.groupId === groupId)?.shots ?? []
+  const numbers = shots
+    .map((id) => order.indexOf(id) + 1)
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b)
+  if (!numbers.length) return ''
+  const one = numbers.length === 1
+  return ` It held ${shotsWord(numbers).toLowerCase()}, and nothing is rendering ${one ? 'it' : 'them'}.`
+}
+
+/**
+ * Say which passes this tab handed to the server were never sent: the outbox
+ * gave them up, too old to send when a page came back, or turned away when
+ * sent again. The pass this page watches says so itself (watchServer). After
+ * a reload nothing is watched, and a pass handed over just before a phone
+ * threw the page away went without a word. Said only while this page has
+ * nothing on the press, so the band of a pass in hand stays; the line waits
+ * for that pass to end and joins its note.
+ */
+function noteGivenUp(snap: RunnerSnapshot): void {
+  if (walking || pending || state.elsewhere || state.status === 'running' || onServer()) return
+  const given = givenUpBatches().filter((g) => g.desk === 'reel' && !saidGivenUp.has(g.groupId))
+  if (!given.length) return
+  for (const g of given) saidGivenUp.add(g.groupId)
+  // After this change has been told to every subscriber, not in the middle of it.
+  queueMicrotask(() => given.forEach((g) => forgetGivenUp(g.groupId)))
+  // One the server lists after all was sent, and takeUpFromServer shows it;
+  // one this page followed to its end has had its ending said.
+  const unsent = given.filter((g) => !ended.has(g.groupId) && !snap.groups.some((x) => x.id === g.groupId))
+  const draft = reel.get().shots.map((s) => s.id)
+  const order = draft.length ? draft : state.order
+  const lines = unsent.map((g) => `${g.label}: ${passLine(g.line)}${heldShotsLine(g.groupId, order)}`).join(' ')
+  forgetHanded(given.map((g) => g.groupId))
+  if (!unsent.length) return
+  if (state.status === 'idle') {
+    // The press that handed it over, as both ends: it never reached the
+    // server, so nothing of it ran, and the band gives it no time of its own.
+    const at = Math.min(...unsent.map((g) => g.at))
+    state = {
+      ...state,
+      id: newRunId(),
+      status: 'stopped',
+      startedAt: at,
+      finishedAt: at,
+      order,
+      // Nothing of it was rendered or sent, so the band counts nothing and
+      // shows the note alone; the note names the shots it held.
+      queue: [],
+      currentShotId: null,
+      stopRequested: false,
+      note: lines,
+    }
+  } else {
+    // The band keeps the pass it shows, and the line joins that pass's note.
+    state = { ...state, note: state.note ? `${state.note} ${lines}` : lines }
+  }
+  emit()
+}
+
+/**
+ * A shot whose loss held the lane says in its fault that the work waiting
+ * behind it is held until the reader says. That holds only while the lane is
+ * held for it: once the word is given, from any page or device, the line
+ * goes, and it comes when the lane's word arrives after the job's ending. A
+ * pass still watched is kept right by watchServer; this is for one that has
+ * ended. Only the fault that job wrote is changed, never one a later render
+ * put on the shot.
+ */
+function settleHeldFaults(snap: RunnerSnapshot): void {
+  const w = watched
+  if (!w?.over || walking) return
+  const heldId = snap.lane.held?.jobId ?? null
+  let changed = false
+  for (const job of w.jobs.values()) {
+    const meta = passMetaOf(job.meta)
+    const shot = meta ? state.states[meta.shotId] : undefined
+    if (!meta || shot?.status !== 'error') continue
+    const held = heldId === job.id
+    const now = endedShotPatch(job, meta, held)?.error ?? null
+    const was = endedShotPatch(job, meta, !held)?.error ?? null
+    if (now === null || was === null || now === was || shot.error !== was) continue
+    changed = patchShot(meta.shotId, { error: now }) || changed
+  }
+  if (changed) emit()
+}
+
+/**
+ * Mark each shot of a pass as waiting, and return each as it stood before.
+ * The clip and frame stay, and a pass puts back any shot it never reaches.
+ */
+function markPass(order: readonly string[], indices: readonly number[], states: Record<string, ShotState>): Record<string, ShotState> {
+  const before: Record<string, ShotState> = {}
+  for (const i of indices) {
+    const shotId = order[i]
+    const shot = shotId ? states[shotId] : undefined
+    if (!shotId || !shot) continue
+    before[shotId] = shot
+    states[shotId] = { ...shot, status: 'waiting', stage: '', error: null, detail: null }
+  }
+  return before
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,16 +2912,9 @@ function startPass(
   indices: number[],
   states: Record<string, ShotState>,
 ): void {
-  const before: Record<string, ShotState> = {}
-  for (const i of indices) {
-    const shotId = order[i]
-    const shot = shotId ? states[shotId] : undefined
-    if (!shotId || !shot) continue
-    before[shotId] = shot
-    // Marked up front so the strip shows the whole queue from the first
-    // moment. The clip and frame stay, and walk puts back any it never reaches.
-    states[shotId] = { ...shot, status: 'waiting', stage: '', error: null, detail: null }
-  }
+  // Marked up front so the strip shows the whole queue from the first
+  // moment. The clip and frame stay, and walk puts back any it never reaches.
+  const before = markPass(order, indices, states)
 
   state = {
     id: newRunId(),
@@ -1652,6 +2928,7 @@ function startPass(
     stopRequested: false,
     note: null,
     elsewhere: null,
+    runnerGroupId: null,
   }
   emit()
   void walk({ order, jobs, ctx, indices, before })
@@ -1666,31 +2943,67 @@ export const reelRun = {
   },
   snapshot: (): RunState => state,
 
-  /** True while the queue is walking. A second press does nothing. */
-  busy: (): boolean => walking,
+  /** True while the queue is walking, here or on the server. A second press does nothing. */
+  busy: (): boolean => walking || onServer(),
 
   /**
    * Render the whole reel, skipping shots that are already done and still
    * current. Pass `force` to render every shot again from the top. Nothing
-   * starts while another tab has the reel on the press (RunState.elsewhere).
+   * starts while another tab has the reel on the press (RunState.elsewhere),
+   * or while the server renders a pass of it.
    */
   renderAll(order: string[], jobs: readonly ShotJob[], ctx: RunContext, opts: { force?: boolean } = {}): void {
-    if (walking || state.elsewhere) return
+    if (walking || state.elsewhere || onServer()) return
     const states = adopt(order, jobs)
     const queue = shotsToRender(order, jobs, states, opts.force)
     if (!queue.length) return
-    startPass(order, jobs, ctx, queue, states)
+    press(order, jobs, ctx, queue, states, () => reelRun.renderAll(order, jobs, ctx, opts))
   },
 
   /** Render one shot, leaving every other shot exactly as it stands. */
   renderOne(index: number, order: string[], jobs: readonly ShotJob[], ctx: RunContext): void {
-    if (walking || state.elsewhere || !order[index]) return
-    startPass(order, jobs, ctx, [index], adopt(order, jobs))
+    const shotId = order[index]
+    if (walking || state.elsewhere || onServer() || !shotId) return
+    const had = state.states[shotId]?.clip ?? null
+    press(order, jobs, ctx, [index], adopt(order, jobs), () => {
+      // Pressed before the server's state was read. A clip for this shot that
+      // the read brought in, current with the strip, is the one the press
+      // asked for: the reader saw no such clip. It is not rendered again.
+      const now = state.states[shotId]?.clip ?? null
+      const brought = now !== null && (had === null || relPath(now) !== relPath(had))
+      if (brought && currencyOf(index, order, jobs, state.states) === 'current') return
+      reelRun.renderOne(index, order, jobs, ctx)
+    })
   },
 
   /** Stop the running shot and abandon the rest of the queue. */
   stop(): void {
     if (state.status !== 'running') return
+    const w = watched
+    if (w && !w.over) {
+      if (!w.group) {
+        // The server has not taken the pass: the page is still asking whether
+        // it can, or the hand-over waits in this tab's outbox for an answer.
+        // It is taken out of the outbox, so neither this page nor one loaded
+        // after it sends it, and it ends here. Should an earlier try have
+        // reached the server all the same, the Stop is kept and asked for once
+        // the server lists the pass (stopWhenListed).
+        if (w.handed) {
+          withdraw(w.groupId)
+          keepStop(w.groupId)
+        }
+        finishServerPass(w, { verdict: 'stopped', note: passNote(w.indices, [{ kind: 'stopped-before' }]).note })
+        return
+      }
+      // The server stops the shot on the press and every shot after it, from
+      // whichever page or device asks. Kept in the tab until it has.
+      keepStop(w.groupId)
+      setRun({ stopRequested: true })
+      const shot = shotOf(state.currentShotId ?? undefined)
+      if (shot) setShot(shot.shotId, { stage: 'Stopping' })
+      sendStop(w)
+      return
+    }
     setRun({ stopRequested: true })
     // A shot still waiting for ComfyUI's queue to empty has nothing to cancel yet.
     waiting?.abort()
@@ -1712,7 +3025,8 @@ export const reelRun = {
    * back, and this one's would wipe its shots from the saved run meanwhile.
    */
   clear(): void {
-    if (walking || state.elsewhere) return
+    if (walking || state.elsewhere || onServer()) return
+    watched = null
     state = IDLE
     setPending(null)
     emit()
@@ -1771,3 +3085,8 @@ onStorage(RUN_KEY, (value) => {
 
 // Last, so everything it calls is defined.
 restore()
+// A pass the server renders for this strip, on a page that loaded after it
+// was pressed. The queue's store is started by the shell; until it has an
+// answer it lists nothing, and this runs again when it does.
+runnerStore.subscribe(onRunnerChange)
+onRunnerChange()

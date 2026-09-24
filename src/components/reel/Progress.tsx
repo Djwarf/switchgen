@@ -91,6 +91,20 @@ export function ReelProgress({
   if (run.status === 'idle') return null
 
   const running = run.status === 'running'
+  // A pass that set out to render nothing here, such as one handed to the
+  // server that never reached it: there is nothing to count or time, and the
+  // note says what became of it.
+  if (!running && !run.queue.length) {
+    return (
+      <section className="mb-6 border border-grey-300 bg-newsprint-aged px-4 py-3">
+        <span className="flex items-center gap-2">
+          <Mark state={run.status === 'done' ? 'ok' : 'off'} />
+          <Kicker tone="ink">{run.status === 'stopped' ? 'Stopped' : run.status === 'done' ? 'Done' : 'Stopped short'}</Kicker>
+        </span>
+        {run.note ? <p className="mt-2 border-l-2 border-ink pl-2 text-caption italic text-grey-700">{run.note}</p> : null}
+      </section>
+    )
+  }
   const order = run.order
   // Everything below counts the shots this pass set out to render. Counting the
   // whole reel made one shot rendered alone read "6 to go", time work nobody
@@ -156,7 +170,15 @@ export function ReelProgress({
     if (shots > 0 && unmeasured === 0) estimate = { ms, runs, shots }
   }
 
-  const elapsed = run.startedAt ? now - run.startedAt : 0
+  // The clock ticks only while something runs, so a pass that has ended is
+  // timed from its own two ends, not from whenever the page last ticked.
+  const elapsed = !run.startedAt
+    ? 0
+    : running
+      ? now - run.startedAt
+      : run.finishedAt
+        ? run.finishedAt - run.startedAt
+        : 0
 
   return (
     <section className="mb-6 border border-grey-300 bg-newsprint-aged px-4 py-3">

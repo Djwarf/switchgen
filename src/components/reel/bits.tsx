@@ -21,9 +21,11 @@ export { clamp }
 export function duration(ms: number): string {
   const s = Math.max(0, ms) / 1000
   if (s < 10) return `${s.toFixed(1)} s`
-  if (s < 60) return `${Math.round(s)} s`
-  const m = Math.floor(s / 60)
-  const rest = Math.round(s - m * 60)
+  // Rounded whole first, so 59.6 s reads 1 min, and 119.6 s 2 min, never "60 s".
+  const t = Math.round(s)
+  if (t < 60) return `${t} s`
+  const m = Math.floor(t / 60)
+  const rest = t - m * 60
   if (rest === 0) return `${m} min`
   return `${m} min ${rest} s`
 }
