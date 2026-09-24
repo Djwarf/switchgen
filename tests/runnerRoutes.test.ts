@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -21,6 +21,7 @@ import {
   revEvents,
   runnerEnv,
   standIn,
+  tempRoot,
   type Harness,
 } from './runnerFake'
 
@@ -53,12 +54,17 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 let restoreEnv = () => {}
+let roots = ''
 beforeAll(() => {
   // Every root a server module reads, then the queue's own.
-  tempRoots()
+  roots = tempRoots().root
   restoreEnv = runnerEnv()
 })
-afterAll(() => restoreEnv())
+afterAll(() => {
+  restoreEnv()
+  // tempRoots' folder; runnerFake removes its own, and every tempRoot().
+  if (roots) rmSync(roots, { recursive: true, force: true })
+})
 afterEach(() => {
   disk.full = false
   disk.after = 0
@@ -783,7 +789,7 @@ describe('/api/capabilities and the plugin', () => {
     const { switchgenRunner } = await import('../server/runner.mjs')
     await mountPlugin(switchgenRunner())
     const c = await caps()
-    expect(c).toMatchObject({ server: 'switchgen', deleteFiles: true, archive: true, runner: true, runnerDesks: ['video', 'images', 'reel'], runnerReason: null })
+    expect(c).toMatchObject({ server: 'switchgen', deleteFiles: true, archive: true, runner: true, runnerDesks: ['video', 'images', 'reel', 'lab'], runnerReason: null })
   })
 
   it('takes only the desks SWITCHGEN_RUNNER_DESKS names', async () => {
@@ -801,7 +807,7 @@ describe('/api/capabilities and the plugin', () => {
 
   it('says no, and why, with SWITCHGEN_RUNNER=off, and the queue takes nothing', async () => {
     process.env.SWITCHGEN_RUNNER = 'off'
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'switchgen-runner-off-'))
+    const dir = tempRoot()
     process.env.SWITCHGEN_RUNNER_DIR = path.join(dir, 'runner')
     try {
       const { switchgenRunner } = await import('../server/runner.mjs')
@@ -822,7 +828,7 @@ describe('/api/capabilities and the plugin', () => {
     const { archiveApi } = await import('../server/archive.mjs')
     // Taken from here only once the other server has it.
     await clearRegistry()
-    const script = path.join(mkdtempSync(path.join(os.tmpdir(), 'switchgen-holder-')), 'holder.mjs')
+    const script = path.join(tempRoot(), 'holder.mjs')
     const archiveUrl = pathToFileURL(path.resolve(import.meta.dirname, '..', 'server', 'archive.mjs')).href
     writeFileSync(
       script,
@@ -871,7 +877,7 @@ process.stdin.on('data', () => process.exit(0))
     // Two servers on one outputs root, the second given an archive of its
     // own beside the first's, with no SWITCHGEN_RUNNER_DIR: both run a queue,
     // each over its own folder, each holding that folder's lock.
-    const root = mkdtempSync(path.join(os.tmpdir(), 'switchgen-two-archives-'))
+    const root = tempRoot()
     const outputs = path.join(root, 'outputs')
     const script = path.join(root, 'server.mjs')
     const runnerUrl = pathToFileURL(path.resolve(import.meta.dirname, '..', 'server', 'runner.mjs')).href

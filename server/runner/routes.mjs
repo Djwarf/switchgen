@@ -29,7 +29,12 @@ const PING_MS = 25_000
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
-const KIND_OF_DESK = { images: 'batch', video: 'clips', reel: 'pass' }
+/**
+ * The kind of group each desk sends. A lab set is the model lab's: jobs that
+ * go independently, except one chained to another waits for it to end. No
+ * busy lock applies to it, so a lab night never refuses the Pictures desk.
+ */
+const KIND_OF_DESK = { images: 'batch', video: 'clips', reel: 'pass', lab: 'set' }
 
 const DISK_FULL = 'The server’s disk is full, so it cannot save this work. Nothing was taken.'
 const BUSY_IMAGES = 'A batch of pictures is already being made, from this page or another.'
@@ -55,7 +60,7 @@ export function validateGroup(body, desks) {
   const g = body.group
   if (!isObject(g)) return { error: 'group must be an object' }
   if (typeof g.id !== 'string' || !UUID.test(g.id)) return { error: 'group.id must be a lowercase v4 UUID' }
-  if (!Object.hasOwn(KIND_OF_DESK, g.desk)) return { error: 'group.desk must be images, video or reel' }
+  if (!Object.hasOwn(KIND_OF_DESK, g.desk)) return { error: 'group.desk must be images, video, reel or lab' }
   if (!desks.includes(g.desk)) return { error: `the ${g.desk} desk does not send its work through the queue on this server` }
   if (g.kind !== KIND_OF_DESK[g.desk]) return { error: `a ${g.desk} group must be of kind ${KIND_OF_DESK[g.desk]}` }
   if (!isString(g.label, 200)) return { error: 'group.label must be a string of at most 200 characters' }

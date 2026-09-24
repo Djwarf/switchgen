@@ -3,8 +3,12 @@ import type { ArchiveApi } from './archive.mjs'
 import type { Comfy } from './runner/comfy.mjs'
 import type { ApiWorkflow, OutputFile } from './runner/comfyRecord.mjs'
 
-/** A desk that can hand its waiting work to the queue on the server. */
-export type RunnerDesk = 'video' | 'images' | 'reel'
+/**
+ * A desk that can hand its waiting work to the queue on the server. 'lab' is
+ * the model lab's (lab/): its jobs are never filed in the archive, and no desk
+ * of the app shows them.
+ */
+export type RunnerDesk = 'video' | 'images' | 'reel' | 'lab'
 
 export type RunnerStatus =
   | 'waiting'
@@ -109,7 +113,12 @@ export type JobView = {
 export type GroupView = {
   id: string
   desk: RunnerDesk
-  kind: 'batch' | 'clips' | 'pass'
+  /**
+   * 'batch' (images), 'clips' (video), 'pass' (reel) or 'set' (lab). A set's
+   * jobs go independently, except that one chained to another waits for it
+   * to end; a failure ends only its own job and the ones chained to it.
+   */
+  kind: 'batch' | 'clips' | 'pass' | 'set'
   label: string
   device: string
   createdAt: number

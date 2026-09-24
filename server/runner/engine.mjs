@@ -69,6 +69,14 @@ const KEEP_ENDED = 500
  */
 const KEEP_PASS_MS = 30 * 24 * 3_600_000
 const KEEP_PASS_JOBS = 2000
+/**
+ * The model lab's ended pictures are counted apart from the desks' 500 as
+ * well, so a night of lab work never pushes the reader's own ended work off
+ * the list, and no more than 200 of them are kept, the most one lab group
+ * holds. While the lab runs it reads each ending within seconds; the picture
+ * of one it missed, it finds on disk.
+ */
+const KEEP_LAB = 200
 const PRUNE_EVERY_MS = 60_000
 /** How often a stop that ComfyUI did not take is asked again while the job is still its. */
 const CANCEL_EVERY_MS = 2000
@@ -94,7 +102,12 @@ export const REASONS = {
   stopped: 'The queue on the server is not running.',
 }
 
-export const DESKS = ['video', 'images', 'reel']
+/**
+ * The desks that can hand their work to the queue. 'lab' is the model lab's
+ * (lab/ in the repo): its groups are of kind 'set', its jobs are never filed
+ * in the archive, and no desk of the app shows them.
+ */
+export const DESKS = ['video', 'images', 'reel', 'lab']
 
 /**
  * This runner has handed over (retired, or lost the archive to another
@@ -193,7 +206,8 @@ const waitsToGo = (s) => !!s && Object.values(s.jobs).some((j) => j.status === '
  * goes on past a picture that wrote no file, as the page's own batch always
  * has; any other failure ends it. A reel pass ends on anything but done,
  * because every shot after may open on the one that did not finish. Clips
- * are independent.
+ * are independent, and so are the pictures of a lab set: one that fails
+ * fails only itself and the pictures chained to it.
  */
 function endsGroup(kind, job) {
   if (kind === 'batch') {
@@ -366,7 +380,7 @@ export function createEngine(opts) {
     for (const g of Object.values(d.groups)) {
       if (g.state !== 'active') continue
       const members = g.jobIds.map((id) => d.jobs[id]).filter(Boolean)
-      const ender = g.kind === 'clips' ? null : members.find((j) => endsGroup(g.kind, j)) ?? null
+      const ender = g.kind === 'clips' || g.kind === 'set' ? null : members.find((j) => endsGroup(g.kind, j)) ?? null
       if (ender) {
         for (const j of members) {
           if (j.status !== 'waiting') continue
@@ -1129,10 +1143,20 @@ export function createEngine(opts) {
 
   // ---------------------------------------------------------- dispatching --
 
-  /** Every job before this one in a batch or a pass has ended. */
+  /**
+   * Every job before this one in a batch or a pass has ended. Clips wait for
+   * nothing. A picture of a lab set waits only for the picture it is chained
+   * to, until that one has ended, so it opens on a finished picture or fails
+   * with no-frame, and never catches it still being filed.
+   */
   function beforeDone(j, s) {
     const g = s.groups[j.groupId]
     if (!g || g.kind === 'clips') return true
+    if (g.kind === 'set') {
+      if (!j.chain) return true
+      const up = s.jobs[j.chain.after]
+      return !up || TERMINAL.has(up.status)
+    }
     for (const id of g.jobIds) {
       if (id === j.id) return true
       const o = s.jobs[id]
@@ -1189,12 +1213,16 @@ export function createEngine(opts) {
   /**
    * A reel shot that opens on the last frame of the shot before it, in this
    * pass: now that shot has landed, find its frame on disk and commit it as
-   * the one this shot opens on, before anything is released or sent.
+   * the one this shot opens on, before anything is released or sent. A
+   * picture of a lab set opens on the picture the one before it stands for
+   * (its primary), the same file the lab names when that picture was made in
+   * an earlier group.
    */
   async function openChain(id) {
     const j = job(id)
     const up = job(j.chain.after)
-    const frame = up?.status === 'done' ? up.frame : null
+    const inSet = group(j.groupId)?.kind === 'set'
+    const frame = up?.status === 'done' ? (inSet ? up.primary : up.frame) : null
     let there = false
     if (frame && (!frame.type || frame.type === 'output')) {
       const full = await confineReal(outputs, relOf(frame))
@@ -1212,7 +1240,11 @@ export function createEngine(opts) {
       tcommit((d) => {
         const cur = d.jobs[id]
         if (!cur || !waiting(cur)) return false
-        endJob(d, id, 'failed', fault('no-frame', { message: 'The shot before it left no last frame on disk to open on.' }))
+        endJob(d, id, 'failed', fault('no-frame', {
+          message: inSet
+            ? 'The picture it works on did not finish, or is not on disk, so there was nothing to open.'
+            : 'The shot before it left no last frame on disk to open on.',
+        }))
       })
       return false
     }
@@ -1436,6 +1468,9 @@ export function createEngine(opts) {
    * hundreds of pictures; dropped, its shots would read as never made and be
    * rendered again. A page that has taken a pass in dismisses it, and it goes
    * as any other ended work does.
+   *
+   * The model lab's ended pictures are kept 48 hours too, and no more than
+   * 200 of them, counted apart from the desks' 500 (KEEP_LAB).
    */
   function prune() {
     const t = now()
@@ -1450,6 +1485,8 @@ export function createEngine(opts) {
       const g = s.groups[j.groupId]
       return g?.kind === 'pass' && g.dismissed !== true
     }
+    const lab = (j) => j.desk === 'lab'
+    const ofDesks = (j) => !untaken(j) && !lab(j)
     const ended = Object.values(s.jobs)
       .filter((j) => TERMINAL.has(j.status) && s.groups[j.groupId]?.state !== 'active')
       .sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
@@ -1468,8 +1505,9 @@ export function createEngine(opts) {
       }
     }
     const terminal = Object.values(s.jobs).filter((j) => TERMINAL.has(j.status))
-    drop(ended.filter((j) => !untaken(j)), KEEP_ENDED_MS, KEEP_ENDED, terminal.filter((j) => !untaken(j)).length)
+    drop(ended.filter(ofDesks), KEEP_ENDED_MS, KEEP_ENDED, terminal.filter(ofDesks).length)
     drop(ended.filter(untaken), KEEP_PASS_MS, KEEP_PASS_JOBS, terminal.filter(untaken).length)
+    drop(ended.filter(lab), KEEP_ENDED_MS, KEEP_LAB, terminal.filter(lab).length)
     if (!gone.size) return
     tcommit((d) => {
       for (const id of gone) delete d.jobs[id]

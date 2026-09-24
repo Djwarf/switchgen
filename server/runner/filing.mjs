@@ -1,5 +1,7 @@
 /**
  * Filing a finished job in the archive: the one filer of the queue's work.
+ * The model lab's jobs (desk 'lab') are the exception: they end done here
+ * with no record, so none of its pictures reaches History.
  *
  * The page used to file what it made, and a page asleep when its clip landed
  * filed nothing until it woke, dated to when it woke. The runner files the
@@ -117,6 +119,19 @@ export async function fileJob(rt, id) {
       } else {
         rt.endJob(d, id, 'done', null, { entryId: null, entryNo: null })
       }
+    })
+    rt.archive.unclaim(rels)
+    return
+  }
+
+  // The model lab's pictures (desk 'lab') are a study, not the reader's work:
+  // never filed in the archive, and never taken for a repeat of a record
+  // there. The job keeps its files, its primary, its time and any cached
+  // mark, which is all the lab reads.
+  if (job.desk === 'lab') {
+    rt.commit((d) => {
+      if (!still(d.jobs[id])) return false
+      rt.endJob(d, id, 'done', null, { entryId: null, entryNo: null })
     })
     rt.archive.unclaim(rels)
     return

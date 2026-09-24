@@ -1,6 +1,6 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it } from 'vitest'
 import { tempRoots } from './http'
 
 /**
@@ -12,6 +12,12 @@ import { tempRoots } from './http'
  */
 const raw = readFileSync(path.resolve(import.meta.dirname, '..', 'README.md'), 'utf8')
 const readme = raw.replace(/\s+/g, ' ')
+
+/** The temporary folders a test here made, removed once the file is done. */
+const temps: string[] = []
+afterAll(() => {
+  for (const dir of temps) rmSync(dir, { recursive: true, force: true })
+})
 
 describe('the README on the archive', () => {
   it('says one server holds the archive at a time, and what a second one answers', () => {
@@ -134,7 +140,7 @@ describe('the README on the queue\'s folder', () => {
     expect(readme).toContain('(`archive-b.json.runner` for `archive-b.json`)')
     expect(readme).toContain('the `lock` file in that folder')
     // The server module reads its roots as it loads: temporary ones, never the author's.
-    tempRoots()
+    temps.push(tempRoots().root)
     const { runnerDirFor } = await import('../server/runner.mjs')
     expect(path.basename(runnerDirFor('/x/.switchgen/archive.json'))).toBe('runner')
     expect(path.basename(runnerDirFor('/x/.switchgen/archive-b.json'))).toBe('archive-b.json.runner')
@@ -176,8 +182,21 @@ describe('.env.example', () => {
   })
 
   it('offers the queue\'s settings commented out, at their defaults', () => {
-    for (const line of ['#SWITCHGEN_RUNNER=off', '#SWITCHGEN_RUNNER_DIR=', '#SWITCHGEN_RUNNER_DESKS=video,images,reel', '#SWITCHGEN_RUNNER_SETTLE_MS=1000']) {
+    for (const line of ['#SWITCHGEN_RUNNER=off', '#SWITCHGEN_RUNNER_DIR=', '#SWITCHGEN_RUNNER_DESKS=video,images,reel,lab', '#SWITCHGEN_RUNNER_SETTLE_MS=1000']) {
       expect(example.split('\n'), line).toContain(line)
     }
+  })
+
+  it('gives the queue\'s desks at the default the queue itself has, the lab\'s among them', () => {
+    // The queue's own list, read from its source: a copy of the old default in
+    // .env silently turns off a desk added since, and the lab then refuses to start.
+    const engine = readFileSync(path.resolve(import.meta.dirname, '..', 'server', 'runner', 'engine.mjs'), 'utf8')
+    const list = /^export const DESKS = \[([^\]]*)\]/m.exec(engine)?.[1]
+    expect(list).toBeTruthy()
+    const desks = [...list!.matchAll(/'([a-z]+)'/g)].map((m) => m[1]).join(',')
+    expect(desks).toBe('video,images,reel,lab')
+    expect(example.split('\n')).toContain(`#SWITCHGEN_RUNNER_DESKS=${desks}`)
+    expect(raw).toContain(`| \`SWITCHGEN_RUNNER_DESKS\` | \`${desks}\` |`)
+    expect(readme).toContain("`lab` is the model lab's own desk")
   })
 })

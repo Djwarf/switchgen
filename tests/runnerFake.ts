@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { afterAll } from 'vitest'
 import { Unanswered } from '../server/runner/comfy.mjs'
 import type { Comfy, SocketMessage, SubmitResult } from '../server/runner/comfy.mjs'
 import type { ArchiveApi } from '../server/archive.mjs'
@@ -312,6 +313,26 @@ export function groupBody(o: { desk: 'video' | 'images' | 'reel'; jobs: JobSpec[
 
 let loads = 0
 
+/**
+ * The temporary folders runnerEnv, harness and tempRoot made, removed once
+ * the test file that loaded this module is done. The hook is registered as
+ * the file loads, before any of the file's own, so it runs after them all:
+ * its runners are retired and its environment put back by then. The temp
+ * folder is memory on some machines, and one folder left per harness filled
+ * it.
+ */
+const made = new Set<string>()
+/** A new temporary folder, removed with the rest once the test file is done. */
+export function tempRoot(): string {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'switchgen-runner-'))
+  made.add(root)
+  return root
+}
+afterAll(() => {
+  for (const root of made) rmSync(root, { recursive: true, force: true })
+  made.clear()
+})
+
 type ArchiveModule = { archiveApi: ArchiveApi; switchgenArchive: () => { configurePreviewServer?: unknown } }
 
 /** Each load of the archive a harness made, by its api, for a test that wants its routes too. */
@@ -342,12 +363,12 @@ export function archiveRoutes(api: ArchiveApi) {
  * Point every root a server module reads at a temporary folder and turn the
  * queue on, returning what puts the environment back. Called before any
  * server module is imported: runner.mjs loads the archive, which reads its
- * roots as it loads.
+ * roots as it loads. The folder itself goes once the test file is done.
  */
 export function runnerEnv(): () => void {
   const keys = ['SWITCHGEN_RUNNER', 'SWITCHGEN_OUTPUTS', 'SWITCHGEN_ARCHIVE', 'SWITCHGEN_MODELS', 'SWITCHGEN_RUNNER_DIR', 'SWITCHGEN_RUNNER_DESKS', 'COMFY_URL']
   const before = Object.fromEntries(keys.map((k) => [k, process.env[k]]))
-  const root = mkdtempSync(path.join(os.tmpdir(), 'switchgen-runner-'))
+  const root = tempRoot()
   process.env.SWITCHGEN_RUNNER = 'on'
   process.env.SWITCHGEN_OUTPUTS = path.join(root, 'outputs')
   process.env.SWITCHGEN_ARCHIVE = path.join(root, 'outputs', '.switchgen', 'archive.json')
@@ -412,7 +433,7 @@ export async function harness(o: HarnessOptions = {}): Promise<Harness> {
   // loads the archive module too, and that load must not share a file with
   // the archive loaded for this runner below.
   const { createRunner } = await import('../server/runner.mjs')
-  const root = o.root ?? mkdtempSync(path.join(os.tmpdir(), 'switchgen-runner-'))
+  const root = o.root ?? tempRoot()
   const outputs = o.outputs ?? path.join(root, 'outputs')
   mkdirSync(outputs, { recursive: true })
   const dir = o.dir ?? path.join(outputs, '.switchgen', 'runner')

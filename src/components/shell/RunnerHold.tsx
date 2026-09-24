@@ -22,13 +22,19 @@
  * which is every waiting job for a hold over all the work, and every heavy one
  * for a hold over heavy work, whatever else its wait says (in a batch or a
  * pass only the first job waiting says "held"; the rest wait for the one
- * before them, and are held all the same).
+ * before them, and are held all the same). The model lab's pictures (lab/ in
+ * the repo) are counted too, by name: no desk of the app shows them, but the
+ * hold covers them, and so does the word given here.
  */
 import { useState } from 'react'
 import { holdCovers, laneWord, runnerStore, useRunner, type RunnerDesk, type RunnerSnapshot } from '../../lib/runner'
 
-/** How many waiting jobs a hold covers, desk by desk. */
-export type HeldCounts = Record<RunnerDesk, number>
+/**
+ * How many waiting jobs a hold covers, desk by desk. `lab` is there only
+ * when the hold covers some of the model lab's pictures: the server sends
+ * them through the same lane, though no desk of the app shows them.
+ */
+export type HeldCounts = Record<RunnerDesk, number> & { lab?: number }
 
 /**
  * The waiting jobs the lane's hold covers, by desk, counted as the server's
@@ -41,7 +47,11 @@ export function heldCounts(snap: Pick<RunnerSnapshot, 'lane' | 'jobs'>): HeldCou
   const held = snap.lane.held
   if (!held) return counts
   for (const j of snap.jobs) {
-    if (j.status === 'waiting' && holdCovers(held, j) && j.desk in counts) counts[j.desk]++
+    if (j.status !== 'waiting' || !holdCovers(held, j)) continue
+    // The page's type names the app's three desks; the server's list holds the lab's too.
+    const desk: string = j.desk
+    if (desk === 'lab') counts.lab = (counts.lab ?? 0) + 1
+    else if (desk in counts) counts[j.desk]++
   }
   return counts
 }
@@ -56,18 +66,20 @@ const WHY: Record<string, string> = {
 }
 const WHY_ANY = 'The server holds its waiting work until you say.'
 
-/** What each desk's work is called, one and many, in the order the rooms go. */
-const NOUNS: readonly (readonly [RunnerDesk, string, string])[] = [
+/** What each desk's work is called, one and many, in the order the rooms go, the lab's last. */
+const NOUNS: readonly (readonly [keyof HeldCounts, string, string])[] = [
   ['images', 'picture', 'pictures'],
   ['video', 'clip', 'clips'],
   ['reel', 'shot', 'shots'],
+  ['lab', 'lab picture', 'lab pictures'],
 ]
 
-/** "10 pictures, 2 clips and 1 shot", or null for none. */
+/** "10 pictures, 2 clips and 1 lab picture", or null for none. */
 function countLine(counts: HeldCounts): string | null {
-  const parts = NOUNS.filter(([desk]) => counts[desk] > 0).map(
-    ([desk, one, many]) => `${counts[desk]} ${counts[desk] === 1 ? one : many}`,
-  )
+  const parts = NOUNS.flatMap(([desk, one, many]) => {
+    const n = counts[desk] ?? 0
+    return n > 0 ? [`${n} ${n === 1 ? one : many}`] : []
+  })
   if (!parts.length) return null
   return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`
 }

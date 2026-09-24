@@ -22,6 +22,10 @@
  * the queue that next runs holds whatever waited meanwhile until the reader
  * says.
  *
+ * One more desk sends through it besides the app's three: the model lab
+ * (lab/ in the repo), whose pictures are made in turn with the reader's own
+ * work but never filed in the archive, and shown on no desk.
+ *
  * The pieces live in server/runner/: store.mjs keeps the list of work on
  * disk, engine.mjs decides what goes to ComfyUI and when, filing.mjs files
  * what comes back, routes.mjs answers /api/runner, and comfy.mjs and
@@ -53,7 +57,7 @@ function registry() {
   return reg
 }
 
-/** The desks that send their work through the queue: SWITCHGEN_RUNNER_DESKS, or all three. */
+/** The desks that send their work through the queue: SWITCHGEN_RUNNER_DESKS, or all four. */
 function desksFromEnv() {
   const raw = process.env.SWITCHGEN_RUNNER_DESKS
   if (raw === undefined) return [...DESKS]

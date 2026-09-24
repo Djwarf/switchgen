@@ -404,7 +404,7 @@ again, and an unchanged file costs a 304.
 | `GET /api/outputs` | archive | Every media file under the outputs root, marking the files a record names or the queue is filing |
 | `GET /api/runner`, `GET /api/runner/stream` | runner | Everything the queue holds, its batches, clips and shots, and their event stream; when this server does not run the queue, the reason, and the saved list read-only |
 | `GET /api/runner/jobs/:id`, `/jobs/:id/preview` | runner | One job with its graph and record template, and the newest preview ComfyUI sent for it |
-| `POST /api/runner/groups` | runner | Hand the queue a batch of pictures, a reel's pass or clips; sent again with the same ids, it is taken once |
+| `POST /api/runner/groups` | runner | Hand the queue a batch of pictures, a reel's pass, clips or a set of the model lab's pictures; sent again with the same ids, it is taken once |
 | `POST /api/runner/jobs/:id/stop`, `/groups/:id/stop` | runner | Stop one job, or a whole batch or pass, from any device |
 | `POST /api/runner/lane` | runner | Send or call off the work held after a lost job, a machine restart or a time with the queue off, naming the hold the page showed; refused when that hold has changed since |
 | `POST /api/runner/dismiss` | runner | Put away jobs that have ended |
@@ -431,7 +431,7 @@ export them first, or use `switchgen dev` and `switchgen validate`.
 | `SWITCHGEN_ARCHIVE` | `<outputs>/.switchgen/archive.json` | archive |
 | `SWITCHGEN_RUNNER` | empty | the queue on the server: `off` turns it off, and every desk sends its own work; what the queue had saved shows as waiting, and is held until you say once it is on again |
 | `SWITCHGEN_RUNNER_DIR` | beside the archive and named after it: `<outputs>/.switchgen/runner` for the default archive, `<archive file>.runner` for any other | the queue's list of work and its lock, for one archive |
-| `SWITCHGEN_RUNNER_DESKS` | `video,images,reel` | the desks whose work goes through the queue |
+| `SWITCHGEN_RUNNER_DESKS` | `video,images,reel,lab` | the desks whose work goes through the queue; `lab` is the model lab's own desk (`lab/`), whose pictures are never filed in History, and without it the lab will not start |
 | `SWITCHGEN_RUNNER_SETTLE_MS` | `1000` | how long the queue waits after ComfyUI is asked to release its memory before it checks the queue again and sends a heavy job |
 | `SWITCHGEN_THUMBS` | `<outputs>/.switchgen/thumbs` | thumbs |
 | `SWITCHGEN_CATALOG` | `server/catalog.json` | downloads |
