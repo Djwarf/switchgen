@@ -1,3 +1,5 @@
+import os from 'node:os'
+import path from 'node:path'
 import { defineConfig } from 'vitest/config'
 
 // The suite covers the pure modules under src/lib, the desks' job engines and
@@ -26,5 +28,23 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     environment: 'node',
     testTimeout: 15_000,
+    // A server module under test must never reach the real ComfyUI or send it
+    // work: its address points at a port nothing listens on (9, discard), and
+    // the server-side runner stays off unless a test turns it on with its own
+    // stand-in ComfyUI and temporary folders.
+    //
+    // Nor may it reach the author's own folders. Every test that loads a
+    // server module sets its roots first (tempRoots in tests/http.ts); one
+    // that forgot would otherwise find the defaults, which name the real
+    // library and outputs, where the running app keeps its archive and its
+    // queue. The archive, the thumbnails and the queue's folder are found
+    // under the outputs root unless named, so a test that names only that
+    // root still gets all three beside it.
+    env: {
+      COMFY_URL: 'http://127.0.0.1:9',
+      SWITCHGEN_RUNNER: 'off',
+      SWITCHGEN_OUTPUTS: path.join(os.tmpdir(), 'switchgen-vitest-unset', 'outputs'),
+      SWITCHGEN_MODELS: path.join(os.tmpdir(), 'switchgen-vitest-unset', 'models'),
+    },
   },
 })

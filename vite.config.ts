@@ -10,6 +10,7 @@ import { switchgenApi } from './server/api.mjs'
 import { switchgenArchive } from './server/archive.mjs'
 import { switchgenDownloads } from './server/downloads.mjs'
 import { switchgenReel } from './server/reel.mjs'
+import { switchgenRunner } from './server/runner.mjs'
 import { switchgenThumbs } from './server/thumbs.mjs'
 import { switchgenVision } from './server/vision.mjs'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
@@ -128,6 +129,9 @@ export default defineConfig({
     tailwindcss(),
     switchgenApi(),
     switchgenArchive(),
+    // The queue on the server, right after the archive whose lock it runs
+    // under and through which it files what it makes (server/runner.mjs).
+    switchgenRunner(),
     switchgenThumbs(),
     switchgenDownloads(),
     switchgenReel(),

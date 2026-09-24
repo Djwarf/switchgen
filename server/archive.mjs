@@ -54,6 +54,11 @@
  * the body is capped, and nothing here touches a media file. GET /api/outputs
  * lists them, marking the ones a record already names and the ones whose
  * record was removed, so the client can find files no record describes.
+ *
+ * The queue on the server (server/runner.mjs) files its own work through
+ * `archiveApi`, in this process and under this lock, rather than over HTTP:
+ * it runs only while this process holds the archive, and it must know a
+ * record is on disk before it calls a job done.
  */
 import { randomUUID } from 'node:crypto'
 import { linkSync, mkdirSync, promises as fs, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
@@ -405,21 +410,27 @@ function stillDismissed(s, rel, written) {
 }
 
 /**
- * When each dismissed file these records would file after the fact was last
- * written, read from disk, for {@link upsert}. Only those are read, and only
- * inside the outputs root.
+ * When each of `rels` that is dismissed was last written, read from disk into
+ * `out`, for {@link stillDismissed}. Only those are read, and only inside the
+ * outputs root.
  */
+async function writtenAt(s, rels, out = new Map()) {
+  const root = path.resolve(OUTPUTS)
+  for (const rel of rels) {
+    if (!s.dismissed.has(rel) || out.has(rel)) continue
+    const full = path.resolve(root, rel)
+    if (!full.startsWith(root + path.sep)) continue
+    try { out.set(rel, (await fs.stat(full)).mtimeMs) } catch { /* not there: the removal stands */ }
+  }
+  return out
+}
+
+/** {@link writtenAt} for the files these records would file after the fact, for {@link upsert}. */
 async function dismissedWritten(s, records) {
   const out = new Map()
-  const root = path.resolve(OUTPUTS)
   for (const r of records) {
     if (!sane(r) || r.recovered !== true || r.refiled === true || s.records.has(r.id)) continue
-    for (const rel of relsOf(r)) {
-      if (!s.dismissed.has(rel) || out.has(rel)) continue
-      const full = path.resolve(root, rel)
-      if (!full.startsWith(root + path.sep)) continue
-      try { out.set(rel, (await fs.stat(full)).mtimeMs) } catch { /* not there: the removal stands */ }
-    }
+    await writtenAt(s, relsOf(r), out)
   }
   return out
 }
@@ -690,6 +701,112 @@ async function outputs() {
   return files
 }
 
+// ------------------------------------------------------ the queue's access --
+
+/**
+ * Output files the queue on the server has taken for filing and not yet let
+ * go, as paths under the outputs root. A set, not a count: the queue may take
+ * a file again on each attempt at filing it (after a restart, say), and a
+ * count that one release did not bring to nothing would keep the file marked
+ * filed with no record naming it, so the recovery pass never filed it.
+ */
+const claimed = new Set()
+
+/**
+ * What the queue on the server (server/runner.mjs) needs of the archive, in
+ * this process. It files through the same store, lock and stream as the
+ * routes below, so every open page pulls its records as it pulls any other.
+ */
+export const archiveApi = {
+  /**
+   * Whether this process holds the archive. The queue runs only while it
+   * does: a second server on the same outputs stands back from both, so there
+   * is never a second dispatcher sending the same work to ComfyUI.
+   */
+  holds() {
+    return takeLock() === null && stillMine()
+  },
+
+  /**
+   * The record naming `rel`, a path under the outputs root, or null. A desk's
+   * record is preferred to one the recovery pass filed, because only a desk's
+   * says how the file was made, which is what an answer from ComfyUI's cache
+   * repeats.
+   */
+  async recordNaming(rel) {
+    const s = await load()
+    let found = null
+    for (const r of s.records.values()) {
+      if (!relsOf(r).includes(rel)) continue
+      found = r
+      if (r.recovered !== true) break
+    }
+    if (!found) return null
+    return {
+      id: found.id,
+      no: num(found.no, 0),
+      recovered: found.recovered === true,
+      promptId: typeof found.promptId === 'string' ? found.promptId : null,
+      durationMs: num(found.durationMs, 0),
+    }
+  },
+
+  /**
+   * File `record` once. Its id is the job's, so asking again after a crash
+   * finds the record already here rather than filing a second one; a record
+   * the reader removed since stays removed. So does one the recovery pass
+   * filed for the same file under its own id, while the queue was not
+   * running, and the reader removed: the file this run wrote is still the one
+   * the reader took out. A file ComfyUI handed back from its cache was
+   * written by an earlier run, and asking for it again takes its removal
+   * back, as a desk's record always has. The answer comes before the write
+   * is on disk: call durable() before saying the job is done.
+   */
+  async fileOnce(record) {
+    if (!sane(record)) throw new Error('not a record')
+    const s = await load()
+    const wrote = [record.file, ...(Array.isArray(record.files) ? record.files : [])]
+      .filter((f) => f?.cached !== true)
+      .flatMap((f) => relsOf({ file: f }))
+    const written = await writtenAt(s, wrote)
+    const held = s.records.get(record.id)
+    if (held) return { entryId: held.id, no: num(held.no, 0), existed: true }
+    if (s.tombstones.has(record.id)) return { removed: true }
+    if (wrote.some((rel) => stillDismissed(s, rel, written))) return { removed: true }
+    const { assigned } = upsert(s, [record])
+    // Refused, which a desk's record with no removal behind it never is:
+    // taken as removed, so the queue ends the job rather than trying again
+    // for ever with nothing the reader could do about it.
+    if (!assigned.length) return { removed: true }
+    save()
+    broadcast(s)
+    return { entryId: assigned[0].id, no: assigned[0].no, existed: false }
+  },
+
+  /**
+   * Write now, and say whether every change made before the call is on disk.
+   * False when the write failed or another server has taken the archive.
+   */
+  async durable() {
+    const target = changes
+    // The debounced write this one replaces would only write the same again.
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+    await writeNow()
+    return persisted >= target
+  },
+
+  claim(rels) {
+    for (const rel of rels) if (typeof rel === 'string' && rel) claimed.add(rel)
+  },
+
+  unclaim(rels) {
+    for (const rel of rels) claimed.delete(rel)
+  },
+
+  outputsRoot: OUTPUTS,
+  archiveFile: ARCHIVE,
+}
+
 // ---------------------------------------------------------------- routes --
 
 const METHODS = new Map([
@@ -762,7 +879,10 @@ export function switchgenArchive() {
         // Marked here because only the server holds every record. A browser
         // keeps a window of the archive, so a file whose record fell out of
         // that window would otherwise look unfiled and be filed a second time.
-        const named = new Set()
+        // A file the queue on the server is filing counts as filed too: its
+        // record is on its way, and a recovery pass that filed it first would
+        // leave the archive with a bare record the queue then has to replace.
+        const named = new Set(claimed)
         for (const r of s.records.values()) for (const rel of relsOf(r)) named.add(rel)
         const listed = since ? files.filter(f => f.mtime > since) : files
         const mark = (f) => {

@@ -15,6 +15,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { confineReal, guardMutation, readBody, reqUrl, safely, send, tools } from './guard.mjs'
 import { forgetThumbs } from './thumbs.mjs'
+import { runnerStatus } from './runner.mjs'
 
 const run = promisify(execFile)
 
@@ -230,6 +231,7 @@ function leave(res) {
  */
 async function capabilities() {
   const t = await tools()
+  const queue = queueStatus()
   return {
     server: 'switchgen',
     deleteFiles: true,
@@ -243,6 +245,35 @@ async function capabilities() {
     archive: true,
     gpu: t.gpu,
     tools: { aria2c: t.aria2c, ffmpeg: t.ffmpeg, ffprobe: t.ffprobe },
+    // The queue on the server (server/runner.mjs), and which desks send their
+    // work through it. Its own word, not whether it is mounted: it stands
+    // back while another server holds the archive, when SWITCHGEN_RUNNER is
+    // off, or when it cannot write its list of work, and a page told no here
+    // sends its work itself, as it did before there was a queue.
+    runner: queue.active,
+    runnerDesks: queue.active ? queue.desks : [],
+    runnerReason: queue.active ? null : queue.reason,
+  }
+}
+
+const NOT_RUNNING = 'The queue on the server is not running.'
+
+/**
+ * The queue's status, never a throw. Every page reads capabilities when it
+ * loads, and an answer of 500 here would switch off deletion, downloads and
+ * the archive with it, over a fault in the queue alone.
+ */
+function queueStatus() {
+  try {
+    const s = runnerStatus()
+    return {
+      active: s?.active === true,
+      desks: Array.isArray(s?.desks) ? s.desks : [],
+      reason: typeof s?.reason === 'string' && s.reason ? s.reason : NOT_RUNNING,
+    }
+  } catch (err) {
+    console.warn(`[switchgen-api] could not read the queue's status: ${err?.message ?? err}`)
+    return { active: false, desks: [], reason: NOT_RUNNING }
   }
 }
 
