@@ -64,7 +64,7 @@ function indexedTrigger(file: string): string | null {
   if (!e || !e.triggerPhrase) return null
   return e.confidence === 'strong' || e.confidence === 'likely' ? e.triggerPhrase : null
 }
-import { canTakeLoras, capabilitiesOf, withLoras, type Capabilities, type DerivedDef } from './refine'
+import { canTakeLoras, capabilitiesOf, detailSentence, withLoras, type Capabilities, type DerivedDef } from './refine'
 import { FAMILIES, defaultsFor, deriveImg2Img, IMG2IMG, instantiate, type FamilyDef, type Params } from './workflows'
 
 // ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ export function decide(input: RecipeInput): Recipe {
       anatomy,
       prompt,
       reason: input.sourceImage
-        ? 'Nothing installed can work from a picture here. The blocked list says what is missing or too large.'
+        ? 'Nothing installed can work from a picture here. Open More: it says what is missing or too large, and its catalogue can fetch a model.'
         : report.note,
       report,
       notes,
@@ -868,8 +868,8 @@ export function decide(input: RecipeInput): Recipe {
   const passes = passesFor(
     capabilities,
     {
-      face: `Re renders every detected face at 768 and pastes it back. Measured ${pct(MEASURED.faceDetailer.ratio)} whole frame sharpness, so it is offered rather than run blind.`,
-      hand: 'Re renders every detected hand with more freedom than a face, because hands come out wrong rather than merely soft. Not measured here.',
+      face: `${detailSentence('face')} Measured ${pct(MEASURED.faceDetailer.ratio)} whole frame sharpness, so it is offered rather than run blind.`,
+      hand: `${detailSentence('hand')} It is given more freedom than a face, because hands come out wrong rather than merely soft. Not measured here.`,
       refine: 'Draw a mask over a region and it is cropped, upscaled to full working resolution and rendered alone. The only thing that adds real detail to a region with no detector.',
       hires: 'Renders the same picture larger, at low denoise, from the finished latent.',
     },

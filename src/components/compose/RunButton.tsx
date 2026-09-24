@@ -40,6 +40,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
+import { WAITS_IN_PAGE, wakeLockAvailable } from '../../lib/wakeLock'
 
 /** How long an armed stop waits for its confirming press. */
 const ARMED_MS = 3000
@@ -61,6 +62,33 @@ function seconds(ms: number): string {
   const m = Math.floor(ms / 60_000)
   const s = Math.round((ms % 60_000) / 1000)
   return `${m} min ${s}${THIN}s`
+}
+
+/**
+ * The stage a desk shows from the moment Stop is asked until the cancel lands.
+ * Shared so the desk and this button cannot drift apart on the word.
+ */
+export const STOPPING = 'Stopping'
+
+/**
+ * The line under a batch while pictures still wait in the page, or null when
+ * none do. Only the picture on the press is in ComfyUI; the rest are sent from
+ * this page one at a time, and a phone that locks or hides the page sends
+ * nothing more until it wakes. Nothing said so, and the card sat idle.
+ */
+export function waitingLine(job: RunJob | null, keepsScreenOn = wakeLockAvailable()): string | null {
+  // A stop drops the rest of the batch at once, but the picture on the press
+  // can take seconds to let go, and until it does the job still counts the
+  // ones behind it. None of them will be sent, so none is said to wait.
+  if (job?.stage === STOPPING) return null
+  const left = job?.total && job.index ? job.total - job.index : 0
+  if (left <= 0) return null
+  const waits =
+    left === 1
+      ? 'One more picture waits in this page and is sent when this one is done.'
+      : `${left} more pictures wait in this page and are sent one at a time.`
+  const screen = keepsScreenOn ? ' The page asks the phone to keep the screen on until the last one is sent.' : ''
+  return `${waits} ${WAITS_IN_PAGE}${screen}`
 }
 
 /** What the desk knows about the job in front of it. All of it optional. */
@@ -152,6 +180,7 @@ export function RunButton({
   }
 
   const isActivation = (e: ReactKeyboardEvent) => e.key === 'Enter' || e.key === ' '
+  const waiting = running ? waitingLine(job) : null
 
   /** The press that stopped the last job is over, wherever it ended. */
   const forgetPress = () => {
@@ -232,6 +261,7 @@ export function RunButton({
             ? ' · running long, still working'
             : ''}
         </p>
+        {waiting ? <p className="mt-1 text-caption leading-snug text-grey-700">{waiting}</p> : null}
       </div>
     )
   }

@@ -13,6 +13,7 @@
  */
 import { useMemo, useState } from 'react'
 
+import { copyText } from '../../lib/clipboard'
 import { Head, Link, Note } from './bits'
 import { buildGraph, type Settled } from './overrides'
 
@@ -25,7 +26,8 @@ export function WorkflowPeek({
   faultNode?: string | null
 }) {
   const [open, setOpen] = useState(false)
-  const [copied, setCopied] = useState(false)
+  /** What the Copy link last came to, said in its place for a moment. */
+  const [copied, setCopied] = useState<'copied' | 'failed' | null>(null)
 
   const json = useMemo(() => {
     if (!open) return ''
@@ -57,18 +59,19 @@ export function WorkflowPeek({
         {open ? (
           <>
             <span className="text-grey-400"> · </span>
+            {/* navigator.clipboard exists only on a secure page, and this one
+                is usually reached over plain http, where the old handler did
+                nothing at all and said nothing either. copyText falls back to
+                the older copy command, and a copy that fails is said. */}
             <Link
               onClick={() => {
-                void navigator.clipboard?.writeText(json).then(
-                  () => {
-                    setCopied(true)
-                    setTimeout(() => setCopied(false), 1500)
-                  },
-                  () => setCopied(false),
-                )
+                void copyText(json).then((ok) => {
+                  setCopied(ok ? 'copied' : 'failed')
+                  setTimeout(() => setCopied(null), ok ? 1500 : 3000)
+                })
               }}
             >
-              {copied ? 'Copied' : 'Copy'}
+              {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Could not copy' : 'Copy'}
             </Link>
           </>
         ) : null}

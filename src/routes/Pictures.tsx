@@ -44,6 +44,8 @@ import { measureImage as measure } from '../lib/images'
 import { clamp } from '../lib/num'
 import { ServerDown } from '../components/ServerDown'
 import { onPlanLanded } from '../lib/downloads'
+import { annotatedRef } from '../lib/continuation'
+import { holdAwake } from '../lib/wakeLock'
 import { thumbSrcSet, thumbUrl } from '../lib/thumbs'
 import { Kicker, Link, Notice } from '../components/type'
 import {
@@ -60,13 +62,20 @@ import {
 import {
   cancelJob,
   connectionState,
+  fetchPastRun,
   fileUrl,
+  followPrompt,
+  forgetObjectInfo,
   listJobs,
+  newPromptId,
   objectInfo,
   run,
   uploadImage,
   watchConnection,
   type ApiWorkflow,
+  type FileRef,
+  type Followed,
+  type OutputFile,
   type ProgressEvent,
   relPath,
   VIDEO_EXT,
@@ -100,6 +109,7 @@ import {
   update as updateRecord
 } from '../lib/history'
 import {
+  MODES,
   adoptValue,
   compositionFromEntry,
   deskStore,
@@ -107,6 +117,9 @@ import {
   randomSeed,
   recordOf,
   settings,
+  sourceFile,
+  tabStore,
+  takePlateRequest,
   takeRegionRequest,
   toParams,
   type Composition,
@@ -118,6 +131,7 @@ import {
   deriveAutoDetail,
   deriveHiresFix,
   deriveRefine,
+  detailSentence,
   hiresStepsFor,
   instantiateRefine,
   rebuildable,
@@ -129,6 +143,7 @@ import {
 } from '../lib/refine'
 import { EMPTY_LIBRARY, loadLoraLibrary, type LoraLibrary, defaultStrength, fitFor, targetFor, triggersFor, archFor } from '../lib/loras'
 import {
+  ANATOMY_LEVELS,
   LOOKS,
   decide,
   passesFor,
@@ -142,12 +157,13 @@ import {
   type RecipeNote,
   type RecipeLora
 } from '../lib/recipe'
-import { RegionRefine, type RefineRequest } from '../components/refine'
+import { RegionRefine, forgetBench, type RefineRequest } from '../components/refine'
 import {
   ComposeDesk,
   MoreFootnote,
   PromptField,
   RunButton,
+  STOPPING,
   SourceWell,
   Choice,
 } from '../components/compose'
@@ -155,10 +171,12 @@ import {
   AdvancedPanel,
   NO_PASSES,
   buildGraph,
+  sanitiseOverrides,
   settle,
   useOverrides,
   type Overrides,
   type Passes,
+  type Unloadable,
 } from '../components/advanced'
 import { ResultActions } from '../components/result'
 import { INTENTS, intentReport, lookScore, strongestLook, type Intent } from '../lib/intent'
@@ -267,6 +285,16 @@ function titleFromFilename(file: string): string {
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1)
 }
 
+/**
+ * Why a pinned file cannot be used, as the end of "X is pinned, but ...": the
+ * catalogue's own sentence when it has one ("it needs qwen_3_4b.safetensors"),
+ * else that the file is not installed here.
+ */
+function pinBlockedWhy(model: string, unavailable: readonly { name: string; why: string }[]): string {
+  const why = unavailable.find((u) => u.name === model)?.why
+  return why ? `it cannot load here: it ${why.replace(/\.$/, '')}` : 'it is not installed here'
+}
+
 /** The family's name without its parenthetical, for the picker's groups. */
 const groupName = (def: FamilyDef) => def.label.split('(')[0].replace(/[—-]\s*$/, '').trim()
 
@@ -303,7 +331,13 @@ export type Style = {
 
 type Catalogue = {
   styles: Style[]
-  unavailable: { name: string; why: string }[]
+  /**
+   * Weight files that cannot be offered, with why. `files` is true when a file
+   * the graph loads is missing (an encoder, a VAE, the node pack that reads
+   * it), which no reading of free memory can change; false when only the
+   * memory verdict refused it, which the ranking judges again on each visit.
+   */
+  unavailable: { name: string; why: string; files: boolean }[]
   samplers: string[]
   schedulers: string[]
   hardware: Hardware | null
@@ -369,7 +403,7 @@ async function readCatalogue(): Promise<Catalogue> {
   const installed = inv.weights
 
   const styles: Style[] = []
-  const unavailable: { name: string; why: string }[] = []
+  const unavailable: Catalogue['unavailable'] = []
 
   for (const model of installed) {
     const def = familyOwning(model)
@@ -377,10 +411,11 @@ async function readCatalogue(): Promise<Catalogue> {
 
     // Every file the graph references must exist, or the run fails with an
     // opaque backend error. Name the missing file instead; then the memory,
-    // priced on this file rather than the family's default.
+    // priced on this file rather than the family's default. Checked for this
+    // file alone: one SDXL checkpoint does not need the other three.
     const avail = availabilityOf(def, inv, hardware, sizes, model)
     if (!avail.ok) {
-      unavailable.push({ name: model, why: avail.why })
+      unavailable.push({ name: model, why: avail.why, files: missingFilesFor(def, inv, model).length > 0 })
       continue
     }
     styles.push(styleOf(def, model, avail.verdict))
@@ -399,7 +434,7 @@ async function readCatalogue(): Promise<Catalogue> {
     for (const model of def.models) {
       if (installed.has(model) || !sizes.has(model)) continue
       if (!packNeededFor(model, inv)) continue
-      unavailable.push({ name: model, why: missingWhy([model, ...others], inv, sizes) })
+      unavailable.push({ name: model, why: missingWhy([model, ...others], inv, sizes), files: true })
     }
   }
 
@@ -419,6 +454,9 @@ async function readCatalogue(): Promise<Catalogue> {
 
 let cataloguePromise: Promise<Catalogue> | null = null
 function catalogue(reload = false): Promise<Catalogue> {
+  // The model list is one shared download for every desk (comfy.ts keeps it),
+  // so a reload asks for it afresh rather than reading the kept copy again.
+  if (reload) forgetObjectInfo()
   if (reload || !cataloguePromise) cataloguePromise = readCatalogue()
   return cataloguePromise
 }
@@ -428,6 +466,7 @@ function catalogue(reload = false): Promise<Catalogue> {
 // catalogue once and keeps it, so the kept reading goes here, and the next
 // visit reads what is installed now.
 onPlanLanded(() => {
+  forgetObjectInfo()
   cataloguePromise = null
 })
 
@@ -451,6 +490,14 @@ type DeskJob = {
   total: number
   startedAt: number
   finishedAt: number | null
+  /**
+   * When ComfyUI began running it: the first 'running' event, which is its
+   * execution_start. The time a record files is counted from here, not from
+   * the press. A picture sent while a clip was sampling used to file the
+   * clip's remaining minutes as its own, and the timing line under the
+   * heading then stated that as how long a picture takes.
+   */
+  ranAt: number | null
 }
 
 type PressState = {
@@ -461,6 +508,10 @@ type PressState = {
   fault: DeskFault | null
   /** Duration of the last finished run, for the button's quiet receipt. */
   lastMs: number | null
+  /** What the page before this one never sent of its batch, in a line (see batchRestLine). */
+  unsent: string | null
+  /** Pictures an earlier page in this tab sent and did not hand on, which this page follows only at the reader's word. */
+  left: SentPicture[]
 }
 
 export type RunPlan = {
@@ -480,7 +531,10 @@ export type RunPlan = {
   loras: LoraSpec[]
 }
 
-let press: PressState = { job: null, results: [], current: null, fault: null, lastMs: null }
+/** What a record is filed from: the plan, less the graph that ran. */
+type Filing = Pick<RunPlan, 'composition' | 'seed' | 'familyLabel' | 'modelLabel' | 'variant' | 'passes' | 'loras'>
+
+let press: PressState = { job: null, results: [], current: null, fault: null, lastMs: null, unsent: null, left: [] }
 const pressListeners = new Set<() => void>()
 
 function emit(patch: Partial<PressState>) {
@@ -513,10 +567,272 @@ let stopped = false
 
 /** The one fault this desk writes itself. Fault gives it its own title. */
 const NO_FILE = 'The job finished but wrote no file. Check ComfyUI’s own log for the reason.'
+/** A picture the last page went while sending, which ComfyUI never heard of. Fault gives it its own title too. */
+const NOT_SENT =
+  'The page before this one went while it was still sending this picture, and ComfyUI has nothing under its number, so it was not sent. Nothing has been sent in its place.'
 
 function busy(state: PressState): boolean {
   const s = state.job?.status
   return s === 'submitting' || s === 'queued' || s === 'running'
+}
+
+// ---------------------------------------------------------------------------
+// A picture sent to ComfyUI outlives the page
+// ---------------------------------------------------------------------------
+
+/**
+ * The picture on the press, kept for this tab from the moment before it is
+ * sent until it settles.
+ *
+ * The press lived only in memory, and a phone reloads a tab it put in the
+ * background as a matter of course. The picture then went on rendering in
+ * ComfyUI with nothing following it: no progress, no Stop, the section bar
+ * calling it a job started outside SwitchGen, and no record until some later
+ * page load happened to look for unfiled files, by which time a restarted
+ * ComfyUI had forgotten everything but the file.
+ *
+ * Kept in the tab's session storage, and taken up by the next page only when
+ * the page that wrote it said it was going (pagehide) or the browser discarded
+ * the tab, as the Video desk's lane is: a tab copied from this one while it is
+ * still following the picture gets the same entry, and must not follow and
+ * file it a second time. Anything else (a copied tab, a page that crashed, an
+ * iPhone that closed the tab in the background, which says nothing to tell it
+ * apart from a copy) is put to the reader, never followed on a guess and never
+ * dropped without a word.
+ *
+ * It is written under the prompt's number before the prompt goes, marked as
+ * still being sent. The send can reach ComfyUI and the page go before the
+ * answer comes back, as when the phone throws away a tab the reader left just
+ * after pressing Make. Kept only once ComfyUI had answered, that picture
+ * rendered with nothing following it, the desk bare, and a second press made
+ * it twice.
+ */
+const SENT_KEY = 'switchgen.picturesent.v1'
+/** Sent pictures an earlier page left that this page would not follow by itself. */
+const LEFT_SENT_KEY = 'switchgen.picturesent.v1.left'
+/** This page, so a page back from the browser's cache can tell whether a later one took its picture. */
+const PAGE = globalThis.crypto?.randomUUID?.() ?? `page_${Date.now()}_${Math.random().toString(36).slice(2)}`
+
+/** A picture sent to ComfyUI, with what its record will say. */
+export type SentPicture = Filing & {
+  id: string
+  promptId: string
+  startedAt: number
+  label: string
+  /** Still on its way: ComfyUI had not answered when this was written, so it may never have got there. */
+  sending?: boolean
+  /** Where it stood in its batch, so a later page can say what of the batch was never sent. */
+  index?: number
+  total?: number
+}
+
+/** This page's pictures in ComfyUI's hands. One at a time, but a list costs nothing. */
+let sent: SentPicture[] = []
+/** False when the tab would not keep the last write. */
+let sentKept = true
+
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
+
+function isSent(v: unknown): v is SentPicture {
+  return (
+    isObj(v) &&
+    typeof v.id === 'string' &&
+    typeof v.promptId === 'string' &&
+    !!v.promptId &&
+    typeof v.startedAt === 'number' &&
+    typeof v.label === 'string' &&
+    isObj(v.composition) &&
+    typeof v.seed === 'number' &&
+    typeof v.familyLabel === 'string' &&
+    typeof v.modelLabel === 'string' &&
+    (v.variant === null || v.variant === undefined || typeof v.variant === 'string') &&
+    isObj(v.passes) &&
+    Array.isArray(v.loras) &&
+    (v.sending === undefined || typeof v.sending === 'boolean') &&
+    (v.index === undefined || typeof v.index === 'number') &&
+    (v.total === undefined || typeof v.total === 'number')
+  )
+}
+
+/** The saved pictures as written, or null when there are none or they cannot be read. */
+export function readSent(raw: string | null): { writer: string; released: boolean; jobs: SentPicture[] } | null {
+  let v: unknown
+  try {
+    v = JSON.parse(raw ?? 'null')
+  } catch {
+    return null
+  }
+  if (!isObj(v) || !Array.isArray(v.jobs)) return null
+  return {
+    writer: typeof v.writer === 'string' ? v.writer : '',
+    released: v.released === true,
+    jobs: v.jobs.filter(isSent),
+  }
+}
+
+/** Write this page's pictures, or clear them when none are out. `released` says the page is going. */
+function saveSent(released = false): void {
+  if (sent.length) {
+    sentKept = tabStore.set(SENT_KEY, JSON.stringify({ writer: PAGE, released, jobs: sent }))
+  } else {
+    tabStore.remove(SENT_KEY)
+    sentKept = true
+  }
+}
+
+function saveLeftSent(): void {
+  if (press.left.length) tabStore.set(LEFT_SENT_KEY, JSON.stringify({ jobs: press.left }))
+  else tabStore.remove(LEFT_SENT_KEY)
+}
+
+function noteSent(job: SentPicture): void {
+  sent = [...sent.filter((j) => j.id !== job.id), job]
+  saveSent()
+}
+
+/**
+ * Keep the picture on the press for the tab under `promptId`, marked
+ * `sending` until ComfyUI has said it has it.
+ */
+function keepSent(plan: RunPlan, promptId: string, sending: boolean): void {
+  const job = press.job
+  if (!job) return
+  noteSent({
+    id: job.id,
+    promptId,
+    startedAt: job.startedAt,
+    label: plan.label,
+    ...(sending ? { sending: true } : {}),
+    index: job.index,
+    total: job.total,
+    composition: plan.composition,
+    seed: plan.seed,
+    familyLabel: plan.familyLabel,
+    modelLabel: plan.modelLabel,
+    variant: plan.variant,
+    passes: plan.passes,
+    loras: plan.loras,
+  })
+}
+
+/**
+ * What the page before this one never sent of the batch a picked-up picture
+ * belonged to, in a line, or null when it was the last of its batch or its
+ * place is not known. The rest of a batch lives only in the page sending it,
+ * so a reload loses it. The next page showed the picture it picked up as 1 of
+ * 1 and said nothing more, and the reader took the whole batch to have run.
+ */
+export function batchRestLine(index: number | undefined, total: number | undefined): string | null {
+  if (index === undefined || total === undefined) return null
+  if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || total <= index) return null
+  const first = index + 1
+  const one = first === total
+  const which = one ? `Picture ${total} was` : `Pictures ${first} ${total === first + 1 ? 'and' : 'to'} ${total} were`
+  const it = one ? 'it' : 'them'
+  return `The picture picked up from the page before this one was number ${index} of a batch of ${total}. ${which} never sent: the page reloaded before it got to ${it}, and nothing has sent ${it} since. Make ${it} again from the desk if you want ${it}.`
+}
+
+/** Done, failed, stopped or lost: nothing is left for a later page to follow. */
+function settleSent(id: string): void {
+  if (!sent.some((j) => j.id === id)) return
+  sent = sent.filter((j) => j.id !== id)
+  saveSent()
+}
+
+/** The same file, as ComfyUI serves it. */
+function sameFile(a: FileRef, b: FileRef): boolean {
+  return a.filename === b.filename && (a.subfolder ?? '') === (b.subfolder ?? '') && (a.type || 'output') === (b.type || 'output')
+}
+
+/**
+ * The record that already names this file, when ComfyUI answered from its
+ * cache. A graph identical to one it has run (a reused seed and nothing
+ * changed) comes back in the time it takes to look it up, with the file it
+ * wrote last time under a new prompt id. Filed again, it made a second card
+ * and edition number for one file, and its lookup time went into the timing
+ * line as a picture that took a tenth of a second. Only a file ComfyUI says
+ * was cached is matched: a file name reused after the old file was deleted is
+ * a new picture, and is filed as one.
+ */
+export function cachedRecordFor(file: OutputFile, records: readonly HistoryEntry[]): HistoryEntry | null {
+  if (file.cached !== true) return null
+  return records.find((r) => sameFile(r.file, file)) ?? null
+}
+
+/**
+ * How long ComfyUI took, from when it began running the picture to when the
+ * answer came back. Zero, which files as not timed, when the start was never
+ * seen: counted from the press instead, it would include every job that was
+ * in front of this one.
+ */
+export function ranFor(ranAt: number | null, finishedAt: number): number {
+  return ranAt != null && finishedAt >= ranAt ? finishedAt - ranAt : 0
+}
+
+/** ComfyUI's own start and end for a prompt, from its history, or 0 when it has none to give. */
+async function timedByComfy(promptId: string): Promise<number> {
+  if (!promptId) return 0
+  try {
+    const past = await fetchPastRun(promptId)
+    if (past?.startedAt != null && past.finishedAt != null && past.finishedAt >= past.startedAt) {
+      return past.finishedAt - past.startedAt
+    }
+  } catch {
+    /* no answer is no timing, not a failed picture */
+  }
+  return 0
+}
+
+/**
+ * Put a finished picture on the plate: the record ComfyUI's cache points back
+ * to, or a new record filed from the plan. False when the job wrote no file.
+ */
+function landPicture(files: OutputFile[], filing: Filing, promptId: string, durationMs: number, jobId: string): boolean {
+  const picture = files.find((f) => f.kind === 'image') ?? files[0] ?? null
+  if (!picture) {
+    emit({
+      fault: { message: NO_FILE, cancelled: false, lost: false, node: null, nodeType: null, detail: null },
+    })
+    patchJob({ status: 'error', finishedAt: Date.now() })
+    return false
+  }
+  const known = cachedRecordFor(picture, allRecords())
+  if (known) {
+    // The picture already on file, with its own real time. No receipt: a
+    // lookup is not a run.
+    emit({ results: [known, ...press.results.filter((r) => r.id !== known.id)], current: known })
+    patchJob({ status: 'done', pct: 1, stage: 'Done', finishedAt: Date.now() })
+    return true
+  }
+  const record = recordOf(filing.composition, {
+    file: picture,
+    files: files.length > 1 ? files : undefined,
+    kind: picture.kind,
+    promptId,
+    durationMs,
+    seed: filing.seed,
+    familyLabel: filing.familyLabel,
+    modelLabel: filing.modelLabel,
+    variant: filing.variant,
+    passes: filing.passes,
+    loras: filing.loras,
+  })
+  // A full or unwritable archive must never present as a failed picture:
+  // the file is on disk either way, so show it and carry on.
+  let entry: HistoryEntry
+  try {
+    entry = fileRecord(record)
+  } catch {
+    entry = { ...record, id: `unfiled-${jobId}`, no: 0, at: record.at ?? Date.now() }
+  }
+  emit({
+    results: [entry, ...press.results],
+    current: entry,
+    // A picture whose run was not timed leaves the last receipt alone.
+    lastMs: durationMs > 0 ? durationMs : press.lastMs,
+  })
+  patchJob({ status: 'done', pct: 1, stage: 'Done', finishedAt: Date.now() })
+  return true
 }
 
 /**
@@ -527,23 +843,50 @@ export function startRuns(plans: RunPlan[]) {
   if (driving || !plans.length) return
   queue = [...plans]
   stopped = false
+  // A new press answers what the last page never sent, so the line goes.
+  if (press.unsent) emit({ unsent: null })
   void drive()
+}
+
+/**
+ * The hold on the screen while the rest of a batch waits in the page. It is
+ * let go the moment ComfyUI has the last picture (see onProgress), not when
+ * that picture lands: from then on nothing waits here, a picture ComfyUI has
+ * goes on while the phone sleeps and is kept for the tab (SENT_KEY), and
+ * a phone left on the table kept its screen on through the whole of the last
+ * render for nothing.
+ */
+let awake: (() => void) | null = null
+
+function letScreenSleep(): void {
+  awake?.()
+  awake = null
 }
 
 async function drive() {
   driving = true
   let index = 0
   const total = queue.length
+  // The rest of a batch is sent from this page, one picture at a time, and a
+  // phone that locks its screen sends nothing more until it wakes. Where the
+  // browser allows it, the screen is kept on until the last picture is sent;
+  // the button says the rest in words either way (see RunButton's waitingLine).
+  awake = total > 1 ? holdAwake('pictures batch') : null
 
   try {
     while (queue.length && !stopped) {
       const plan = queue.shift()!
       index += 1
       const startedAt = Date.now()
+      const jobId = `${startedAt.toString(36)}-${index}`
+      // The prompt's number, made here so the picture can be kept for the tab
+      // under it before it goes (see SENT_KEY), and looked up by a later page
+      // if this one goes before ComfyUI answers.
+      const sendAs = newPromptId()
       emit({
         fault: null,
         job: {
-          id: `${startedAt.toString(36)}-${index}`,
+          id: jobId,
           promptId: null,
           status: 'submitting',
           stage: 'Sending the job',
@@ -556,61 +899,19 @@ async function drive() {
           total,
           startedAt,
           finishedAt: null,
+          ranAt: null,
         },
       })
+      keepSent(plan, sendAs, true)
 
       // run() also rejects when ComfyUI forgets the prompt, as after a
       // restart mid job, so this await always returns and the desk is freed.
       try {
-        const files = await run(plan.graph, (ev) => onProgress(ev, plan))
-        const picture = files.find((f) => f.kind === 'image') ?? files[0] ?? null
-        const durationMs = Date.now() - startedAt
-        if (!picture) {
-          emit({
-            fault: {
-              message: NO_FILE,
-              cancelled: false,
-              lost: false,
-              node: null,
-              nodeType: null,
-              detail: null,
-            },
-          })
-          patchJob({ status: 'error', finishedAt: Date.now() })
-          continue
-        }
-        const record = recordOf(plan.composition, {
-          file: picture,
-          files: files.length > 1 ? files : undefined,
-          kind: picture.kind,
-          promptId: press.job?.promptId ?? '',
-          durationMs,
-          seed: plan.seed,
-          familyLabel: plan.familyLabel,
-          modelLabel: plan.modelLabel,
-          variant: plan.variant,
-          passes: plan.passes,
-          loras: plan.loras,
-        })
-        // A full or unwritable archive must never present as a failed picture:
-        // the file is on disk either way, so show it and carry on.
-        let entry: HistoryEntry
-        try {
-          entry = fileRecord(record)
-        } catch {
-          entry = {
-            ...record,
-            id: `unfiled-${startedAt.toString(36)}`,
-            no: 0,
-            at: record.at ?? Date.now(),
-          }
-        }
-        emit({
-          results: [entry, ...press.results],
-          current: entry,
-          lastMs: durationMs,
-        })
-        patchJob({ status: 'done', pct: 1, stage: 'Done', finishedAt: Date.now() })
+        const files = await run(plan.graph, (ev) => onProgress(ev, plan), { promptId: sendAs })
+        const finishedAt = Date.now()
+        const promptId = press.job?.promptId ?? ''
+        const durationMs = ranFor(press.job?.ranAt ?? null, finishedAt) || (await timedByComfy(promptId))
+        if (!landPicture(files, plan, promptId, durationMs, jobId)) continue
       } catch (err) {
         const fault = faultOf(err)
         emit({ fault })
@@ -618,6 +919,8 @@ async function drive() {
         // A rejected queue or a stopped job ends the whole batch: three more of
         // the same mistake helps nobody.
         break
+      } finally {
+        settleSent(jobId)
       }
     }
   } finally {
@@ -626,6 +929,7 @@ async function drive() {
     queue = []
     driving = false
     stopped = false
+    letScreenSleep()
   }
 }
 
@@ -637,11 +941,18 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
     // here, the job used to go on and render, and be filed, as if nobody had
     // asked; now it is cancelled, and run() settles it as a stop.
     if (stopped) {
-      patchJob({ promptId: ev.promptId, stage: 'Stopping' })
+      // The cancel below ends it, so nothing is left for a later page to
+      // follow: kept, it would be picked up and read as lost to a restart.
+      settleSent(press.job.id)
+      patchJob({ promptId: ev.promptId, stage: STOPPING })
       void cancelJob(ev.promptId).catch(() => undefined)
       return
     }
     patchJob({ promptId: ev.promptId, status: 'queued', stage: 'Queued' })
+    // From here the picture is ComfyUI's, and outlives this page.
+    keepSent(plan, ev.promptId, false)
+    // With the last picture in ComfyUI's hands nothing waits in the page.
+    if (!queue.length) letScreenSleep()
     return
   }
   if (ev.phase === 'preview') {
@@ -653,12 +964,168 @@ function onProgress(ev: ProgressEvent, plan: RunPlan) {
   const cls = ev.node ? plan.graph[ev.node]?.class_type : null
   // A job asked to stop may still report a step or two before the cancel
   // lands. It says it is stopping until it has.
-  const stage = stopped ? 'Stopping' : stageFor(cls, ev.value, ev.max)
+  const stage = stopped ? STOPPING : stageFor(cls, ev.value, ev.max)
   const sampling = ev.max > 1
   const pct = sampling
     ? clamp(ev.value / ev.max, press.job.pct, 0.97)
     : Math.max(press.job.pct, 0.02)
-  patchJob({ status: 'running', stage, value: ev.value, max: ev.max, pct })
+  patchJob({ status: 'running', stage, value: ev.value, max: ev.max, pct, ranAt: press.job.ranAt ?? Date.now() })
+}
+
+/**
+ * Follow a picture an earlier page in this tab sent, to its end, and file it.
+ *
+ * The socket that would have reported it belonged to that page, so it is
+ * followed through ComfyUI's job list instead (followPrompt). It is the desk's
+ * own job meanwhile: the press shows it, the section bar counts it as this
+ * app's, and Stop cancels it.
+ *
+ * One that page was still sending is looked for under its number, and counts
+ * as queued only once ComfyUI says it has it. If ComfyUI has nothing under
+ * that number it was never sent, and it is not sent again from here: the
+ * reader decides whether to make it.
+ */
+async function followSent(job: SentPicture): Promise<void> {
+  driving = true
+  stopped = false
+  const rest = batchRestLine(job.index, job.total)
+  /** ComfyUI has said it has the picture, so gone later is gone, not unsent. */
+  let arrived = !job.sending
+  emit({
+    fault: null,
+    ...(rest ? { unsent: rest } : {}),
+    job: {
+      id: job.id,
+      promptId: job.promptId,
+      status: job.sending ? 'submitting' : 'queued',
+      stage: job.sending ? 'Asking ComfyUI whether it got there' : 'Picked up from the page before this one',
+      value: 0,
+      max: 0,
+      pct: 0,
+      previewUrl: null,
+      label: job.label,
+      // One of one, whatever its place in its batch: the rest of that batch
+      // went with the page (the unsent line says so), and counted here the
+      // button would say they wait to be sent from this one.
+      index: 1,
+      total: 1,
+      startedAt: job.startedAt,
+      finishedAt: null,
+      ranAt: null,
+    },
+  })
+  let outcome: Followed
+  try {
+    outcome = await followPrompt(job.promptId, {
+      onState: (s) => {
+        // The first word from ComfyUI settles the doubt the mark carried: drop
+        // it from the saved entry too, so a page after this one follows a
+        // picture that got there, not one that may never have.
+        if (!arrived && job.sending) {
+          const { sending: _sending, ...landed } = job
+          noteSent(landed)
+        }
+        arrived = true
+        const cur = press.job
+        if (!cur || cur.id !== job.id) return
+        patchJob({
+          status: s,
+          stage: stopped ? STOPPING : s === 'queued' ? 'Queued' : 'Drawing',
+          pct: s === 'running' ? Math.max(cur.pct, 0.02) : cur.pct,
+        })
+      },
+    })
+  } catch (err) {
+    outcome = { status: 'error', message: err instanceof Error ? err.message : String(err), node: null, nodeType: null }
+  }
+  try {
+    if (outcome.status === 'done') {
+      // Timed by ComfyUI itself: this page never saw it begin.
+      landPicture(outcome.files, job, job.promptId, await timedByComfy(job.promptId), job.id)
+    } else if (outcome.status === 'cancelled' || (outcome.status === 'lost' && stopped)) {
+      // Stop takes a waiting job out of the queue with no record left behind,
+      // so gone after a stop is the stop landing.
+      emit({ fault: faultOf({ message: 'Job stopped. Nothing was saved.', cancelled: true }) })
+      patchJob({ status: 'cancelled', finishedAt: Date.now() })
+    } else if (outcome.status === 'lost') {
+      emit({
+        fault: faultOf({
+          // Still being sent when that page went, and never seen in ComfyUI:
+          // not a restart, and no file to look for.
+          message: arrived
+            ? 'ComfyUI no longer has any record of the picture the page before this one sent, which usually means it restarted. If it finished first, its file is on disk: open the Archive and press “Look for files with no record”.'
+            : NOT_SENT,
+          lost: true,
+        }),
+      })
+      patchJob({ status: 'error', finishedAt: Date.now() })
+    } else {
+      emit({
+        fault: { message: outcome.message, cancelled: false, lost: false, node: outcome.node, nodeType: outcome.nodeType, detail: null },
+      })
+      patchJob({ status: 'error', finishedAt: Date.now() })
+    }
+  } finally {
+    settleSent(job.id)
+    driving = false
+    stopped = false
+  }
+}
+
+/** Take pictures up as this page's own, and follow them one after another. */
+function takeUp(jobs: SentPicture[]): void {
+  sent = [...sent.filter((j) => !jobs.some((t) => t.id === j.id)), ...jobs]
+  saveSent()
+  void (async () => {
+    for (const job of jobs) await followSent(job)
+  })()
+}
+
+/**
+ * Take up what the last page in this tab left on the press, once, when the
+ * module loads. The saved entry is cleared either way: taken up, it is written
+ * again as this page's own; left alone, it moves to the desk's question (see
+ * LEFT_SENT_KEY), so a copy another tab is following is never taken up later
+ * by accident. It used to be dropped without a word, on the reasoning that it
+ * was a copied tab's; but an iPhone closes a tab in the background without
+ * saying it is going, and so does a crashed page, and that picture then went
+ * on with no Stop and reached the Archive only through its look for files
+ * with no record, bare if ComfyUI had restarted meanwhile.
+ */
+function restoreSent(): void {
+  const saved = readSent(tabStore.get(SENT_KEY))
+  const left = readSent(tabStore.get(LEFT_SENT_KEY))
+  tabStore.remove(SENT_KEY)
+  let kept = left?.jobs ?? []
+  let take: SentPicture[] = []
+  if (saved?.jobs.length) {
+    const discarded =
+      typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
+    if (saved.released || discarded) take = saved.jobs
+    else kept = [...kept, ...saved.jobs.filter((s) => !kept.some((l) => l.id === s.id))]
+  }
+  emit({ left: kept })
+  saveLeftSent()
+  if (take.length) takeUp(take)
+}
+
+/**
+ * Follow what an earlier page sent, from this page, at the reader's word.
+ * The press takes one picture at a time, so only while it is free.
+ */
+export function followLeftSent(): void {
+  if (driving || !press.left.length) return
+  const jobs = press.left
+  emit({ left: [] })
+  saveLeftSent()
+  takeUp(jobs)
+}
+
+/** Stop offering them. ComfyUI goes on making them. */
+export function forgetLeftSent(): void {
+  if (!press.left.length) return
+  emit({ left: [] })
+  saveLeftSent()
 }
 
 async function stopRun() {
@@ -671,10 +1138,10 @@ async function stopRun() {
     // busy until then. Marked cancelled here, the Run button came back while
     // the send was still in flight, did nothing when pressed, and the job
     // went on to render.
-    patchJob({ stage: 'Stopping' })
+    patchJob({ stage: STOPPING })
     return
   }
-  patchJob({ stage: 'Stopping' })
+  patchJob({ stage: STOPPING })
   try {
     await cancelJob(id)
   } catch {
@@ -702,6 +1169,77 @@ function showResult(entry: HistoryEntry) {
   emit({ current: entry })
 }
 
+/**
+ * What the plate shows when nothing has been made or chosen since the page
+ * loaded: the newest picture this desk filed that is still on disk. The plate
+ * used to come up empty after every reload, and the face, hand and larger
+ * render passes, which only the plate offers, could not be reached for any
+ * picture made before it, or on another device.
+ */
+export function plateFallback(records: readonly HistoryEntry[]): HistoryEntry | null {
+  return records.find((r) => r.desk === DESK && r.kind === 'image' && !r.missing) ?? null
+}
+
+/**
+ * How often the desk asks how many jobs are ahead in ComfyUI's queue, and the
+ * asking itself. The next ask is scheduled only once the last one answered: on
+ * a fixed interval, a ComfyUI too slow to answer (a machine swapping just
+ * before earlyoom acts) stacked a new request every five seconds until they
+ * held every connection the browser allows the page, and the archive, the
+ * thumbnails and the plate all waited behind them.
+ */
+export function watchAhead(onAhead: (n: number) => void, everyMs = 5000): () => void {
+  let alive = true
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const poll = async () => {
+    try {
+      const page = await listJobs({ status: ['pending', 'in_progress'], limit: 20 })
+      if (!alive) return
+      const mine = press.job?.promptId
+      onAhead(page.jobs.filter((j) => j.id !== mine).length)
+    } catch {
+      if (alive) onAhead(0)
+    } finally {
+      if (alive) timer = setTimeout(() => void poll(), everyMs)
+    }
+  }
+  void poll()
+  return () => {
+    alive = false
+    if (timer) clearTimeout(timer)
+  }
+}
+
+if (typeof window !== 'undefined') {
+  // A reload or a close says it is going, so the next page in the tab takes
+  // the picture up at once.
+  window.addEventListener('pagehide', () => {
+    if (sent.length) saveSent(true)
+  })
+  // A phone hides the page (and says pagehide) without always ending it. Back
+  // in view, the picture is still this page's to follow, unless a later page
+  // in the tab took it over meanwhile, which the pageshow below deals with.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !sent.length) return
+    if (readSent(tabStore.get(SENT_KEY))?.writer === PAGE) saveSent()
+  })
+  // Back from the browser's cache. If another page ran in this tab meanwhile,
+  // it took this picture up and has followed or filed it, so this page's copy
+  // must not file it again: the page starts over, as a reload does.
+  window.addEventListener('pageshow', (e) => {
+    if (!e.persisted || !sent.length) return
+    if (sentKept && readSent(tabStore.get(SENT_KEY))?.writer !== PAGE) {
+      sent = []
+      window.location.reload()
+      return
+    }
+    saveSent()
+  })
+}
+
+// Last in the engine, so everything it calls is defined.
+restoreSent()
+
 // ---------------------------------------------------------------------------
 // Small shared pieces
 // ---------------------------------------------------------------------------
@@ -720,9 +1258,13 @@ const store = deskStore(DESK)
  * room dropped them and the next press made a different picture from the one
  * the reader had loaded, with nothing on screen to say so.
  *
- * Memory only, never localStorage. An override is a statement about this
- * session's picture (see useOverrides), so a reload still starts clean; a walk
- * to another room and back does not.
+ * Kept for this tab, in its session storage, never in localStorage. An
+ * override is a statement about this session's picture (see useOverrides), so
+ * another tab and a later session start clean. A reload of this tab does not:
+ * a phone reloads a tab it put in the background, and "Use these settings"
+ * then kept the record's prompt in the field while the pin, the values set by
+ * hand, the seed and the notice saying so all went, so the next press made a
+ * different picture from a desk that still looked loaded.
  */
 type Held = {
   look: Intent
@@ -740,7 +1282,67 @@ type Held = {
   mode: Mode
 }
 
-let held: Held | null = null
+const HELD_KEY = 'switchgen.pictures.held.v1'
+
+const INTENT_IDS = new Set<string>(INTENTS.map((i) => i.id))
+const ANATOMY_IDS = new Set<string>(ANATOMY_LEVELS.map((a) => a.id))
+
+/**
+ * What the desk was set to, read back from the tab's storage. Each field is
+ * checked, since whatever wrote it may be an older build: a look, a detail
+ * setting, a mode or a seed that cannot be read discards the whole of it, and
+ * the desk starts as it would have; a bad pin, notice or override is dropped
+ * on its own.
+ */
+export function parseHeld(raw: string | null): Held | null {
+  let v: unknown
+  try {
+    v = JSON.parse(raw ?? 'null')
+  } catch {
+    return null
+  }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+  const h = v as Record<string, unknown>
+  if (typeof h.look !== 'string' || !INTENT_IDS.has(h.look)) return null
+  if (typeof h.anatomy !== 'string' || !ANATOMY_IDS.has(h.anatomy)) return null
+  if (typeof h.mode !== 'string' || !MODES.images.includes(h.mode as Mode)) return null
+  if (typeof h.seed0 !== 'number' || !Number.isFinite(h.seed0) || h.seed0 < 0) return null
+  return {
+    look: h.look as Intent,
+    anatomy: h.anatomy as AnatomyLevel,
+    anatomySaid: h.anatomySaid === true,
+    pinned: typeof h.pinned === 'string' && h.pinned ? h.pinned : null,
+    overrides: sanitiseOverrides(h.overrides),
+    seed0: Math.floor(h.seed0),
+    correction: typeof h.correction === 'string' && h.correction ? h.correction : null,
+    mode: h.mode as Mode,
+  }
+}
+
+let held: Held | null = parseHeld(tabStore.get(HELD_KEY))
+
+/**
+ * The region bench as the reader left it, for the next visit to the desk.
+ *
+ * Memory only: the bench is the picture in front of the reader, and a mask is
+ * too large and too particular to keep past the page. App mounts one room at
+ * a time, and a look at the Archive or at a clip on the Video desk closed the
+ * bench and threw away the model choice, the region add-ons and the pass on
+ * its way, so a pass that landed meanwhile came back as an ordinary picture
+ * with no comparison. The strokes and the region words are kept by the bench
+ * itself (components/refine) and forgotten with this when the bench closes.
+ */
+type Bench = {
+  source: RefineSource
+  result: HistoryEntry | null
+  pick: string | null
+  picked: string[]
+  /** The press job the region pass was queued as, and whether its result is still awaited. */
+  job: string | null
+  awaiting: boolean
+}
+
+let bench: Bench | null = null
 
 /**
  * The trained prefix to file on a record, when the prompt sent really opened
@@ -799,13 +1401,18 @@ type RegionPicture = Pick<
 >
 
 /**
- * A finished picture, copied into ComfyUI's input folder and measured, ready
- * for a refine pass. Both halves are needed before anything can be queued:
- * LoadImage reads the input folder, and the crop arithmetic needs real pixels.
+ * A finished picture, named for LoadImage and measured, ready for a refine
+ * pass. Both halves are needed before anything can be queued: the graph needs
+ * the file, and the crop arithmetic needs real pixels.
  */
 type RefineSource = {
-  /** Filename in ComfyUI's input folder, for LoadImage. */
+  /**
+   * The file as LoadImage takes it: an output by its annotated path, read
+   * where it lies, or an upload by its name in the input folder.
+   */
   name: string
+  /** The output file, when the picture is one of ours, so its record can point back at it. */
+  ref?: FileRef
   /** Where the browser shows it from, which is still the output folder. */
   url: string
   width: number
@@ -977,8 +1584,8 @@ function editRecipe(input: {
     passes: passesFor(
       capabilities,
       {
-        face: 'Re renders every detected face at 768 and pastes it back.',
-        hand: 'Re renders every detected hand with more freedom than a face. Not measured here.',
+        face: detailSentence('face'),
+        hand: `${detailSentence('hand')} It is given more freedom than a face. Not measured here.`,
         refine: 'Draw a mask over a region and it is cropped, upscaled and rendered alone.',
         hires: 'Renders the same picture larger, at low denoise.',
       },
@@ -1088,9 +1695,10 @@ export function Pictures() {
    */
   const [seed0, setSeed0] = useState(() => held?.seed0 ?? randomSeed())
 
-  // Kept for the next visit. See `held`.
+  // Kept for the next visit, and for a reload of this tab. See `held`.
   useEffect(() => {
     held = { look, anatomy, anatomySaid, pinned, overrides: ov.value, seed0, correction, mode: c.mode }
+    tabStore.set(HELD_KEY, JSON.stringify(held))
   }, [look, anatomy, anatomySaid, pinned, ov.value, seed0, correction, c.mode])
 
   /**
@@ -1118,14 +1726,21 @@ export function Pictures() {
     }
   }
 
-  const [refining, setRefining] = useState(false)
-  const [refineSource, setRefineSource] = useState<RefineSource | null>(null)
-  const [refineResult, setRefineResult] = useState<HistoryEntry | null>(null)
+  // The bench comes back as it was left on the last visit (see `bench`).
+  const [refining, setRefining] = useState(() => bench !== null)
+  const [refineSource, setRefineSource] = useState<RefineSource | null>(() => bench?.source ?? null)
+  const [refineResult, setRefineResult] = useState<HistoryEntry | null>(() => bench?.result ?? null)
   const [refineFault, setRefineFault] = useState<string | null>(null)
   const [openingRefine, setOpeningRefine] = useState(false)
   const refineToken = useRef(0)
-  /** True between queueing a refine and its result landing on the plate. */
-  const awaitingRefine = useRef(false)
+  /**
+   * True between queueing a refine and its result landing on the plate. Back
+   * from another room, it is still awaited only while the press holds the job
+   * it was queued as; the landing effect below then settles it either way.
+   */
+  const awaitingRefine = useRef(
+    !!bench?.awaiting && !!bench.job && pressSnapshot().job?.id === bench.job,
+  )
   /**
    * The press job the region pass was queued as.
    *
@@ -1136,9 +1751,9 @@ export function Pictures() {
    * next ordinary picture was then shown as the refined result, compared
    * against the source and offered as the next region to work on.
    */
-  const refineJob = useRef<string | null>(null)
+  const refineJob = useRef<string | null>(bench?.job ?? null)
   /** The region add-ons the reader ticked on the bench, by filename. None until they do. */
-  const [refinePicked, setRefinePicked] = useState<string[]>([])
+  const [refinePicked, setRefinePicked] = useState<string[]>(() => bench?.picked ?? [])
 
   const fileInput = useRef<HTMLInputElement | null>(null)
   const promptRef = useRef<HTMLTextAreaElement | null>(null)
@@ -1231,25 +1846,7 @@ export function Pictures() {
   }, [])
 
   // --- what is in front of us in the single queue -------------------------
-  useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const page = await listJobs({ status: ['pending', 'in_progress'], limit: 20 })
-        if (!alive) return
-        const mine = press.job?.promptId
-        setAhead(page.jobs.filter((j) => j.id !== mine).length)
-      } catch {
-        if (alive) setAhead(0)
-      }
-    }
-    void poll()
-    const timer = setInterval(poll, 5000)
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
-  }, [])
+  useEffect(() => watchAhead(setAhead), [])
 
   // --- styles -------------------------------------------------------------
   const styles = useMemo(() => cat?.styles ?? [], [cat])
@@ -1360,11 +1957,46 @@ export function Pictures() {
     const def = familyOwning(pinned)
     return !def || !(IMG2IMG[def.id] ?? deriveImg2Img(def))
   }, [pinned, usingSource, c.mode])
+
+  /**
+   * The weight files the ranking may choose from: every file ComfyUI lists,
+   * less those of a picture family that cannot load here for a missing file.
+   *
+   * decide() was handed every listed file, and ranks on memory alone, so a
+   * family whose text encoder or VAE ComfyUI does not list was picked, counted
+   * as runnable and queued, and ComfyUI refused the job over the missing file,
+   * while the catalogue had already worked out the plain "needs" sentence and
+   * shown it nowhere. That sentence is now in More instead (see unloadable). A
+   * file held back only for memory stays in: the ranking judges memory again
+   * on each visit, against a fresher reading than the catalogue's.
+   */
+  const cannotLoad = useMemo(
+    () => new Set((cat?.unavailable ?? []).filter((u) => u.files).map((u) => u.name)),
+    [cat],
+  )
+  const rankable = useMemo(
+    () => (cat ? cat.installed.filter((m) => !cannotLoad.has(m)) : []),
+    [cat, cannotLoad],
+  )
+  /** The pinned file cannot load here, or is not installed at all: said, and set aside. */
+  const pinUnloadable = !!pinned && !!cat && !rankable.includes(pinned)
+
   /** Said for as long as the pin is set aside, and gone the moment it is not. */
-  const pinNote =
-    pinSetAside && pinned
+  const pinNote = pinUnloadable && pinned
+    ? `${PLAIN_NAMES[pinned] ?? titleFromFilename(pinned)} is pinned, but ${
+        pinBlockedWhy(pinned, (cat?.unavailable ?? []).filter((u) => u.files))
+      }, so the desk chooses another model until it can load.`
+    : pinSetAside && pinned
       ? `${PLAIN_NAMES[pinned] ?? titleFromFilename(pinned)} is pinned, and it cannot work from a picture, so the desk chooses another model while a picture is in the well. Choose From words and the pin is used again.`
       : null
+
+  /** The files More lists as unable to load here, for the mode the desk is on. */
+  const unloadable: Unloadable[] = useMemo(() => {
+    const want = c.mode === 'edit' ? 'edit' : 'image'
+    return (cat?.unavailable ?? [])
+      .filter((u) => u.files && familyOwning(u.name)?.mode === want)
+      .map((u) => ({ model: u.name, label: PLAIN_NAMES[u.name] ?? titleFromFilename(u.name), why: u.why }))
+  }, [cat, c.mode])
 
   const recipe: Recipe = useMemo(() => {
     if (!cat) {
@@ -1399,7 +2031,7 @@ export function Pictures() {
       sourceImage: usingSource ? sourceName : undefined,
       hardware,
       sizes: cat.sizes,
-      installed: pinned && !pinSetAside ? [pinned] : cat.installed,
+      installed: pinned && !pinSetAside && !pinUnloadable ? [pinned] : rankable,
       loras: lib,
       seed: seed0,
       // The reader's own decisions, threaded in so they survive this recompute.
@@ -1408,8 +2040,8 @@ export function Pictures() {
       addOns: { accepted: c.addOnsAccepted, declined: c.addOnsDeclined },
       passBlocks: cat.passBlocks,
     })
-  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, pinSetAside, lib, seed0, editStyle,
-      c.addOnsAccepted, c.addOnsDeclined, hardware])
+  }, [cat, c.mode, c.prompt, look, anatomy, usingSource, sourceName, pinned, pinSetAside, pinUnloadable, rankable,
+      lib, seed0, editStyle, c.addOnsAccepted, c.addOnsDeclined, hardware])
 
   const plan = recipe.ok ? recipe : null
 
@@ -1551,15 +2183,18 @@ export function Pictures() {
     })
   }, [])
 
-  // A picture adopted from the archive lives in the OUTPUT folder; LoadImage
-  // reads the input folder, so it is copied across once, here.
+  // A picture adopted from the archive lives in the OUTPUT folder, and
+  // LoadImage reads it there by its annotated path ("x.png [output]"), as the
+  // reel's key frames already do. It used to be fetched to the browser and
+  // uploaded back into the input folder: over a phone's uplink that was
+  // seconds each way for every pick, with the button waiting, and a copy left
+  // behind in the input folder each time.
   useEffect(() => {
     const s = c.source
     if (!s || s.name || !s.ref) return
     // LoadImage reads a still, and a draft saved by an older build can hold a
-    // clip here. Copied across, the whole clip was uploaded for a run that
-    // could only fail on it. The mode is left alone so the well stays on
-    // screen to say why it is empty.
+    // clip here. Sent on, the run could only fail on it. The mode is left
+    // alone so the well stays on screen to say why it is empty.
     if (VIDEO_EXT.test(s.ref.filename)) {
       store.patch({ source: null })
       setSourceError('It is a clip, and this desk starts only from a still. Choose a picture instead.')
@@ -1567,26 +2202,7 @@ export function Pictures() {
     }
     // A picture chosen after a refusal is a fresh start; the old notice goes.
     setSourceError(null)
-    let alive = true
-    setUploading(true)
-    ;(async () => {
-      try {
-        const res = await fetch(fileUrl(s.ref!))
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const blob = await res.blob()
-        const name = await uploadImage(blob, s.ref!.filename)
-        if (alive) store.patch({ source: { ...store.get().source, ...s, name } })
-      } catch {
-        if (alive) {
-          setSourceError('We could not copy that picture into ComfyUI’s input folder. Try picking it again.')
-        }
-      } finally {
-        if (alive) setUploading(false)
-      }
-    })()
-    return () => {
-      alive = false
-    }
+    store.patch({ source: { ...s, name: annotatedRef(s.ref), previewUrl: s.previewUrl ?? fileUrl(s.ref) } })
   }, [c.source])
 
   // --- drag, drop, paste --------------------------------------------------
@@ -1727,9 +2343,11 @@ export function Pictures() {
   }, [])
 
   // The plate always reads the live record, so a star lands without a reload.
+  // With nothing made or chosen since the page loaded, it shows the newest
+  // picture on file, with its offers (see plateFallback).
   const current = useMemo(() => {
     const cur = state.current
-    if (!cur) return null
+    if (!cur) return plateFallback(records)
     return records.find((r) => r.id === cur.id) ?? cur
   }, [state, records])
 
@@ -1791,12 +2409,18 @@ export function Pictures() {
     }
   }, [])
 
-  /** The attached picture, read on request. One element, handed to whichever desk is up. */
-  const sourceReading = c.source?.name ? (
+  /**
+   * The attached picture, read on request. One element, handed to whichever
+   * desk is up. Read where the file is: an upload in the input folder, one of
+   * our outputs where it lies.
+   */
+  const sourceAt = c.source?.name ? sourceFile(c.source) : null
+  const sourceKind = sourceAt?.type === 'output' ? 'output' : 'input'
+  const sourceReading = sourceAt ? (
     <Reading
       compact
-      source={{ kind: 'input', rel: c.source.name }}
-      cacheKey={`input:${c.source.name}`}
+      source={{ kind: sourceKind, rel: relPath(sourceAt) }}
+      cacheKey={`${sourceKind}:${relPath(sourceAt)}`}
       arch={style ? archFor(style.def, style.model) : null}
       anatomy={anatomy}
       onAnatomy={(level) => {
@@ -1909,7 +2533,7 @@ export function Pictures() {
   )
 
   /** The reader's own pick, as `familyId::model`. Null means "the suggested one". */
-  const [refinePick, setRefinePick] = useState<string | null>(null)
+  const [refinePick, setRefinePick] = useState<string | null>(() => bench?.pick ?? null)
 
   const deskRefines = !!style && deriveRefine(style.def) !== null
 
@@ -2100,6 +2724,13 @@ export function Pictures() {
   const openRefine = useCallback(async (entry: RegionPicture, words?: string) => {
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
+    // The "Drawn by" choice and the ticked region add-ons were made for the
+    // picture the bench was on, as closeRefine says. The bench now comes back
+    // after a look at another room with them in place, so a picture handed
+    // over from the Archive was drawn by the model picked for the last one.
+    // A pass carried on from its own result loses nothing: that result files
+    // the model that drew it, which is then the suggested one.
+    setRefinePick(null)
     setRefinePicked([])
     setRefining(true)
     setRefineSource(null)
@@ -2112,13 +2743,13 @@ export function Pictures() {
         (await measure(url)) ??
         (entry.width && entry.height ? { width: entry.width, height: entry.height } : null)
       if (!measured) throw new Error('the size could not be read')
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const blob = await res.blob()
-      const name = await uploadImage(blob, entry.file.filename)
       if (refineToken.current !== token) return
       setRefineSource({
-        name,
+        // Read where it lies, as a picture taken from the archive is (see the
+        // source effect above). It used to be downloaded and uploaded back on
+        // every opening of the bench.
+        name: annotatedRef(entry.file),
+        ref: entry.file,
         url,
         width: measured.width,
         height: measured.height,
@@ -2130,9 +2761,7 @@ export function Pictures() {
     } catch (err) {
       if (refineToken.current !== token) return
       const why = err instanceof Error ? err.message : String(err)
-      setRefineFault(
-        `That picture could not be copied into ComfyUI’s input folder (${why}). A refine pass reads the source from there, so nothing can run until it lands.`,
-      )
+      setRefineFault(`That picture could not be opened for region editing (${why}).`)
     } finally {
       if (refineToken.current === token) setOpeningRefine(false)
     }
@@ -2141,36 +2770,31 @@ export function Pictures() {
   /**
    * Open the bench on the picture currently attached to the desk.
    *
-   * This is the upload route. A record from the archive goes through
-   * openRefine, which fetches it out of the OUTPUT folder and copies it into
-   * the input folder; an attached source is already in the input folder by the
-   * time the well shows it (see the copy effect above), so `source.name` is all
-   * LoadImage needs and there is nothing to upload again.
+   * An attached source is already named for LoadImage by the time the well
+   * shows it, an upload by its input-folder name and an archive picture by its
+   * annotated path, so `source.name` is all the graph needs and there is
+   * nothing to upload again.
    */
   const openRefineFromSource = useCallback(async (src: SourceRef, words?: string) => {
     if (!src.name) return
     const token = (refineToken.current += 1)
     awaitingRefine.current = false
+    // A new picture starts from the suggested model and no add-ons (see openRefine).
+    setRefinePick(null)
     setRefinePicked([])
     setRefining(true)
     setRefineSource(null)
     setRefineResult(null)
     setRefineFault(null)
     setOpeningRefine(true)
-    // Paint on the INPUT-FOLDER copy, not on the well's preview.
+    // Paint on the file the graph will read, not on the well's preview.
     //
-    // src.name is already the LoadImage filename, so this URL serves the exact
-    // bytes the graph will read, and it is a stable server URL. The well's
-    // previewUrl is a blob: object URL owned by the desk store, which Clear,
-    // paste and drop all revoke - out from under the bench, which does not own
-    // it. It is also absent entirely for an upload restored from localStorage,
-    // which would offer the link and then fault on it.
-    const cut = src.name.lastIndexOf('/')
-    const url = fileUrl(
-      cut === -1
-        ? { filename: src.name, subfolder: '', type: 'input' }
-        : { filename: src.name.slice(cut + 1), subfolder: src.name.slice(0, cut), type: 'input' },
-    )
+    // sourceFile resolves the LoadImage name to that file, so this URL serves
+    // the exact bytes the graph will read, and it is a stable server URL. The
+    // well's previewUrl can be a blob: object URL owned by the desk store,
+    // which Clear, paste and drop all revoke - out from under the bench, which
+    // does not own it.
+    const url = fileUrl(sourceFile(src) ?? { filename: src.name, subfolder: '', type: 'input' })
     try {
       // MEASURE THE FILE, never trust the declared size. A record files the size
       // the composer ASKED for, and a second pass upscales on the way to disk, so
@@ -2186,6 +2810,7 @@ export function Pictures() {
       const made = src.fromEntryId ? allRecords().find((r) => r.id === src.fromEntryId) : undefined
       setRefineSource({
         name: src.name,
+        ref: src.ref,
         url,
         width: measured.width,
         height: measured.height,
@@ -2250,10 +2875,39 @@ export function Pictures() {
     setOpeningRefine(false)
     // The "Drawn by" choice belongs to the picture it was made for. Left set,
     // it silently outranked the recipe for every region pass that followed.
-    // The ticked region add-ons are the same kind of choice.
+    // The ticked region add-ons are the same kind of choice, and so are the
+    // strokes and words the bench kept for the next visit.
     setRefinePick(null)
     setRefinePicked([])
+    forgetBench()
+    bench = null
   }, [])
+
+  // A record the Archive asked to see on the plate, with the passes the plate
+  // offers. The same one-shot handover; the bench, if it was left open, gives
+  // way to the plate the reader asked for.
+  useEffect(() => {
+    const handed = takePlateRequest()
+    if (!handed) return
+    closeRefine()
+    showResult(handed)
+  }, [closeRefine])
+
+  // Kept for the next visit, whatever changed: the refs move with the press
+  // job, so the press state is a dependency too. See `bench`.
+  useEffect(() => {
+    bench =
+      refining && refineSource
+        ? {
+            source: refineSource,
+            result: refineResult,
+            pick: refinePick,
+            picked: refinePicked,
+            job: refineJob.current,
+            awaiting: awaitingRefine.current,
+          }
+        : null
+  }, [refining, refineSource, refineResult, refinePick, refinePicked, state])
 
   /**
    * Queue one refine pass.
@@ -2317,6 +2971,7 @@ export function Pictures() {
           seed,
           source: {
             name: refineSource.name,
+            ref: refineSource.ref,
             previewUrl: refineSource.url,
             label: `region of ${refineSource.entryId || refineSource.name}`,
             width: refineSource.width,
@@ -2453,6 +3108,7 @@ export function Pictures() {
         onPinModel={setPinned}
         onCatalogueChange={() => load(true)}
         onDropAddOn={dropAddOn}
+        unloadable={unloadable}
         faultNode={state.fault?.node ?? null}
         onClose={() => settings.patch({ expert: false })}
       />
@@ -2514,6 +3170,9 @@ export function Pictures() {
             </Notice>
           </div>
         )}
+
+        {/* Pictures an earlier page sent, which this page will not follow on a guess */}
+        {state.left.length ? <LeftSent left={state.left} running={running} /> : null}
 
         {/*
           What you are doing is the first question, not a parameter. It sits
@@ -2633,6 +3292,14 @@ export function Pictures() {
             moreOpen={expert}
             onMoreOpenChange={(open) => settings.patch({ expert: open })}
           />
+        )}
+
+        {state.unsent && (
+          <div className="mt-5">
+            <Notice tone="warning" title="Not sent">
+              {state.unsent} <Link onClick={() => emit({ unsent: null })}>Dismiss</Link>
+            </Notice>
+          </div>
         )}
 
         {state.fault && (
@@ -2998,6 +3665,53 @@ function EditDesk({
 }
 
 /**
+ * Pictures the page before this one sent and went without handing on, put to
+ * the reader. Following one a tab copied from this one is still following
+ * would file it twice, and only the reader knows whether that tab is open.
+ */
+function LeftSent({ left, running }: { left: SentPicture[]; running: boolean }) {
+  const one = left.length === 1
+  const it = one ? 'it' : 'them'
+  const button = 'inline-flex items-center underline [@media(pointer:coarse)]:min-h-11'
+  return (
+    <div className="mb-4">
+      <Notice tone="warning" title={one ? 'A picture sent before this page' : 'Pictures sent before this page'}>
+        {one ? 'One picture was' : `${left.length} pictures were`} sent to ComfyUI from this tab by the page before
+        this one, which went away without handing {it} on, as happens when the phone closes a tab in the background, a
+        page crashes or a tab is copied.{' '}
+        {left.some((j) => j.sending)
+          ? `That page was still sending ${one ? 'it' : 'one of them'} when it went, so ComfyUI may never have had ${one ? 'it' : 'that one'}. `
+          : ''}
+        If this tab was copied from one that is still open, that one is following {it} already, and following from here
+        as well could file {it} twice.
+        <ul className="my-1 list-none p-0">
+          {left.map((j) => (
+            <li key={j.id} className="truncate italic">
+              {j.composition.prompt || 'No words'} · {j.modelLabel || j.familyLabel}
+            </li>
+          ))}
+        </ul>
+        {running ? (
+          <>Once the picture on the press is done, {it} can be followed from here. </>
+        ) : (
+          <>
+            <button className={button} onClick={followLeftSent}>
+              Follow {it} from here
+            </button>{' '}
+            ·{' '}
+          </>
+        )}
+        <button className={button} onClick={forgetLeftSent}>
+          Forget {it}
+        </button>{' '}
+        Forgetting does not stop ComfyUI making {it}; the Archive’s “Look for files with no record” files{' '}
+        {one ? 'it once it has' : 'them once they have'} landed.
+      </Notice>
+    </div>
+  )
+}
+
+/**
  * A failed job, in the words every desk uses (lib/faults.ts).
  *
  * This desk used to call every failure "rejected", say ComfyUI "would not
@@ -3007,7 +3721,8 @@ function EditDesk({
  * was not rejected. The Video desk already said "did not finish" for those.
  */
 function Fault({ fault, onDismiss }: { fault: DeskFault; onDismiss: () => void }) {
-  const title = fault.message === NO_FILE ? 'No picture came back' : faultTitle(fault)
+  const title =
+    fault.message === NO_FILE ? 'No picture came back' : fault.message === NOT_SENT ? 'The picture was not sent' : faultTitle(fault)
   const tone = fault.cancelled ? 'correction' : fault.lost ? 'warning' : 'error'
   const oom = title === 'The card ran out of memory'
   // The shared wording for memory mentions a shorter clip, which this desk
@@ -3138,7 +3853,7 @@ function Plate({
 
       {!entry && !running && c.prompt.trim() && (
         <p className="mt-3 text-small italic text-grey-500">
-          Nothing yet. Press Make the picture on the left.
+          Nothing yet. Press Make the picture.
         </p>
       )}
 
@@ -3164,8 +3879,8 @@ function EmptyPlate({
   return (
     <div className="max-w-xl px-8 py-10">
       <p className="dropcap text-body leading-relaxed text-grey-700">
-        Type a line on the left and press Make the picture. Everything you make is filed in the
-        archive with the settings that made it, so you can find it again and change one word.
+        Type a line and press Make the picture. Everything you make is filed in the archive with
+        the settings that made it, so you can find it again and change one word.
       </p>
       {examples.length > 0 && (
         <div className="mt-6">
@@ -3224,8 +3939,14 @@ function Caption({
       )}
 
       <p className="mt-2 text-small text-grey-700">
-        Made by {entry.modelLabel} · {DATE.format(entry.at)} ·{' '}
-        <span className="tabular-nums">{seconds(entry.durationMs)}</span>
+        Made by {entry.modelLabel} · {DATE.format(entry.at)}
+        {/* No time is printed for a run nobody timed: 0.0 s would read as one. */}
+        {entry.durationMs > 0 ? (
+          <>
+            {' '}
+            · <span className="tabular-nums">{seconds(entry.durationMs)}</span>
+          </>
+        ) : null}
       </p>
 
       <p className="mt-1 text-caption text-grey-700">

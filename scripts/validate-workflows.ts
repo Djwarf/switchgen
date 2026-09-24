@@ -163,7 +163,9 @@ const unlisted = (missing: string[]) =>
 
 for (const def of FAMILIES) {
   const model = def.models.find(m => installed.has(m)) ?? def.models[0]
-  const missing = missingFilesFor(def, inv)
+  // Checked for the one file this run loads: a family that lists several
+  // checkpoints needs only one of them installed.
+  const missing = missingFilesFor(def, inv, model)
   if (missing.length) { console.log(`SKIP  ${def.label}: ${unlisted(missing) ?? `missing ${missing.join(', ')}`}`); skip++; continue }
 
   const d = defaultsFor(def, model)
@@ -256,7 +258,7 @@ for (const [srcId, def] of Object.entries(IMG2IMG)) {
   const base = FAMILIES.find(f => f.id === srcId)
   if (!base) continue
   const model = base.models.find(m => installed.has(m)) ?? base.models[0]
-  const missing = missingFilesFor(def, inv)
+  const missing = missingFilesFor(def, inv, model)
   if (missing.length) { i2iSkip++; continue }
 
   const d = defaultsFor(base, model)
@@ -365,7 +367,9 @@ function checkGraph(wf: ApiWorkflow): string[] {
 /** Every node class a graph uses, for the "did the derivation actually fire" check. */
 const classesOf = (wf: ApiWorkflow) => new Set(Object.values(wf).map(n => n.class_type))
 
-const runnable = (def: FamilyDef): boolean => missingFilesFor(def, inv).length === 0
+/** Runnable with the one file of the family that is installed, as the desks run it. */
+const runnable = (def: FamilyDef): boolean =>
+  missingFilesFor(def, inv, def.models.find(m => installed.has(m))).length === 0
 
 const baseParamsFor = (def: FamilyDef, model: string) => {
   const d = defaultsFor(def, model)
@@ -648,7 +652,7 @@ const videoParamsFor = (def: FamilyDef, model: string): Params => {
 for (const def of FAMILIES) {
   if (def.mode !== 'video') continue
   if (!runnable(def)) {
-    console.log(`SKIP  ${def.label}: continued shots (${unlisted(missingFilesFor(def, inv)) ?? 'weights not installed'})`)
+    console.log(`SKIP  ${def.label}: continued shots (${unlisted(missingFilesFor(def, inv, def.models.find(m => installed.has(m)))) ?? 'weights not installed'})`)
     cSkip++
     continue
   }

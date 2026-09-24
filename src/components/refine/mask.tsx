@@ -33,7 +33,7 @@
  * this agent owns, which is scoped to .tsx, and the hook has to live beside the
  * geometry it serves.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Rect } from '../../lib/refine'
 
 export type MaskPoint = { x: number; y: number }
@@ -246,6 +246,31 @@ type Session = { signature: string; layer: HTMLCanvasElement | null; doc: Doc }
 
 const EMPTY: Doc = { strokes: [], undone: [] }
 
+/**
+ * The strokes of the last few pictures, by signature, for as long as the page
+ * lives.
+ *
+ * App mounts one room at a time, so a look at another room unmounted the bench
+ * and took a mask painted with a finger on a phone with it. The desk now keeps
+ * the bench open across the visit, and this keeps what was painted on it. The
+ * desk forgets it all when the reader closes the bench (forgetKeptMasks), so a
+ * picture opened again later starts clean, as before.
+ */
+const kept = new Map<string, Doc>()
+const KEPT_MAX = 4
+
+function keep(signature: string, doc: Doc): void {
+  kept.delete(signature)
+  if (!doc.strokes.length && !doc.undone.length) return
+  kept.set(signature, doc)
+  while (kept.size > KEPT_MAX) kept.delete(kept.keys().next().value as string)
+}
+
+/** Drop every kept mask. Called when the bench is closed on purpose. */
+export function forgetKeptMasks(): void {
+  kept.clear()
+}
+
 function makeLayer(width: number, height: number): HTMLCanvasElement | null {
   if (width < 1 || height < 1) return null
   const c = document.createElement('canvas')
@@ -257,12 +282,13 @@ function makeLayer(width: number, height: number): HTMLCanvasElement | null {
 /**
  * Hold the mask for one source picture.
  *
- * There are no effects in here on purpose. When the picture changes, the layer
- * and the history are replaced DURING render, which is React's own answer to
- * "adjust state when a prop changes": the component renders again and nothing
- * intermediate is ever committed. An effect would paint one frame of the
- * previous picture's mask over the new one, and on a refined result that came
- * back at exactly the same size nobody would notice until it queued.
+ * Nothing that draws is in an effect, on purpose. When the picture changes,
+ * the layer and the history are replaced DURING render, which is React's own
+ * answer to "adjust state when a prop changes": the component renders again
+ * and nothing intermediate is ever committed. An effect would paint one frame
+ * of the previous picture's mask over the new one, and on a refined result
+ * that came back at exactly the same size nobody would notice until it queued.
+ * The one effect only copies the strokes out to `kept`, and draws nothing.
  */
 export function useMaskEditor(
   size: { width: number; height: number } | null,
@@ -281,11 +307,16 @@ export function useMaskEditor(
   const [session, setSession] = useState<Session>(() => ({
     signature,
     layer: makeLayer(width, height),
-    doc: EMPTY,
+    doc: kept.get(signature) ?? EMPTY,
   }))
   if (session.signature !== signature) {
-    setSession({ signature, layer: makeLayer(width, height), doc: EMPTY })
+    setSession({ signature, layer: makeLayer(width, height), doc: kept.get(signature) ?? EMPTY })
   }
+  useEffect(() => {
+    // Only a real picture's mask is worth keeping; the bench renders with no
+    // size while it opens.
+    if (width > 0 && height > 0) keep(session.signature, session.doc)
+  }, [session.signature, session.doc, width, height])
   // This render pass is thrown away when the signature just changed, so it runs
   // against nothing rather than against the outgoing picture's strokes.
   const live: Session =

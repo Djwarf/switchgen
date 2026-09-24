@@ -25,7 +25,7 @@ export { PromptField } from './PromptField'
 export { LookPicker } from './LookPicker'
 export { AnatomyPicker } from './AnatomyPicker'
 export { SourceWell } from './SourceWell'
-export { RunButton, type RunJob } from './RunButton'
+export { RunButton, STOPPING, type RunJob } from './RunButton'
 export { RecipeProse } from './RecipeProse'
 export { MoreFootnote } from './More'
 export {

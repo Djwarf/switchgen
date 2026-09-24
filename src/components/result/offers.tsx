@@ -39,6 +39,7 @@ import {
   deriveAutoDetail,
   deriveHiresFix,
   deriveRefine,
+  detailSentence,
   hiresSize,
   type DerivedDef,
 } from '../../lib/refine'
@@ -236,7 +237,7 @@ export function offersFor(
       id: 'hand',
       label: 'Fix the hands',
       what:
-        'Finds every hand and draws it again, guided to 768 pixels and capped at 1024, with more freedom than a face, because hands come out wrong rather than merely soft. The picture is rendered again at the same seed, so the composition is the one in front of you.' +
+        `${detailSentence('hand')} It has more freedom than a face, because hands come out wrong rather than merely soft. The picture is rendered again at the same seed, so the composition is the one in front of you.` +
         foundSentence(opts.facts, 'hand'),
       measured: 'Not measured. Judge it against the picture you already have.',
       ...costOf(deriveAutoDetail(def, 'hand')),
@@ -249,7 +250,7 @@ export function offersFor(
       id: 'face',
       label: 'Fix the face',
       what:
-        'Finds every face and draws it again, guided to 768 pixels and capped at 1024, where two eyes and a mouth finally have the cells to resolve. Rendered again at the same seed, so only the faces move.' +
+        `${detailSentence('face')} That is room for two eyes and a mouth to resolve. Rendered again at the same seed, so only the faces move.` +
         foundSentence(opts.facts, 'face'),
       measured: `Measured ${ratio(MEASURED.faceDetailer.ratio)} whole frame sharpness, which is why it is offered rather than run for you.`,
       ...costOf(deriveAutoDetail(def, 'face')),

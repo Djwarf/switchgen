@@ -22,7 +22,7 @@
  * reusing it does the same thing from every room.
  */
 
-import type { FileRef } from './comfy'
+import { fileUrl, type FileRef } from './comfy'
 import type { HistoryEntry, NewEntry } from './history'
 import { loraLabel } from './loras'
 import { restoreRack, type RestoredRack } from './videoLoras'
@@ -240,13 +240,17 @@ export function needsSource(mode: Mode): boolean {
 /**
  * A picture standing by as the source of the next generation.
  *
- * `name` is what goes into the graph's LoadImage — the file as ComfyUI's input
- * folder knows it, returned by `uploadImage()`. `ref` is set instead when the
- * picture is one of our own outputs being reused, in which case nothing needs
- * uploading again.
+ * `name` is what goes into the graph's LoadImage: the file as ComfyUI's input
+ * folder knows it, returned by `uploadImage()`, or, for one of our own
+ * outputs, its annotated path (`sub/x.png [output]`), which LoadImage reads in
+ * place. `ref` is set too when the picture is one of our outputs, so nothing
+ * is fetched to the browser and uploaded back.
  */
 export type SourceRef = {
-  /** ComfyUI input filename for LoadImage. Empty until the upload lands. */
+  /**
+   * The name LoadImage takes: an input-folder filename, or an output's
+   * annotated path. Empty until the upload lands or the desk fills it in.
+   */
   name: string
   /** Set when the source is an existing ComfyUI output rather than an upload. */
   ref?: FileRef
@@ -729,6 +733,27 @@ function sanitiseDraft(desk: DeskId, raw: unknown): Composition {
   }
 }
 
+/** ComfyUI's folder annotation on a LoadImage name, as annotatedRef writes it. */
+const ANNOTATED = /^(.*) \[(output|input|temp)\]$/
+
+/**
+ * The file a source picture is, as ComfyUI serves it: the one its LoadImage
+ * name says, which is a file in the input folder unless the name carries a
+ * folder annotation, else, before the name is filled in, its `ref`. The name
+ * comes first because it is what the graph reads. Null when there is neither.
+ */
+export function sourceFile(source: Pick<SourceRef, 'name' | 'ref'>): FileRef | null {
+  if (!source.name) return source.ref ?? null
+  const m = ANNOTATED.exec(source.name)
+  const path = m ? m[1] : source.name
+  const cut = path.lastIndexOf('/')
+  return {
+    filename: path.slice(cut + 1),
+    subfolder: cut === -1 ? '' : path.slice(0, cut),
+    type: m ? m[2] : 'input',
+  }
+}
+
 function sanitiseSource(raw: unknown): SourceRef | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const s = raw as Record<string, unknown>
@@ -745,11 +770,17 @@ function sanitiseSource(raw: unknown): SourceRef | null {
   if (!name && !file) return null
   // An object URL belongs to the page that made it. Restoring one from a
   // previous load points the well at a blob the browser has already released.
+  // The file it showed is still in ComfyUI, though: an upload or a lifted frame
+  // is in the input folder under `name`, an output under its own path. Dropped
+  // with nothing in its place, the well drew an empty square after a reload,
+  // and the reader could not see which frame the next clip would open on.
   const preview = asStringOrNull(s.previewUrl)
+  const kept = preview && !preview.startsWith('blob:') ? preview : null
+  const served = kept ? null : sourceFile({ name, ref: file })
   return {
     name,
     ref: file,
-    previewUrl: preview && !preview.startsWith('blob:') ? preview : undefined,
+    previewUrl: kept ?? (served ? fileUrl(served) : undefined),
     label: asStringOrNull(s.label) ?? file?.filename ?? name,
     width: asNumberOrNull(s.width) ?? undefined,
     height: asNumberOrNull(s.height) ?? undefined,
@@ -1307,6 +1338,29 @@ export function takeRegionRequest(): HistoryEntry | null {
 }
 
 /**
+ * Cross-route handoff for the plate, the same way as the region bench's.
+ *
+ * Face, hands and a larger render are offered only on the Pictures plate, and
+ * the plate showed only what this page had made, so a picture made before a
+ * reload, or on another device, could never have them. The Archive leaves the
+ * record here and navigates; Pictures takes it once and puts it on the plate.
+ * One shot and memory only, for the reason given above.
+ */
+let pendingPlate: HistoryEntry | null = null
+
+/** Ask the Pictures desk to show this record on its plate, with its offers. */
+export function requestPlate(entry: HistoryEntry): void {
+  pendingPlate = entry
+}
+
+/** Take the pending plate request, if any. Reading it clears it, so it fires once. */
+export function takePlateRequest(): HistoryEntry | null {
+  const held = pendingPlate
+  pendingPlate = null
+  return held
+}
+
+/**
  * Send only the picture to a desk, leaving the prompt and settings alone.
  * The archive's "Use as source" verb.
  */
@@ -1316,9 +1370,9 @@ export function adoptSource(
   opts: { name?: string; frame?: number } = {},
 ): () => void {
   return standBy(desk, {
-    // An output of ours is already inside ComfyUI, but LoadImage reads the
-    // *input* folder, so the desk uploads it and fills `name` in. Until then
-    // the ref is enough to show the well.
+    // An output of ours is already inside ComfyUI. The desk fills `name` in
+    // with its annotated path, which LoadImage reads in place; until then the
+    // ref is enough to show the well.
     name: opts.name ?? '',
     ref: entry.file,
     previewUrl: undefined,

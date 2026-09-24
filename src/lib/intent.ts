@@ -651,8 +651,12 @@ export function intentReport(brief: Brief, opts: RankOptions = {}): IntentReport
 /** The line above the list. Names the winner and the reason in one breath. */
 function headline(brief: Required<Brief>, ranked: Recommendation[], unrouted: UnroutedModel[]): string {
   const top = ranked[0]
+  // The reader is sent to More, which says what is missing or too large and
+  // holds the catalogue that can fetch a model. This used to point at "the
+  // blocked list", which on a machine with nothing installed listed nothing,
+  // with no catalogue anywhere in reach.
   if (!top) {
-    return 'Nothing installed can run this here. Check the blocked list for what is missing or too large.'
+    return 'Nothing installed can run this here. Open More: it says what is missing or too large, and its catalogue can fetch a model.'
   }
   const look = brief.intent === 'photoreal' ? 'photoreal' : brief.intent
   const lead = brief.explicit

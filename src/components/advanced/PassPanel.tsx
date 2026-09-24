@@ -18,12 +18,12 @@
  * omission.
  *
  * THE FACE PASS MEASURED 0.714. That figure is whole frame Laplacian variance,
- * which is sharpness: re rendering a face at 768 and pasting it back softens
+ * which is sharpness: re rendering a face larger and pasting it back softens
  * the frame average while making the face itself right. It is printed because
  * every number in this app is printed, and it is not an argument against the
  * pass. It is the reason the pass is offered rather than run on your behalf.
  */
-import { hiresSize, hiresStepsFor } from '../../lib/refine'
+import { detailSentence, hiresSize, hiresStepsFor } from '../../lib/refine'
 import type { Plan } from '../../lib/recipe'
 import { Check, Head, Note, times } from './bits'
 import type { Passes, Settled } from './overrides'
@@ -81,7 +81,7 @@ export function PassPanel({
               on={p.face}
               onToggle={() => toggle('face')}
               title="Detail every face"
-              note="Finds faces with a detector, crops each one, re renders it at up to 1024px and pastes it back. A face 80px across has about a hundred latent cells and cannot hold two eyes and a mouth. At 1024 it has nine thousand."
+              note={`${detailSentence('face')} A hundred cells cannot hold two eyes and a mouth. The face is pasted back into the picture.`}
               cost="about one extra pass per face found"
             />
           ) : null}
@@ -90,7 +90,7 @@ export function PassPanel({
               on={p.hand}
               onToggle={() => toggle('hand')}
               title="Detail every hand"
-              note="The same pass on the hand detector, at a higher strength. Hands come out wrong rather than merely soft, so this one is allowed to rebuild rather than sharpen."
+              note={`${detailSentence('hand')} It runs at a higher strength than the face pass: hands come out wrong rather than merely soft, so this one is allowed to rebuild rather than sharpen.`}
               cost="about one extra pass per hand found"
             />
           ) : null}

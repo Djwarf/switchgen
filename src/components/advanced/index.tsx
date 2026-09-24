@@ -42,7 +42,7 @@ import { MEASURED, MEASURED_ON, type Recipe } from '../../lib/recipe'
 import { Caution, Fault, Head, Kicker, Link, Note, Source } from './bits'
 import { CataloguePanel } from './CataloguePanel'
 import { LoraPanel } from './LoraPanel'
-import { ModelPanel } from './ModelPanel'
+import { ModelPanel, type Unloadable } from './ModelPanel'
 import {
   NO_OVERRIDES,
   clearOverride,
@@ -59,7 +59,7 @@ import { WorkflowPeek } from './WorkflowPeek'
 
 export { CataloguePanel } from './CataloguePanel'
 export { LoraPanel } from './LoraPanel'
-export { ModelPanel } from './ModelPanel'
+export { ModelPanel, type Unloadable } from './ModelPanel'
 export { PassPanel } from './PassPanel'
 export { SamplingPanel } from './SamplingPanel'
 export { WorkflowPeek } from './WorkflowPeek'
@@ -76,6 +76,7 @@ export {
   maxSideOf,
   overrideKeys,
   preLoraDef,
+  sanitiseOverrides,
   settle,
   setOverride,
   shapesFor,
@@ -103,9 +104,11 @@ export type OverrideStore = {
 /**
  * Overrides, held wherever the desk wants them.
  *
- * Deliberately not persisted. An override is a statement about this picture,
- * and a CFG of 12 restored from last Tuesday into a recipe that decided 5 would
- * be the exact failure this whole redesign exists to end.
+ * Never kept past the tab. An override is a statement about this picture, and
+ * a CFG of 12 restored from last Tuesday into a recipe that decided 5 would be
+ * the exact failure this whole redesign exists to end. The desk may keep them
+ * for its own tab, so a reload does not drop settings the reader loaded (see
+ * sanitiseOverrides), and that store dies with the tab.
  */
 export function useOverrides(initial: Overrides = NO_OVERRIDES): OverrideStore {
   const [value, set] = useState<Overrides>(initial)
@@ -136,6 +139,7 @@ export function AdvancedPanel({
   faultNode = null,
   onCatalogueChange,
   onDropAddOn,
+  unloadable = [],
   onClose,
 }: {
   recipe: Recipe
@@ -160,6 +164,13 @@ export function AdvancedPanel({
    * while the add stayed on file, so the add-on came straight back.
    */
   onDropAddOn?: (file: string) => void
+  /**
+   * Weight files ComfyUI lists that cannot load here, with the reason: a text
+   * encoder or VAE the graph names is missing, or the node pack that reads it.
+   * The ranking leaves them out, so they are named in the model panel rather
+   * than offered and then refused by ComfyUI.
+   */
+  unloadable?: readonly Unloadable[]
   /** Back to the three questions. */
   onClose: () => void
 }) {
@@ -211,8 +222,9 @@ export function AdvancedPanel({
           <Head title="Nothing can run this" />
           <Fault>{recipe.reason}</Fault>
           <Note>
-            The lists below say what is installed, what will not fit in this machine’s memory, and
-            what is on disk with no verified graph behind it.
+            The lists below say what is installed, what cannot load here and why, what will not fit
+            in this machine’s memory, and what is on disk with no verified graph behind it. The
+            catalogue under them fetches a model that can run.
           </Note>
           <div className="mt-4">
             <ModelPanel
@@ -223,8 +235,13 @@ export function AdvancedPanel({
               pinned={pinnedModel}
               onPin={(m) => onPinModel?.(m)}
               measured={MEASURED_ON}
+              unloadable={unloadable}
             />
           </div>
+          {/* The one way to a first model on a machine with none. It used to
+              appear only once a recipe could already run, which is exactly
+              when it was least needed. */}
+          {onCatalogueChange ? <CataloguePanel modes={['image', 'edit']} onInstalled={onCatalogueChange} /> : null}
         </section>
       ) : null}
 
@@ -240,6 +257,7 @@ export function AdvancedPanel({
             pinned={pinnedModel}
             onPin={(m) => onPinModel?.(m)}
             measured={MEASURED_ON}
+            unloadable={unloadable}
           />
 
           {onCatalogueChange ? <CataloguePanel modes={['image', 'edit']} onInstalled={onCatalogueChange} /> : null}

@@ -51,7 +51,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { planRefine, type RefinePlan, type Rect } from '../../lib/refine'
 import { randomSeed } from '../../lib/session'
 import { Caution, Chips, Head, Kicker, Quiet, clamp, times } from './bits'
-import { clampRect, defaultBrush, useMaskEditor, type MaskTool } from './mask'
+import { clampRect, defaultBrush, forgetKeptMasks, useMaskEditor, type MaskTool } from './mask'
 import { MaskCanvas } from './MaskCanvas'
 import { Compare } from './Compare'
 import { RefinePanel, REFINE_SETTINGS, type RefineSettings, type RegionAddOns } from './RefinePanel'
@@ -59,6 +59,24 @@ import { RefinePanel, REFINE_SETTINGS, type RefineSettings, type RegionAddOns } 
 export { Compare } from './Compare'
 export { RefinePanel, REFINE_SETTINGS, type RefineSettings, type RegionAddOns } from './RefinePanel'
 export { useMaskEditor, toMaskBlob, type MaskStroke, type MaskTool } from './mask'
+
+/**
+ * The region words and strengths set on the last few pictures, by the
+ * picture's URL, for as long as the page lives. A look at another room
+ * unmounts the bench, and the words typed for the region went with it; the
+ * mask is kept the same way (see mask.tsx).
+ */
+const keptSettings = new Map<string, RefineSettings>()
+const KEPT_MAX = 4
+
+/**
+ * Forget what the bench kept, strokes and words alike. The desk calls it when
+ * the reader closes the bench, so a picture opened again later starts clean.
+ */
+export function forgetBench(): void {
+  keptSettings.clear()
+  forgetKeptMasks()
+}
 
 /** Everything the desk needs to queue one refine pass. */
 export type RefineRequest = {
@@ -147,11 +165,22 @@ export function RegionRefine({
   onStop,
 }: RegionRefineProps) {
   const editor = useMaskEditor(source, source?.url)
-  const [settings, setSettings] = useState<RefineSettings>({ ...REFINE_SETTINGS, prompt: parentPrompt })
+  const [settings, setSettings] = useState<RefineSettings>(
+    () => (source && keptSettings.get(source.url)) || { ...REFINE_SETTINGS, prompt: parentPrompt },
+  )
   const [tool, setTool] = useState<MaskTool>('paint')
   const [brush, setBrush] = useState(() => defaultBrush(source))
   const [fault, setFault] = useState<string | null>(null)
-  const lastSource = useRef<string | null>(null)
+  // A picture whose settings were kept is not new to the bench, so its words
+  // are not reset to the picture's prompt below.
+  const lastSource = useRef<string | null>(source && keptSettings.has(source.url) ? source.url : null)
+
+  useEffect(() => {
+    if (!source) return
+    keptSettings.delete(source.url)
+    keptSettings.set(source.url, settings)
+    while (keptSettings.size > KEPT_MAX) keptSettings.delete(keptSettings.keys().next().value as string)
+  }, [source, settings])
 
   const patch = useCallback((p: Partial<RefineSettings>) => setSettings(s => ({ ...s, ...p })), [])
 

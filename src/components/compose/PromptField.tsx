@@ -56,7 +56,11 @@ export function PromptField({
         className="field"
         style={{ fontSize: '1.125rem', lineHeight: 1.6, maxWidth: '62ch' }}
       />
-      <span className="mt-1 block text-caption italic text-grey-500">Ctrl+Enter runs it.</span>
+      {/* A key combination, so it is not offered where there is no keyboard:
+          on a phone it named a key the reader does not have. */}
+      <span className="mt-1 block text-caption italic text-grey-500 [@media(hover:none)]:hidden">
+        Ctrl+Enter runs it.
+      </span>
     </label>
   )
 }

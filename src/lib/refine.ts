@@ -650,14 +650,79 @@ export function instantiateRefine(def: DerivedDef, base: Params, r: RefineParams
 export type DetailTarget = 'face' | 'hand'
 
 /**
+ * How the face and hand passes are tuned. The graph below is built from this,
+ * and so is every sentence that describes the pass (detailSentence), so the
+ * words cannot drift from what runs again.
+ *
+ * Hands are usually wrong rather than merely soft, so they need more freedom
+ * to be rebuilt. Faces are usually right but low on pixels, so a gentler pass
+ * keeps the likeness. cropFactor pulls in surrounding context: a hand needs
+ * the wrist and forearm in frame to be posed correctly, a face needs less.
+ */
+export const DETAIL_TUNING: Record<
+  DetailTarget,
+  { denoise: number; guide: number; cropFactor: number; dilation: number }
+> = {
+  face: { denoise: 0.4, guide: 768, cropFactor: 2.5, dilation: 10 },
+  hand: { denoise: 0.5, guide: 768, cropFactor: 3.0, dilation: 12 },
+}
+
+/** FaceDetailer's max_size: the longest side the padded crop is ever enlarged to. */
+export const DETAIL_MAX_SIZE = 1024
+
+/**
+ * What the pass does to one detection `box` pixels across, worked out the way
+ * the Impact Pack's enhance_detail does it (modules/impact/core.py). The crop
+ * is the box with `cropFactor` times its size around it. It is scaled so the
+ * box reaches `guide` pixels, unless that would make the crop longer than
+ * max_size, in which case the crop is scaled to max_size instead; and with
+ * force_inpaint on, it is never scaled down. With these settings the cap
+ * always wins for a box smaller than the guide, so the box comes back at about
+ * max_size / cropFactor: 410 pixels for a face, 340 for a hand. Arithmetic,
+ * not a measurement, and for a square box away from the picture's edges,
+ * where the crop is not cut short.
+ */
+export function detailRedraw(target: DetailTarget, box: number): { crop: number; redrawn: number; cells: number } {
+  const t = DETAIL_TUNING[target]
+  const crop = box * t.cropFactor
+  const scale = Math.max(1, Math.min(t.guide / box, DETAIL_MAX_SIZE / crop))
+  const redrawn = box * scale
+  // A latent cell is eight pixels a side.
+  return { crop, redrawn, cells: Math.round((redrawn / 8) ** 2) }
+}
+
+/** The crop factors the tuning uses, as a reader would say them. */
+const TIMES_WORDS: Record<number, string> = { 2: 'two', 2.5: 'two and a half', 3: 'three', 4: 'four' }
+
+const grouped = (n: number) => Math.round(n).toLocaleString('en-GB')
+/** Rounded the way a reader says a figure: to ten, then to a hundred past a thousand. */
+const about = (n: number) => grouped(n >= 1000 ? Math.round(n / 100) * 100 : Math.round(n / 10) * 10)
+
+/**
+ * The pass in one sentence, from the tuning above, with an 80 pixel box as the
+ * example. It used to say a face "re renders at up to 1024px" and "at 1024 it
+ * has nine thousand" cells, which is neither what 1024 pixels holds (16,384)
+ * nor what the graph does to a small face: the 1024 cap applies to the padded
+ * crop, not to the face.
+ */
+export function detailSentence(target: DetailTarget): string {
+  const t = DETAIL_TUNING[target]
+  const box = 80
+  const r = detailRedraw(target, box)
+  const factor = TIMES_WORDS[t.cropFactor] ?? String(t.cropFactor)
+  const what = target === 'face' ? 'face' : 'hand'
+  const around = target === 'face' ? '' : ', so the wrist and forearm are in frame'
+  return `Finds every ${what} with a detector and cuts out an area ${factor} times its size around it${around}. The cut is enlarged to at most ${DETAIL_MAX_SIZE} pixels on its longer side and drawn again, so a ${what} ${box} pixels across comes back about ${about(r.redrawn)} across: some ${about(r.cells)} latent cells where it had ${grouped((box / 8) ** 2)}.`
+}
+
+/**
  * Automatic detail pass over every detected face or hand.
  *
  * Same physics as deriveRefine, run without a drawn mask because YOLO can find
- * these two region types on its own. FaceDetailer crops each detection,
- * upscales it so its bounding box is at least `guide_size` pixels, re renders
- * it at low denoise and pastes it back with a feathered edge. A face that
- * occupied 80x80 pixels, which is 10x10 latent cells and cannot hold two eyes
- * and a mouth, is re rendered at 768 and gets 96x96 cells.
+ * these two region types on its own. FaceDetailer crops each detection with
+ * context around it, enlarges the crop, re renders it at low denoise and
+ * pastes it back with a feathered edge. What that comes to for one box is
+ * detailRedraw's arithmetic above.
  *
  * The node is called FaceDetailer but it details whatever the bbox detector
  * hands it, which is why the hand detector goes through the same node.
@@ -698,14 +763,8 @@ export function deriveAutoDetail(
     inputs: { model_name: DETECTORS[target] },
   }
 
-  // Hands are usually wrong rather than merely soft, so they need more freedom
-  // to be rebuilt. Faces are usually right but low on pixels, so a gentler pass
-  // keeps the likeness. crop_factor pulls in surrounding context: a hand needs
-  // the wrist and forearm in frame to be posed correctly, a face needs less.
-  const tuned =
-    target === 'hand'
-      ? { denoise: 0.5, guide: 768, cropFactor: 3.0, dilation: 12 }
-      : { denoise: 0.4, guide: 768, cropFactor: 2.5, dilation: 10 }
+  // See DETAIL_TUNING for why a hand and a face are tuned apart.
+  const tuned = DETAIL_TUNING[target]
 
   graph[FD] = {
     class_type: 'FaceDetailer',
@@ -721,7 +780,7 @@ export function deriveAutoDetail(
       // bbox: measure the detection box itself against guide_size. crop_region
       // would measure the padded crop, which under-upscales the actual face.
       guide_size_for: true,
-      max_size: 1024,
+      max_size: DETAIL_MAX_SIZE,
       seed: 0,
       steps: 20,
       cfg: 7,

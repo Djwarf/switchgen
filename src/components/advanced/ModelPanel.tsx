@@ -16,17 +16,21 @@
  * for a different file. The pin is shown as a pin, and dropping it hands the
  * choice back to the ranking.
  *
- * THREE LISTS, NOT ONE. Ranked files can be chosen. Blocked files will not fit
- * in this machine's memory and say by how much. Unrouted files are on disk with
- * no verified graph, which is a job for the registry rather than for the
- * reader. Collapsing the three into one list is how a file that cannot run ends
- * up looking like a file nobody has tried.
+ * FOUR LISTS, NOT ONE. Ranked files can be chosen. Files that cannot load here
+ * name the encoder, VAE or node pack they are missing. Blocked files will not
+ * fit in this machine's memory and say by how much. Unrouted files are on disk
+ * with no verified graph, which is a job for the registry rather than for the
+ * reader. Collapsing them into one list is how a file that cannot run ends up
+ * looking like a file nobody has tried.
  */
 import { useState } from 'react'
 
 import { gb } from '../../lib/hardware'
 import { TAG_STYLE_NOTE, type IntentReport, type Recommendation } from '../../lib/intent'
 import { Caution, Head, Kicker, Leader, Link, Note, Quiet } from './bits'
+
+/** A weight file ComfyUI lists that cannot load here, and why, starting "needs". */
+export type Unloadable = { model: string; label: string; why: string }
 
 export function ModelPanel({
   report,
@@ -36,6 +40,7 @@ export function ModelPanel({
   pinned,
   onPin,
   measured,
+  unloadable = [],
 }: {
   report: IntentReport
   /** The family the recipe chose, or null when it could not choose one. */
@@ -52,6 +57,12 @@ export function ModelPanel({
   onPin: (model: string | null) => void
   /** The checkpoint every sharpness ratio in this app was measured on. */
   measured: string
+  /**
+   * Files on disk that cannot load, each with what it lacks. Listed so the
+   * sentence reaches the reader before a press, not as ComfyUI's refusal of
+   * the job after it.
+   */
+  unloadable?: readonly Unloadable[]
 }) {
   const [open, setOpen] = useState(false)
   const inUse = (r: Recommendation) => r.familyId === familyId && r.model === model
@@ -128,6 +139,27 @@ export function ModelPanel({
         <p className="mt-2 text-caption">
           <Link onClick={() => setOpen(false)}>Show the top four only</Link>
         </p>
+      ) : null}
+
+      {unloadable.length > 0 ? (
+        // Open when nothing ranks, because then this is the answer to why.
+        <details className="mt-4" open={report.ranked.length === 0}>
+          <summary className="cursor-pointer text-caption text-grey-500 [@media(pointer:coarse)]:min-h-11">
+            Cannot load here ({unloadable.length})
+          </summary>
+          <ul className="mt-1 border-t border-grey-300">
+            {unloadable.map((u) => (
+              <li key={u.model} className="border-b border-grey-300 py-1.5">
+                <span className="block text-caption text-ink">{u.label}</span>
+                <span className="block text-caption italic leading-snug text-grey-500">
+                  {u.why.charAt(0).toUpperCase()}
+                  {u.why.slice(1)}
+                  {u.why.endsWith('.') ? '' : '.'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
       ) : null}
 
       {report.blocked.length > 0 ? (

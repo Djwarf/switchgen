@@ -104,13 +104,27 @@ export function packNeededFor(file: string, inv: Inventory): string | null {
 /**
  * Every file the family's graph names that ComfyUI does not list. Empty means
  * the graph can be queued without an opaque backend error naming a file.
+ *
+ * `model` is the weight file the caller means to run, when it knows. A family
+ * that lists several checkpoints (SDXL, Z-Image, Anima) loads one of them per
+ * run, so only that one is needed; asked without it, every file the family
+ * lists is required, as before. A dual-model family loads its whole pair
+ * whichever file stands for it, so it keeps needing every file either way.
+ * Without this, one SDXL checkpoint placed on its own read as "needs" the
+ * other three, and the desk left it out of every list that offers a picture
+ * to work from or a region to redraw, while the recipe went on rendering with
+ * it.
  */
-export function missingFilesFor(def: FamilyDef, inv: Inventory): string[] {
+export function missingFilesFor(def: FamilyDef, inv: Inventory, model?: string): string[] {
   const { clip, vae } = sidecarsOf(def)
+  // The chosen file stands in for the family's list; the graph as it will be
+  // queued still names whatever other loader it has, and that is still needed.
+  const weights =
+    model && !def.dualModel ? modelsOf({ ...def, models: [model], graph: modelGraph(def, model) }) : modelsOf(def)
   const missing = [
     ...clip.filter((c) => !inv.clips.has(c)),
     ...(vae && !inv.vaes.has(vae) ? [vae] : []),
-    ...modelsOf(def).filter((m) => !inv.weights.has(m)),
+    ...weights.filter((m) => !inv.weights.has(m)),
     ...Object.values(def.graph)
       .map((n) => n.inputs['lora_name'])
       .filter((l): l is string => typeof l === 'string' && !inv.loras.has(l)),
@@ -164,8 +178,9 @@ export type Availability =
  * measured, which yields a null verdict rather than a refusal.
  *
  * `model` is the weight file this row stands for, when the family lists more
- * than one. The memory verdict is priced on that file, not on the family's
- * default: two quants of one model differ by gigabytes.
+ * than one. The files are checked for that file alone (see missingFilesFor),
+ * and the memory verdict is priced on it, not on the family's default: two
+ * quants of one model differ by gigabytes.
  */
 export function availabilityOf(
   def: FamilyDef,
@@ -174,7 +189,7 @@ export function availabilityOf(
   sizes: Map<string, ModelFile>,
   model?: string,
 ): Availability {
-  const missing = missingFilesFor(def, inv)
+  const missing = missingFilesFor(def, inv, model)
   if (missing.length) return { ok: false, why: missingWhy(missing, inv, sizes) }
   const graph = model ? modelGraph(def, model) : def.graph
   const verdict = hardware ? feasibility(def, sizes, hardware, graph) : null

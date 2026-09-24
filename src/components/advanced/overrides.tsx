@@ -144,6 +144,44 @@ export function anyOverride(ov: Overrides): boolean {
   return overrideKeys(ov).length > 0
 }
 
+const NUMBER_KEYS = ['steps', 'cfg', 'width', 'height', 'seed', 'shift', 'clipSkip', 'denoise', 'megapixels', 'runs'] as const
+const STRING_KEYS = ['sampler', 'scheduler', 'negative', 'positive'] as const
+
+/**
+ * Overrides read back from storage, keeping only known keys with values of the
+ * right kind. The desk keeps what was set by hand for the tab, so a reload does
+ * not quietly put the recipe's values back under a loaded picture; what comes
+ * back was written by some earlier build, and a string where a number belongs
+ * would reach the graph as it stands. Anything unreadable is dropped, key by
+ * key, which is the recipe's value again.
+ */
+export function sanitiseOverrides(raw: unknown): Overrides {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return NO_OVERRIDES
+  const r = raw as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const k of NUMBER_KEYS) {
+    const v = r[k]
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v
+  }
+  for (const k of STRING_KEYS) if (typeof r[k] === 'string') out[k] = r[k]
+  if (typeof r.seedLocked === 'boolean') out.seedLocked = r.seedLocked
+  const p = r.passes as Record<string, unknown> | null | undefined
+  if (p && typeof p === 'object' && [p.face, p.hand, p.hires].every((b) => typeof b === 'boolean')) {
+    out.passes = { face: p.face, hand: p.hand, hires: p.hires }
+  }
+  if (Array.isArray(r.loras)) {
+    out.loras = r.loras.flatMap((e: unknown) => {
+      const s = e as Record<string, unknown> | null
+      if (!s || typeof s.file !== 'string' || typeof s.strength !== 'number' || !Number.isFinite(s.strength)) return []
+      const entry: LoraStack[number] = { file: s.file, strength: s.strength, enabled: s.enabled !== false }
+      return typeof s.clipStrength === 'number' && Number.isFinite(s.clipStrength)
+        ? [{ ...entry, clipStrength: s.clipStrength }]
+        : [entry]
+    })
+  }
+  return out as Overrides
+}
+
 // ---------------------------------------------------------------------------
 // Settling
 // ---------------------------------------------------------------------------
