@@ -276,6 +276,28 @@ export function chainFrameOf(files: readonly OutputFile[]): OutputFile | null {
   return pick[pick.length - 1] ?? null
 }
 
+/** Which of a shot's sampling passes a node is, and how many there are. */
+export type SamplerPass = { index: number; count: number }
+
+/**
+ * The sampling pass `node` runs, in a graph that samples in two.
+ *
+ * The Wan 2.2 14B pairs sample in two KSamplerAdvanced passes, one per model:
+ * the first stops part way and hands its leftover noise on, the second
+ * finishes. ComfyUI counts each pass's steps from one again, so step 5 of 10
+ * is a quarter of the shot in the first pass and three quarters in the
+ * second, and a band that read the steps alone went back to empty half way
+ * through every shot. Null for any other node, and for a graph that samples
+ * once.
+ */
+export function samplerPass(graph: GraphLike, node: string | null): SamplerPass | null {
+  const n = node ? graph[node] : undefined
+  if (!n || n.class_type !== 'KSamplerAdvanced') return null
+  const passes = Object.values(graph).filter((x) => x.class_type === 'KSamplerAdvanced').length
+  if (passes < 2) return null
+  return { index: n.inputs.return_with_leftover_noise === 'enable' ? 1 : 2, count: 2 }
+}
+
 /** Wan latent maths wants 4k+1 frames. Snap a request to the nearest legal length. */
 export function snapLength(frames: number): number {
   const k = Math.max(1, Math.round((frames - 1) / 4))

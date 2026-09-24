@@ -14,6 +14,7 @@
 import { REEL_PREFIX } from '../../lib/continuation'
 import { useSyncExternalStore } from 'react'
 import { store as kv, randomSeed } from '../../lib/session'
+import { thumbUrl } from '../../lib/thumbs'
 import type { ShotState } from './engine'
 
 export const REEL_KEY = 'switchgen.reel.v1'
@@ -177,6 +178,20 @@ function num(v: unknown, fallback: number): number {
 function maybeStr(v: unknown): string | null {
   return typeof v === 'string' ? v : null
 }
+/**
+ * A pin saved before pins kept thumbnails holds the original render's address,
+ * a megabyte or more drawn on a plate 16rem across at most. Read back, it
+ * becomes the same file's thumbnail. Any other address is kept as it is.
+ */
+export function smallPreview(url: string): string {
+  const view = '/comfy/view?'
+  if (!url.startsWith(view)) return url
+  const q = new URLSearchParams(url.slice(view.length))
+  const filename = q.get('filename')
+  if (!filename) return url
+  return thumbUrl({ filename, subfolder: q.get('subfolder') ?? '', type: q.get('type') ?? 'output' }, 512)
+}
+
 function readFrame(v: unknown): PinnedFrame | null {
   if (!v || typeof v !== 'object') return null
   const f = v as Record<string, unknown>
@@ -186,7 +201,8 @@ function readFrame(v: unknown): PinnedFrame | null {
     label: str(f.label, f.name),
     // An object URL from a previous page does not survive a reload, so a blob
     // preview is dropped rather than rendered as a broken plate.
-    previewUrl: typeof f.previewUrl === 'string' && !f.previewUrl.startsWith('blob:') ? f.previewUrl : undefined,
+    previewUrl:
+      typeof f.previewUrl === 'string' && !f.previewUrl.startsWith('blob:') ? smallPreview(f.previewUrl) : undefined,
   }
 }
 

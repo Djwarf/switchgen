@@ -44,6 +44,8 @@ import {
 } from 'react'
 
 import { connect, fileUrl, objectInfo, type FileRef } from '../lib/comfy'
+import { thumbUrl } from '../lib/thumbs'
+import { WAITS_IN_PAGE, wakeLockAvailable } from '../lib/wakeLock'
 import {
   annotatedRef,
   checkReel,
@@ -58,7 +60,7 @@ import {
 import { history } from '../lib/history'
 import { newComposition, randomSeed, type Composition } from '../lib/session'
 import { FAMILIES, defaultsFor, type FamilyDef, type Params } from '../lib/workflows'
-import { go, parseRoute, useExpert } from '../components/shell'
+import { go, parseRoute, useConnection, useExpert } from '../components/shell'
 
 import {
   Assembly,
@@ -80,6 +82,7 @@ import {
   shotsFromLines,
   shotsToRender,
   useReel,
+  waitingInPage,
   type AssemblyClip,
   type Currency,
   type Elsewhere,
@@ -398,6 +401,12 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
    */
   const elsewhere = run.elsewhere
   const busy = running || elsewhere !== null
+  /**
+   * While ComfyUI is not answering nothing can be queued: a shot sent anyway
+   * only fails, and the pass stops with it. So the press is held until the
+   * socket is back, with the sentence the Pictures desk gives.
+   */
+  const offline = useConnection() === 'closed'
   const now = useNow(running)
 
   /**
@@ -575,6 +584,11 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
     () => [...plan.jobs.flatMap((j) => (j.blocked ? [j.blocked] : [])), ...byReason(memory, 'refuse')],
     [plan.jobs, memory],
   )
+  /**
+   * The shots the strip holds back: every one while ComfyUI is not answering,
+   * since the line under the strip then says why nothing can be sent.
+   */
+  const held = useMemo(() => (offline ? refused.map(() => true) : refused), [offline, refused])
   const cautions = useMemo(() => byReason(memory, 'caution'), [memory])
 
   // --- what is already on disk ---------------------------------------------
@@ -637,19 +651,19 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
 
   const renderAll = useCallback(
     (opts: { force?: boolean } = {}) => {
-      if (!context || busy || blanks.length || !plan.jobs.length || refusals.length) return
+      if (!context || busy || offline || blanks.length || !plan.jobs.length || refusals.length) return
       if (!opts.force && !missing.length) return
       reelRun.renderAll(order, pressJobs(), context, opts)
     },
-    [context, busy, blanks.length, plan.jobs.length, refusals.length, missing.length, order, pressJobs],
+    [context, busy, offline, blanks.length, plan.jobs.length, refusals.length, missing.length, order, pressJobs],
   )
 
   const renderOne = useCallback(
     (index: number) => {
-      if (!context || busy || refused[index]) return
+      if (!context || busy || offline || refused[index]) return
       reelRun.renderOne(index, order, pressJobs(), context)
     },
-    [context, busy, refused, order, pressJobs],
+    [context, busy, offline, refused, order, pressJobs],
   )
 
   /**
@@ -720,8 +734,10 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
           if (!frame) return null
           return {
             label: `Shot ${i + 1} last frame`,
+            // The shot opens on the original, by name; the picker and the
+            // plate show a thumbnail rather than the full-size PNG.
             name: annotatedRef(frame),
-            previewUrl: fileUrl(frame),
+            previewUrl: thumbUrl(frame, 512),
           }
         })
         .filter((f): f is { label: string; name: string; previewUrl: string } => f !== null),
@@ -791,6 +807,13 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
         .filter((c): c is AssemblyClip => c !== null),
     [order, run.states, currency, draft.fps, draft.width, draft.height],
   )
+
+  /**
+   * Shots of this tab's pass still to be sent. Only this page sends them: a
+   * phone suspends a hidden page, so a pocketed reel stops after the shot
+   * ComfyUI already has, and the desk says so while any wait.
+   */
+  const inPage = waitingInPage(run)
 
   const changedCount = currency.filter((c) => c === 'changed').length
   const staleCount = currency.filter((c) => c === 'stale').length
@@ -925,7 +948,8 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               expert={expert}
               busy={busy}
               currency={currency}
-              refused={refused}
+              refused={held}
+              heldReason={offline ? 'ComfyUI is not answering, so nothing can be queued.' : null}
               bookendBlocked={bookendBlocked}
               elsewhere={elsewhere?.shotId ?? null}
               onEdit={(id, patch) => reel.setShot(id, patch)}
@@ -996,7 +1020,13 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                 type="button"
                 className="press"
                 disabled={
-                  busy || blanks.length > 0 || !plan.jobs.length || !family || refusals.length > 0 || !missing.length
+                  busy ||
+                  offline ||
+                  blanks.length > 0 ||
+                  !plan.jobs.length ||
+                  !family ||
+                  refusals.length > 0 ||
+                  !missing.length
                 }
                 onClick={() => renderAll()}
               >
@@ -1010,7 +1040,10 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               </button>
 
               {clips.length && !busy ? (
-                <Quiet onClick={() => renderAll({ force: true })} disabled={refusals.length > 0 || blanks.length > 0}>
+                <Quiet
+                  onClick={() => renderAll({ force: true })}
+                  disabled={offline || refusals.length > 0 || blanks.length > 0}
+                >
                   Render every shot again
                 </Quiet>
               ) : null}
@@ -1019,7 +1052,9 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
               ) : null}
 
               <span className="text-caption italic text-grey-500">
-                {blanks.length
+                {offline
+                  ? 'ComfyUI is not answering, so nothing can be queued.'
+                  : blanks.length
                   ? blanks.length === 1
                     ? `Shot ${blanks[0]} has no line yet.`
                     : `Shots ${blanks.join(', ')} have no lines yet.`
@@ -1028,14 +1063,28 @@ export default function Reel({ renderPlayer, onNavigate }: ReelProps = {}) {
                     : busy
                       ? 'One shot at a time, in order.'
                       : refusals.length
-                        ? 'Nothing is sent while the note above stands.'
-                        : !missing.length
-                          ? 'Every shot is rendered and matches its line.'
-                          : missing.length === 1
-                            ? 'One generation of several minutes. Control and Enter starts it.'
-                            : `${missing.length} generations of several minutes each. Control and Enter starts them.`}
+                          ? 'Nothing is sent while the note above stands.'
+                          : !missing.length
+                            ? 'Every shot is rendered and matches its line.'
+                            : missing.length === 1
+                              ? 'One generation of several minutes.'
+                              : `${missing.length} generations of several minutes each.`}
+                {/* A phone has no Control key, so the shortcut is offered only where a pointer can hover. */}
+                {!blanks.length && !busy && !offline && !refusals.length && missing.length ? (
+                  <span className="[@media(hover:none)]:hidden">
+                    {' '}
+                    Control and Enter starts {missing.length === 1 ? 'it' : 'them'}.
+                  </span>
+                ) : null}
               </span>
             </div>
+
+            {inPage ? (
+              <p className="mt-3 text-caption text-grey-700">
+                {inPage === 1 ? 'One shot waits' : `${inPage} shots wait`} in this page to be sent. {WAITS_IN_PAGE}
+                {wakeLockAvailable() ? ' This page asks to keep the screen on meanwhile.' : ''}
+              </p>
+            ) : null}
 
             {changedCount || staleCount ? (
               <p className="mt-3 border-l-2 border-warning pl-2 text-caption text-ink-warning">

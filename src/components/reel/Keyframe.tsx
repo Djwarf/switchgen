@@ -12,8 +12,9 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { annotatedRef } from '../../lib/continuation'
-import { fileUrl, uploadImage } from '../../lib/comfy'
+import { uploadImage } from '../../lib/comfy'
 import type { HistoryEntry } from '../../lib/history'
+import { thumbSrcSet, thumbUrl } from '../../lib/thumbs'
 import { Kicker, Quiet, RING } from './bits'
 import type { PinnedFrame } from './store'
 
@@ -33,6 +34,19 @@ export type KeyframePickerProps = {
   /** Frames this reel has already made, newest last. */
   reelFrames: readonly { label: string; name: string; previewUrl: string }[]
 }
+
+/**
+ * The tiles are a third of a phone's width, and from the small breakpoint up
+ * a fifth of the sheet, which is 48rem at most. They used to load each
+ * original render, a PNG of a megabyte or more, twenty at once when the sheet
+ * opened.
+ */
+const TILE_SIZES = '(min-width: 640px) 9rem, 33vw'
+/**
+ * A pinned frame is shown again on its shot's plate (at most 16rem across)
+ * and on the bench, so it keeps an address one size up from the tile.
+ */
+const PINNED_WIDTH = 512
 
 export function KeyframePicker({ target, onClose, pictures, reelFrames }: KeyframePickerProps) {
   const [busy, setBusy] = useState(false)
@@ -141,13 +155,15 @@ export function KeyframePicker({ target, onClose, pictures, reelFrames }: Keyfra
               {pictures.slice(0, 20).map((entry) => (
                 <Plate
                   key={entry.id}
-                  src={fileUrl(entry.file)}
+                  src={thumbUrl(entry.file, 256)}
+                  srcSet={thumbSrcSet(entry.file)}
                   caption={`No. ${entry.no}`}
                   onClick={() =>
                     take({
+                      // The render reads the original, by name. Only the preview is small.
                       name: annotatedRef(entry.file),
                       label: `No. ${entry.no} ${entry.file.filename}`,
-                      previewUrl: fileUrl(entry.file),
+                      previewUrl: thumbUrl(entry.file, PINNED_WIDTH),
                     })
                   }
                 />
@@ -168,7 +184,17 @@ export function KeyframePicker({ target, onClose, pictures, reelFrames }: Keyfra
   )
 }
 
-function Plate({ src, caption, onClick }: { src: string; caption: string; onClick: () => void }) {
+function Plate({
+  src,
+  srcSet,
+  caption,
+  onClick,
+}: {
+  src: string
+  srcSet?: string
+  caption: string
+  onClick: () => void
+}) {
   return (
     <button
       type="button"
@@ -176,7 +202,15 @@ function Plate({ src, caption, onClick }: { src: string; caption: string; onClic
       className={`${RING} group block w-full border border-grey-300 bg-newsprint-aged text-left transition-colors hover:border-ink`}
     >
       <span className="block aspect-[16/9] overflow-hidden bg-grey-200">
-        <img src={src} alt="" loading="lazy" className="h-full w-full object-cover" />
+        <img
+          src={src}
+          srcSet={srcSet}
+          sizes={srcSet ? TILE_SIZES : undefined}
+          alt=""
+          loading="lazy"
+          decoding="async"
+          className="h-full w-full object-cover"
+        />
       </span>
       <span className="block truncate px-1 py-0.5 text-caption tabular-nums text-grey-700 group-hover:text-ink">
         {caption}

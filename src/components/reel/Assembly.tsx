@@ -21,6 +21,7 @@
 import { useState } from 'react'
 
 import { useServerCapabilities } from '../../lib/capabilities'
+import { copyText } from '../../lib/clipboard'
 import { fileUrl, relPath, type OutputFile } from '../../lib/comfy'
 import { Head, Kicker, Quiet, duration, grouped, seconds } from './bits'
 
@@ -58,7 +59,8 @@ export type AssemblyProps = {
 }
 
 export function Assembly({ clips, shots, prefix }: AssemblyProps) {
-  const [copied, setCopied] = useState(false)
+  /** What the copy button last did, shown on it for a moment. */
+  const [copied, setCopied] = useState<'copied' | 'failed' | null>(null)
   const [cutting, setCutting] = useState(false)
   // The cut is kept with the strip it was made from. Shots land while a cut
   // runs, and throwing the cut away when the strip moved on (the room used to
@@ -95,14 +97,15 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
   /** True when the strip has changed since the cut on show failed. */
   const failedEarlier = failed !== null && failed.strip !== strip
 
+  // navigator.clipboard exists only on a secure page, and this desk is mostly
+  // reached over plain http from a phone, where the button did nothing at all
+  // and said nothing either. copyText falls back to the older way, and the
+  // button says when neither worked.
   const copy = () => {
-    void navigator.clipboard
-      ?.writeText(command)
-      .then(() => {
-        setCopied(true)
-        setTimeout(() => setCopied(false), 2500)
-      })
-      .catch(() => setCopied(false))
+    void copyText(command).then((ok) => {
+      setCopied(ok ? 'copied' : 'failed')
+      setTimeout(() => setCopied(null), 2500)
+    })
   }
 
   /**
@@ -219,7 +222,9 @@ export function Assembly({ clips, shots, prefix }: AssemblyProps) {
             <code>{command}</code>
           </pre>
           <div className="mt-2 flex flex-wrap items-center gap-3">
-            <Quiet onClick={copy}>{copied ? 'Copied' : 'Copy the command'}</Quiet>
+            <Quiet onClick={copy}>
+              {copied === 'copied' ? 'Copied' : copied === 'failed' ? 'Could not copy' : 'Copy the command'}
+            </Quiet>
             <span className="text-caption italic text-grey-500">
               For doing it yourself. Set COMFY_OUTPUT to ComfyUI's output folder first.
             </span>

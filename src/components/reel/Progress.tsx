@@ -16,7 +16,7 @@ import { relPath } from '../../lib/comfy'
 import type { ShotJob } from '../../lib/continuation'
 import type { HistoryEntry } from '../../lib/history'
 import { Kicker, Mark, Quiet, Rail, duration, grouped, seconds } from './bits'
-import type { RunState, ShotState } from './engine'
+import { drawnFraction, type RunState, type ShotState } from './engine'
 
 /** The median of matching runs, and how many there were. */
 export type Measured = { ms: number; runs: number }
@@ -114,8 +114,8 @@ export function ReelProgress({
     if (shot.status === 'done' && thisPass(shot)) {
       made += shot.frames
       done += 1
-    } else if (shot.status === 'running' && shot.max > 1) {
-      made += shot.frames * Math.min(1, shot.value / shot.max)
+    } else if (shot.status === 'running') {
+      made += shot.frames * drawnFraction(shot)
     } else if (shot.status === 'error' && thisPass(shot)) {
       failed += 1
     }
@@ -148,8 +148,7 @@ export function ReelProgress({
         unmeasured += 1
         return
       }
-      const fraction =
-        shot.status === 'running' && shot.max > 1 ? Math.max(0, 1 - shot.value / shot.max) : 1
+      const fraction = shot.status === 'running' && shot.max > 1 ? 1 - drawnFraction(shot) : 1
       ms += m.ms * fraction
       runs = Math.max(runs, m.runs)
       shots += 1
@@ -247,7 +246,13 @@ function shotStage(run: RunState, index: number): string {
   const id = run.order[index]
   const shot = id ? run.states[id] : null
   if (!shot) return 'Waiting'
-  if (shot.status === 'running' && shot.max > 1) return `${shot.stage} · step ${shot.value} of ${shot.max}`
+  if (shot.status === 'running' && shot.max > 1) {
+    // The two-pass families count each pass's steps from one again, so the
+    // pass is named with them.
+    const pass = shot.pass ?? null
+    const which = pass && pass.count > 1 ? `pass ${pass.index} of ${pass.count}, ` : ''
+    return `${shot.stage} · ${which}step ${shot.value} of ${shot.max}`
+  }
   return shot.stage || 'Waiting'
 }
 

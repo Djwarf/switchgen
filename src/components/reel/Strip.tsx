@@ -16,8 +16,8 @@
  */
 import { useRef, useState } from 'react'
 
-import { fileUrl } from '../../lib/comfy'
 import { clipFrames, type ShotJob } from '../../lib/continuation'
+import { thumbSrcSet, thumbUrl } from '../../lib/thumbs'
 import { Chips, Mark, Quiet, RING, duration, seconds } from './bits'
 import type { Currency, RunState, ShotState } from './engine'
 import { lengthChips, type LengthChoice } from './lengths'
@@ -38,6 +38,12 @@ export type StripProps = {
   currency: readonly (Currency | null)[]
   /** Per shot, in strip order: true when the desk will not queue it as it stands. */
   refused: readonly boolean[]
+  /**
+   * The reason nothing can be queued at all, such as ComfyUI not answering, or
+   * null. It takes the place of the per-shot refusal on every Render button,
+   * so a shot is not blamed for a lost connection.
+   */
+  heldReason?: string | null
   /** Null when this family can pin a closing frame, otherwise the reason it cannot. */
   bookendBlocked: string | null
   /** The shot another tab has on the press, if any (RunState.elsewhere). */
@@ -78,6 +84,7 @@ export function Strip(props: StripProps) {
             state={run.states[shot.id] ?? null}
             currencyNow={props.currency[i] ?? null}
             refusedNow={props.refused[i] ?? false}
+            heldReason={props.heldReason ?? null}
             locked={
               props.busy &&
               run.queue.includes(shot.id) &&
@@ -118,6 +125,7 @@ type RowProps = StripProps & {
   state: ShotState | null
   currencyNow: Currency | null
   refusedNow: boolean
+  heldReason: string | null
   /**
    * True while this shot is in the running pass and has not finished. The walk
    * renders the job it was handed when the button was pressed, so an edit here
@@ -134,7 +142,7 @@ type RowProps = StripProps & {
 }
 
 function ShotRow(p: RowProps) {
-  const { shot, job, state, index, fps, reelLength, expert, busy, locked, currencyNow, refusedNow, bookendBlocked } = p
+  const { shot, job, state, index, fps, reelLength, expert, busy, locked, currencyNow, refusedNow, heldReason, bookendBlocked } = p
   const [confirming, setConfirming] = useState(false)
   const frames = job ? clipFrames(job) : (shot.length ?? reelLength)
   const status = state?.status ?? 'waiting'
@@ -314,7 +322,13 @@ function ShotRow(p: RowProps) {
           <Quiet
             onClick={() => p.onRender(index)}
             disabled={busy || !shot.prompt.trim() || refusedNow}
-            title={refusedNow ? 'This shot cannot be rendered as it stands. The note under the strip says why.' : undefined}
+            title={
+              heldReason
+                ? heldReason
+                : refusedNow
+                  ? 'This shot cannot be rendered as it stands. The note under the strip says why.'
+                  : undefined
+            }
           >
             {state?.status === 'done' ? 'Render again' : 'Render'}
           </Quiet>
@@ -368,7 +382,11 @@ function ShotRow(p: RowProps) {
 
 function ShotPlate({ shot, state, onWatch }: { shot: ReelShot; state: ShotState | null; onWatch: () => void }) {
   const live = state?.previewUrl ?? null
-  const frame = state?.frame ? fileUrl(state.frame) : null
+  // The last frame is a full-size PNG, a megabyte or more, and every shot row
+  // loaded one to fill a plate of 16rem at most (11rem on a wide screen). A
+  // thumbnail is enough there; the next shot still opens on the original.
+  const frame = state?.frame ? thumbUrl(state.frame, 512) : null
+  const frameSet = !live && state?.frame ? thumbSrcSet(state.frame) : undefined
   const pinned = shot.start?.previewUrl ?? null
   const src = live ?? frame ?? pinned
   const watchable = Boolean(state?.clip)
@@ -376,8 +394,11 @@ function ShotPlate({ shot, state, onWatch }: { shot: ReelShot; state: ShotState 
   const body = src ? (
     <img
       src={src}
+      srcSet={frameSet}
+      sizes={frameSet ? '(min-width: 1024px) 11rem, 16rem' : undefined}
       alt=""
       loading="lazy"
+      decoding="async"
       className={`h-full w-full object-cover ${live ? 'opacity-90' : ''}`}
     />
   ) : (

@@ -54,6 +54,7 @@ export {
   reelRun,
   shotsToRender,
   useReelRun,
+  waitingInPage,
   type Currency,
   type Elsewhere,
   type Made,

@@ -33,13 +33,15 @@
  */
 import { useSyncExternalStore } from 'react'
 
-import { releaseComfyMemory, waitForIdleComfy, type ClipMemory } from '../../lib/clipMemory'
+import { releaseComfyMemory, releaseIfOthersAhead, waitForIdleComfy, type ClipMemory } from '../../lib/clipMemory'
 import {
   cancelJob,
   fetchPastRun,
   getJob,
+  newPromptId,
   relPath,
   run,
+  type ApiWorkflow,
   type OutputFile,
   type PastRun,
   type ProgressEvent,
@@ -52,10 +54,13 @@ import {
   clipFrames,
   instantiateShot,
   jobSignature,
+  samplerPass,
+  type SamplerPass,
   type ShotJob,
 } from '../../lib/continuation'
 import { history } from '../../lib/history'
-import { onStorage, recordOf, store as kv, type Composition } from '../../lib/session'
+import { onStorage, recordOf, store as kv, tabStore, type Composition } from '../../lib/session'
+import { holdAwake } from '../../lib/wakeLock'
 
 export type ShotStatus = 'waiting' | 'queued' | 'running' | 'done' | 'error' | 'stopped'
 
@@ -81,6 +86,11 @@ export type ShotState = {
   /** Sampler steps. 0 and 0 until the sampler reports. */
   value: number
   max: number
+  /**
+   * Which sampling pass the steps belong to, for a family that samples in
+   * two (the Wan 2.2 14B pairs), each counted from one. Null for one pass.
+   */
+  pass: SamplerPass | null
   stage: string
   previewUrl: string | null
   startedAt: number | null
@@ -162,6 +172,7 @@ function blankShot(shotId: string, frames: number): ShotState {
     promptId: null,
     value: 0,
     max: 0,
+    pass: null,
     stage: '',
     previewUrl: null,
     startedAt: null,
@@ -293,6 +304,62 @@ export function shotsToRender(
   return [...need].sort((a, b) => a - b)
 }
 
+/**
+ * How much of a running shot's sampling is done, from 0 to 1. A shot that
+ * samples in two passes counts each as half (see samplerPass), so step 1 of
+ * the second pass reads past the middle rather than back at the start.
+ */
+export function drawnFraction(shot: Pick<ShotState, 'status' | 'value' | 'max'> & { pass?: SamplerPass | null }): number {
+  if (shot.status !== 'running' || shot.max <= 1) return 0
+  const steps = Math.min(1, Math.max(0, shot.value / shot.max))
+  const pass = shot.pass ?? null
+  if (!pass || pass.count < 2) return steps
+  return Math.min(1, (Math.min(Math.max(pass.index, 1), pass.count) - 1 + steps) / pass.count)
+}
+
+/**
+ * Shots of this tab's pass that wait in the page to be sent: the ones the
+ * pass has not reached, and the one on the press until ComfyUI has taken it.
+ * Only the page sends them, so none goes while it is closed, hidden or the
+ * phone is locked, and the desk says so while there are any. A shot ComfyUI
+ * has taken carries on whatever the page does.
+ */
+export function waitingInPage(run: Pick<RunState, 'status' | 'queue' | 'states' | 'elsewhere'>): number {
+  if (run.status !== 'running' || run.elsewhere) return 0
+  return run.queue.filter((id) => {
+    const s = run.states[id]
+    return s?.status === 'waiting' || (s?.status === 'queued' && !s.promptId)
+  }).length
+}
+
+/**
+ * Shot numbers after `shotId` in `order` that have no clip. A shot picked up
+ * after a reload was the one on the press when the page went; whatever that
+ * page had still to send went with it, and nothing sends it now.
+ */
+export function unsentAfter(
+  order: readonly string[],
+  shotId: string,
+  states: Readonly<Record<string, ShotState>>,
+): number[] {
+  const at = order.indexOf(shotId)
+  if (at < 0) return []
+  const out: number[] = []
+  for (let i = at + 1; i < order.length; i++) if (!states[order[i] ?? '']?.clip) out.push(i + 1)
+  return out
+}
+
+/**
+ * The line that closes a picked-up shot's note when shots after it have no
+ * clip, naming the press that sends them. It reads "Render what is missing"
+ * once the reel has a clip, and "Render the reel" before.
+ */
+export function unsentLine(numbers: readonly number[], anyClip: boolean): string {
+  if (!numbers.length) return ''
+  const one = numbers.length === 1
+  return `${shotsWord(numbers)} after it ${one ? 'has' : 'have'} no clip. Anything that page was still to send went with it, so ${anyClip ? 'Render what is missing' : 'Render the reel'} sends ${one ? 'it' : 'them'} from here.`
+}
+
 // ---------------------------------------------------------------------------
 // Keeping the run across a reload
 //
@@ -319,6 +386,17 @@ const RUN_KEY = 'switchgen.reelrun.v1'
  * is usually the tab the reel is rendering in.
  */
 const TAB = newRunId()
+/**
+ * The id the page before this one in the same tab ran under, and this page's
+ * id kept for the next. A phone that throws a hidden tab away to free memory
+ * fires no pagehide, so that page's shot and pass are saved as held and
+ * freshly beaten, and without this the reloaded tab read them as another
+ * tab's: it said another tab had the reel, offered no Stop, and sent nothing
+ * for minutes. sessionStorage belongs to the tab and outlives a reload.
+ */
+const TAB_KEY = 'switchgen.reeltab.v1'
+const PREVIOUS: string | null = tabStore.get(TAB_KEY)
+tabStore.set(TAB_KEY, TAB)
 const BEAT_MS = 5_000
 const STALE_MS = 150_000
 /** How often a tab that is not following the shot checks whether its follower has gone. */
@@ -337,6 +415,14 @@ type Pending = {
   composition: Composition
   familyLabel: string
   modelLabel: string
+  /**
+   * True from just before the shot is sent until ComfyUI answers. The prompt
+   * id is made here and saved first, so a page lost while the send is on its
+   * way leaves the next page a number to ask ComfyUI about. Without it the
+   * shot rendered with nothing following it, and read as never made, so the
+   * next press sent it a second time.
+   */
+  sending?: boolean
 }
 
 /** Who is following a saved shot on the press. Stamped when it is written. */
@@ -360,6 +446,14 @@ type StoredPending = Pending & Stamp
 type StoredPress = Stamp & {
   /** The shot the pass is on. Null before it reaches one. */
   shotId: string | null
+  /**
+   * The reel's shots in order, the ones the pass set out to render, and when
+   * it started, so the page after one that went mid-pass can say which shots
+   * it never sent. Absent from saves made before they were kept.
+   */
+  order?: string[]
+  queue?: string[]
+  startedAt?: number | null
 }
 
 type SavedShot = Pick<
@@ -380,10 +474,44 @@ let beatTimer: ReturnType<typeof setInterval> | null = null
 let watchTimer: ReturnType<typeof setTimeout> | null = null
 /** The saved shots this tab last wrote or took in, as written. */
 let mirrored = ''
+/**
+ * The saved run exactly as this tab last wrote it while holding the press,
+ * or null before its first write of a hold. While a tab holds the press no
+ * other page writes the run: they hold their own press while this one's beat
+ * is fresh. So a saved run that differs from this means another page acted
+ * on the reel while this one was not running: it took the shot over, or
+ * started a pass, once this tab went quiet (see holdStands).
+ */
+let wrote: string | null = null
+/** Lets go of the screen wake lock taken while this tab walks (lib/wakeLock). */
+let awake: (() => void) | null = null
 
 /** True while this tab holds a pass or a shot that no other page has taken over. */
 function holding(): boolean {
   return claim !== null && !claim.signal.aborted
+}
+
+/**
+ * True while this tab still holds what it is rendering. False, having let go,
+ * once another page has written the saved run since this tab last did.
+ * `seen` is the saved run: as read now, or as another tab's write carried it.
+ *
+ * A phone freezes a tab it is not showing and later thaws it, with no
+ * pagehide or pageshow either side. Its beat stops meanwhile, and once it
+ * has been quiet long enough another tab takes its shot over, follows it and
+ * files it, and may start a pass of its own. The thawed tab used to carry on
+ * where it left off: it filed the shot the other tab had filed, said ComfyUI
+ * had answered it from the cache, sent the next shot a second time, and wrote
+ * its own run over the other tab's. So it asks here before every write,
+ * before it sends a shot, and before it files one.
+ */
+function holdStands(seen: string | null = kv.get(RUN_KEY)): boolean {
+  if (!holding()) return false
+  if (wrote !== null && seen !== wrote) {
+    letGo()
+    return false
+  }
+  return true
 }
 
 /** Keep the heartbeat going while this tab holds a pass or a shot, and only then. */
@@ -407,6 +535,8 @@ function setPending(p: Pending | null): void {
 function startWalking(): AbortSignal {
   claim = new AbortController()
   walking = true
+  // The run saved before this hold may have been written by any page.
+  wrote = null
   holdUnload(true)
   keepBeat()
   return claim.signal
@@ -417,6 +547,8 @@ function stopWalking(): void {
   walking = false
   holdUnload(false)
   keepBeat()
+  awake?.()
+  awake = null
 }
 
 /**
@@ -431,6 +563,9 @@ function stopWalking(): void {
  * out would forget the shot if that tab then closed.
  */
 function persist(opts: { released?: boolean } = {}): void {
+  // Another page has taken over since this tab last wrote: writing now would
+  // put this tab's view back over that page's shot and pass.
+  if (holding() && !holdStands()) return
   const beat = Date.now()
   const released = opts.released ?? false
   const stored = pending && walking ? null : readStored(kv.get(RUN_KEY))
@@ -438,7 +573,17 @@ function persist(opts: { released?: boolean } = {}): void {
   if (pending) entry = { ...pending, owner: TAB, beat, released }
   else if (stored?.pending && stored.pending.owner !== TAB) entry = stored.pending
   let press: StoredPress | null = null
-  if (walking) press = { owner: TAB, beat, released, shotId: state.currentShotId }
+  if (walking) {
+    press = {
+      owner: TAB,
+      beat,
+      released,
+      shotId: state.currentShotId,
+      order: state.order,
+      queue: state.queue,
+      startedAt: state.startedAt,
+    }
+  }
   else if (stored?.press && stored.press.owner !== TAB) press = stored.press
 
   const shots: SavedShot[] = []
@@ -456,9 +601,13 @@ function persist(opts: { released?: boolean } = {}): void {
     })
   }
   mirrored = JSON.stringify(shots)
+  const raw = !shots.length && !entry && !press ? null : JSON.stringify({ shots, pending: entry, press })
+  // Noted before the write: a write the quota refuses is still what this tab
+  // reads back (the store keeps it in memory), so it is not another page's.
+  wrote = holding() ? raw : null
   try {
-    if (!shots.length && !entry && !press) kv.remove(RUN_KEY)
-    else kv.set(RUN_KEY, JSON.stringify({ shots, pending: entry, press }))
+    if (raw === null) kv.remove(RUN_KEY)
+    else kv.set(RUN_KEY, raw)
   } catch {
     // A full quota costs the saved copy, never the run on screen.
   }
@@ -525,16 +674,21 @@ function readPending(v: unknown): StoredPending | null {
     owner: isString(v.owner) ? v.owner : '',
     beat: isNumber(v.beat) ? v.beat : 0,
     released: v.released === true,
+    sending: v.sending === true,
   }
 }
 
 function readPress(v: unknown): StoredPress | null {
   if (!isObject(v) || !isString(v.owner) || !isNumber(v.beat)) return null
+  const ids = (x: unknown): string[] | undefined => (Array.isArray(x) && x.every(isString) ? x : undefined)
   return {
     owner: v.owner,
     beat: v.beat,
     released: v.released === true,
     shotId: isString(v.shotId) ? v.shotId : null,
+    order: ids(v.order),
+    queue: ids(v.queue),
+    startedAt: isNumber(v.startedAt) ? v.startedAt : null,
   }
 }
 
@@ -579,8 +733,18 @@ function fileClip(
   // up. Filing that again would add a second record for one file, with a
   // duration that measures nothing and would drag every finish time the band
   // prints towards zero. So the existing record stands, with its real time.
+  //
+  // Two records for one file are not always a cached answer. One with this
+  // job's prompt id was filed by another page following the same job, and is
+  // simply this clip's record. One the recovery pass filed, from the file
+  // alone, is not kept: the archive puts this record in its place under the
+  // same number, star and notes (history.add), with the frame it opened on
+  // and the settings the recovery pass could not know.
   const known = history.all().find((e) => relPath(e.file) === relPath(clip))
-  if (known) return { entryId: known.id, durationMs: known.durationMs, unchanged: true }
+  if (known && !known.recovered) {
+    const sameJob = promptId !== '' && known.promptId === promptId
+    return { entryId: known.id, durationMs: known.durationMs, unchanged: !sameJob }
+  }
   try {
     const entry = history.add(
       recordOf(record.compose(), {
@@ -606,6 +770,13 @@ function fileClip(
 // Following a shot that outlived its page
 // ---------------------------------------------------------------------------
 
+/**
+ * The control that files a clip on disk no record describes, as the Archive
+ * labels it (components/archive/FacetRail.tsx). The notes used to send the
+ * reader to "the Archive's recover action", which no control is called.
+ */
+const RECOVER = 'open the Archive and press "Look for files with no record"'
+
 /** How often the queue is asked about a shot picked up after a reload. */
 const POLL_MS = 4000
 /** Unanswered asks in a row before the desk stops waiting (about a minute). */
@@ -621,26 +792,34 @@ const POLL_GIVE_UP = 15
 async function resume(p: Pending, kept: ShotState | null, lost: AbortSignal): Promise<void> {
   let verdict: RunStatus = 'error'
   let note: string | null = null
+  let unsent = false
   try {
-    ;[verdict, note] = await follow(p, lost)
+    ;[verdict, note, unsent = false] = await follow(p, lost)
   } catch {
-    note = `${p.label} was left on the press by the page before this one, and following it failed. If it finishes, the Archive's recover action files it.`
+    note = `${p.label} was left on the press by the page before this one, and following it failed. If it finishes, ${RECOVER} to file it.`
   }
   if (lost.aborted) {
     handedOver()
     return
   }
-
   if (verdict !== 'done') {
     if (kept) state = { ...state, states: { ...state.states, [p.shotId]: kept } }
     else {
       setShot(p.shotId, {
         status: verdict === 'stopped' ? 'stopped' : 'error',
-        stage: verdict === 'stopped' ? 'Stopped' : 'Failed',
+        stage: verdict === 'stopped' ? 'Stopped' : unsent ? 'Not sent' : 'Failed',
         error: verdict === 'stopped' ? null : note,
         finishedAt: Date.now(),
       })
     }
+  }
+
+  // The note used to end at the shot it followed, so a reel stopped one shot
+  // after a reload read as finished.
+  if (verdict !== 'stopped') {
+    const rest = unsentAfter(p.order, p.shotId, state.states)
+    const anyClip = p.order.some((id) => state.states[id]?.clip && state.states[id]?.status === 'done')
+    if (rest.length) note = `${note ?? ''} ${unsentLine(rest, anyClip)}`.trim()
   }
 
   stopWalking()
@@ -651,15 +830,20 @@ async function resume(p: Pending, kept: ShotState | null, lost: AbortSignal): Pr
 /**
  * Poll one job to its end, and file its clip if it lands. Once `lost` is
  * aborted another page follows the job, so this one touches nothing more and
- * returns; resume hands over.
+ * returns; resume hands over. The third value is true when the shot was still
+ * being sent as that page went and ComfyUI never had it.
  */
-async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string]> {
+async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string, boolean?]> {
   const left = `${p.label} was left on the press by the page before this one`
   const gone: [RunStatus, string] = ['stopped', '']
   let misses = 0
   let historyMisses = 0
+  /** Still on its way when that page went, and not yet seen in ComfyUI. */
+  let sending = p.sending === true
+  /** ComfyUI said once that it has no such job. */
+  let absent = false
   for (;;) {
-    if (lost.aborted) return gone
+    if (lost.aborted || !holdStands()) return gone
     let job: ServerJob | null | undefined
     try {
       job = await getJob(p.promptId)
@@ -672,9 +856,19 @@ async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string
         await delay(POLL_MS)
         continue
       }
-      return ['error', `${left}, and ComfyUI is not answering, so the desk stopped waiting for it. If it finishes, the Archive's recover action files it.`]
+      return ['error', `${left}, and ComfyUI is not answering, so the desk stopped waiting for it. If it finishes, ${RECOVER} to file it.`]
     }
     misses = 0
+    if (job && sending) {
+      // It arrived, so from here it is a shot on the press like any other,
+      // and a reload after this one follows it as such. Its number goes on
+      // the shot only now: the section bar reads a number as the queue's word
+      // that the job is in it, and Stop cancels by it.
+      sending = false
+      if (pending?.promptId === p.promptId) setPending({ ...pending, sending: false })
+      setShot(p.shotId, { promptId: p.promptId })
+      if (state.stopRequested) void cancelJob(p.promptId).catch(() => undefined)
+    }
     if (job && (job.status === 'pending' || job.status === 'in_progress')) {
       const waiting = job.status === 'pending'
       setShot(p.shotId, {
@@ -688,9 +882,23 @@ async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string
     // that way leaves no record at all. So gone after a stop is the stop
     // landing, not a job that was lost.
     if (!job) {
-      return state.stopRequested
-        ? ['stopped', `${p.label} was stopped.`]
-        : ['error', `${left}, and ComfyUI no longer knows the job, so it did not finish.`]
+      // A send cut off by the page going may never have left it. ComfyUI
+      // checks a graph before it queues it, so one no-such-job is asked again
+      // a moment later before the shot is called not sent, or stopped.
+      if (sending && !absent) {
+        absent = true
+        await delay(POLL_MS)
+        continue
+      }
+      if (state.stopRequested) return ['stopped', `${p.label} was stopped.`]
+      if (!sending) return ['error', `${left}, and ComfyUI no longer knows the job, so it did not finish.`]
+      // Nothing more happens without the reader: sending it again now would
+      // render it twice if the send lands after all.
+      return [
+        'error',
+        `${p.label} was being sent when the page before this one went, and ComfyUI has no job under its number, so nothing is rendering it. It may never have arrived.`,
+        true,
+      ]
     }
     if (job.status === 'cancelled') return ['stopped', `${p.label} was stopped.`]
     if (job.status === 'failed') return ['error', `${left}, and it failed in ComfyUI.`]
@@ -700,19 +908,19 @@ async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string
     let past: PastRun | null
     try {
       past = await fetchPastRun(p.promptId)
-      if (lost.aborted) return gone
+      if (lost.aborted || !holdStands()) return gone
     } catch {
       // Could not ask, which is not the same as no record.
       if (++historyMisses < POLL_GIVE_UP) {
         await delay(POLL_MS)
         continue
       }
-      return ['error', `${left}. It finished, but ComfyUI did not answer when asked for its clip, so the desk stopped waiting. The Archive's recover action can still file it.`]
+      return ['error', `${left}. It finished, but ComfyUI did not answer when asked for its clip, so the desk stopped waiting. To file it, ${RECOVER}.`]
     }
     const files = past?.files ?? []
     const clip = files.find((f) => f.kind === 'video') ?? null
     if (!clip) {
-      return ['error', `${left}. It finished, but ComfyUI's history does not list its clip. The Archive's recover action can still file it.`]
+      return ['error', `${left}. It finished, but ComfyUI's history does not list its clip. If the clip is on disk, ${RECOVER} to file it.`]
     }
     const finishedAt = past?.finishedAt ?? Date.now()
     const filed = fileClip(
@@ -738,18 +946,99 @@ async function follow(p: Pending, lost: AbortSignal): Promise<[RunStatus, string
       detail: null,
       made: p.made,
     })
-    return ['done', `${left}. It has finished and is filed with the rest.`]
+    return ['done', `${left}. It has finished and is filed.`]
   }
 }
 
 /** Read what the last page left behind, once, when the module loads. */
 function restore(): void {
-  const saved = readStored(kv.get(RUN_KEY))
-  if (!saved) return
+  const found = readStored(kv.get(RUN_KEY))
+  if (!found) return
+  const saved = reclaimDiscarded(found)
   mirrored = saved.shotsKey
   if (Object.keys(saved.states).length) state = { ...IDLE, states: saved.states }
   pickUp(saved.pending, true)
+  if (!saved.pending) noteUnsentPass(saved.press)
   lookElsewhere(saved)
+}
+
+/** True when the browser threw this tab's last page away (a phone does, to free memory) and this is it loading again. */
+const wasDiscarded = (): boolean =>
+  typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
+
+/** Change the saved run as it stands and write it back, leaving alone what this tab does not read. */
+function amendSaved(change: (v: Record<string, unknown>) => void): void {
+  try {
+    const v: unknown = JSON.parse(kv.get(RUN_KEY) ?? 'null')
+    if (!isObject(v)) return
+    change(v)
+    kv.set(RUN_KEY, JSON.stringify(v))
+  } catch {
+    // Unreadable or a full quota: this page still acts on what it read.
+  }
+}
+
+/**
+ * After a discard, the shot and pass this tab's own last page held read as
+ * let go, as a pagehide would have marked them. Only a discarded page: a
+ * duplicated tab starts with the same sessionStorage but was not discarded,
+ * so it still waits for the tab it was copied from. Written back, so other
+ * tabs stop holding their press for a page that is gone.
+ */
+function reclaimDiscarded(saved: Saved): Saved {
+  if (PREVIOUS === null || !wasDiscarded()) return saved
+  const left = (s: Stamp | null): boolean => s !== null && s.owner === PREVIOUS && !s.released
+  const shot = left(saved.pending)
+  const pass = left(saved.press)
+  if (!shot && !pass) return saved
+  amendSaved((v) => {
+    if (shot && isObject(v.pending)) v.pending.released = true
+    if (pass && isObject(v.press)) v.press.released = true
+  })
+  return {
+    ...saved,
+    pending: shot && saved.pending ? { ...saved.pending, released: true } : saved.pending,
+    press: pass && saved.press ? { ...saved.press, released: true } : saved.press,
+  }
+}
+
+/**
+ * A pass whose page went with no shot on the press, while it waited for
+ * ComfyUI's queue to empty or between two shots, left nothing to follow, and
+ * used to vanish without a word. This says which of its shots have no clip
+ * and were never sent, then drops the entry, so the note is said once.
+ *
+ * Only for this tab's own last page, which this page has replaced. Another
+ * tab's page that let its pass go may be in the browser's back and forward
+ * cache, and takes the pass back on its return if the entry is still there.
+ */
+function noteUnsentPass(press: StoredPress | null): void {
+  if (!press?.released || press.owner !== PREVIOUS || !press.order || !press.queue) return
+  const { order, queue } = press
+  const at = press.shotId ? queue.indexOf(press.shotId) : 0
+  const numbers = queue
+    .slice(Math.max(at, 0))
+    .filter((id) => !state.states[id]?.clip)
+    .map((id) => order.indexOf(id) + 1)
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b)
+  amendSaved((v) => {
+    if (isObject(v.press) && v.press.owner === press.owner && v.press.beat === press.beat) v.press = null
+  })
+  if (!numbers.length) return
+  const one = numbers.length === 1
+  const anyClip = order.some((id) => state.states[id]?.clip)
+  state = {
+    ...state,
+    id: newRunId(),
+    status: 'stopped',
+    startedAt: press.startedAt ?? null,
+    // Its last sign of life. When it went after that is not known.
+    finishedAt: press.beat,
+    order,
+    queue,
+    note: `The page before this one went before it sent ${shotsWord(numbers).toLowerCase()}, so ${one ? 'it has' : 'they have'} no clip and nothing is rendering ${one ? 'it' : 'them'}. ${anyClip ? 'Render what is missing' : 'Render the reel'} sends ${one ? 'it' : 'them'} from here.`,
+  }
 }
 
 /**
@@ -780,8 +1069,11 @@ function pickUp(p: StoredPending | null, atLoad: boolean): void {
       [p.shotId]: {
         ...(kept ?? blankShot(p.shotId, p.frames)),
         status: 'running',
-        stage: 'Still on the press from before the reload',
-        promptId: p.promptId,
+        stage: p.sending
+          ? 'Asking ComfyUI whether it arrived before the reload'
+          : 'Still on the press from before the reload',
+        // Not until ComfyUI shows it, for one still being sent (see follow).
+        promptId: p.sending ? null : p.promptId,
         startedAt: p.startedAt,
         finishedAt: null,
         error: null,
@@ -952,6 +1244,8 @@ type ShotRun = {
   order: string[]
   /** Aborted when another page has taken this pass over (see letGo). */
   lost: AbortSignal
+  /** The pass's last shot: once ComfyUI has it, nothing waits in the page. */
+  last: boolean
 }
 
 /** Rejects once `lost` aborts, so a shot stops waiting on a job another page now follows. */
@@ -965,7 +1259,8 @@ function whenLost(lost: AbortSignal): Promise<never> {
 
 async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 'stopped' | 'handed'> {
   const { shotId, job, previous, ctx, lost } = r
-  let workflow
+  if (lost.aborted) return 'handed'
+  let workflow: ApiWorkflow
   try {
     workflow = instantiateShot(job, previous)
   } catch (err) {
@@ -985,6 +1280,7 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
     promptId: null,
     value: 0,
     max: 0,
+    pass: null,
     error: null,
     detail: null,
     startedAt,
@@ -1007,11 +1303,16 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
     waiting = wait
     const idle = await waitForIdleComfy(wait.signal, (ahead) =>
       setShot(shotId, {
-        stage: `Waiting for ComfyUI to finish ${ahead === 1 ? 'one other job' : `${ahead} other jobs`}`,
+        stage:
+          ahead < 0
+            ? 'Waiting for ComfyUI, which is not answering and may be restarting'
+            : `Waiting for ComfyUI to finish ${ahead === 1 ? 'one other job' : `${ahead} other jobs`}`,
       }),
     )
     waiting = null
-    if (lost.aborted) return 'handed'
+    // A page that slept through the wait asks before it frees memory for a
+    // shot another page may now be sending.
+    if (lost.aborted || !holdStands()) return 'handed'
     if (!idle || state.stopRequested) return stopped()
     setShot(shotId, { stage: 'Freeing memory first' })
     await releaseComfyMemory()
@@ -1020,40 +1321,69 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
     setShot(shotId, { stage: 'Sending it to the press' })
   }
 
+  // The prompt id is made here and the shot saved under it, marked as still
+  // being sent, before the send: a page lost while the send is on its way
+  // leaves the next page a number to ask ComfyUI about (see follow).
+  const promptId = newPromptId()
+  let entry: Pending | null = null
+  try {
+    entry = {
+      shotId,
+      promptId,
+      label: r.label,
+      order: r.order,
+      startedAt,
+      made: r.made,
+      frames: job.params.length ?? 0,
+      composition: ctx.compositionFor(job),
+      familyLabel: ctx.familyLabel,
+      modelLabel: ctx.modelLabel,
+      sending: true,
+    }
+  } catch {
+    entry = null
+  }
+
   const onEvent = (e: ProgressEvent) => {
     // Another page follows the job now, and its events are that page's to report.
     if (lost.aborted) return
     if (e.phase === 'queued') {
       setShot(shotId, { promptId: e.promptId, stage: 'Queued' })
-      let entry: Pending | null = null
-      try {
-        entry = {
-          shotId,
-          promptId: e.promptId,
-          label: r.label,
-          order: r.order,
-          startedAt,
-          made: r.made,
-          frames: job.params.length ?? 0,
-          composition: ctx.compositionFor(job),
-          familyLabel: ctx.familyLabel,
-          modelLabel: ctx.modelLabel,
-        }
-      } catch {
-        entry = null
-      }
-      setPending(entry)
+      // The release above counts only if nothing reached ComfyUI between it
+      // and this shot, and the video desk, another tab or anything else could
+      // have sent work in that moment. If anything else is in the queue now,
+      // the release is sent again: ComfyUI applies one that arrives while a
+      // job runs after that job, before it takes the next.
+      if (r.release) void releaseIfOthersAhead(e.promptId).catch(() => undefined)
+      // ComfyUI's answer names the id; one too old to take ours names its own.
+      setPending(entry && { ...entry, promptId: e.promptId, sending: false })
       if (state.stopRequested) void cancelJob(e.promptId).catch(() => undefined)
+      // Nothing of the pass waits in the page any more, and following the
+      // shot needs no screen: a reload picks it up from the saved entry. Kept
+      // on, a phone left on the table lit its screen through the whole render.
+      if (r.last) {
+        awake?.()
+        awake = null
+      }
     } else if (e.phase === 'running') {
-      setShot(shotId, { status: 'running', value: e.value, max: e.max, stage: 'Drawing' })
+      // A node between two passes keeps the pass it follows.
+      const pass = samplerPass(workflow, e.node) ?? shotOf(shotId)?.pass ?? null
+      setShot(shotId, { status: 'running', value: e.value, max: e.max, pass, stage: 'Drawing' })
     } else if (e.phase === 'preview') {
       setShot(shotId, { previewUrl: e.url })
     }
   }
 
+  // Last look before the shot goes: a page that slept through the wait above
+  // may find another page has taken the reel over meanwhile.
+  if (!holdStands()) return 'handed'
+  setPending(entry)
+
   try {
-    const files = await Promise.race([run(workflow, onEvent), whenLost(lost)])
-    if (lost.aborted) return 'handed'
+    const files = await Promise.race([run(workflow, onEvent, { promptId }), whenLost(lost)])
+    // A thawed page's job can land before anything else runs, so the check is
+    // made again before filing: the page that took the shot over files it.
+    if (lost.aborted || !holdStands()) return 'handed'
     const finishedAt = Date.now()
     const clip = files.find((f) => f.kind === 'video') ?? null
     const frame = chainFrameOf(files)
@@ -1086,7 +1416,7 @@ async function renderShot(r: ShotRun): Promise<'done' | 'unchanged' | 'error' | 
     setPending(null)
     return filed.unchanged ? 'unchanged' : 'done'
   } catch (err) {
-    if (lost.aborted) return 'handed'
+    if (lost.aborted || !holdStands()) return 'handed'
     const f = faultOf(err)
     const finishedAt = Date.now()
     setShot(shotId, {
@@ -1125,6 +1455,14 @@ function shotsWord(numbers: readonly number[]): string {
 
 async function walk(pass: Pass): Promise<void> {
   const lost = startWalking()
+  // Only this page sends the next shot, and a phone that locks its screen
+  // suspends the page, so the screen is kept on while shots wait in the page
+  // to be sent, where the browser allows it (a secure page; see
+  // lib/wakeLock), and let go once ComfyUI has the last one (renderShot). A
+  // shot picked up after a reload was sent by the page before, so following
+  // it does not ask.
+  awake?.()
+  awake = holdAwake('reel')
   // Saved at once, so another tab holds its press from the first moment, even
   // while this pass waits for ComfyUI's queue to empty before its first shot.
   persist()
@@ -1164,6 +1502,7 @@ async function walk(pass: Pass): Promise<void> {
     setRun({ currentShotId: shotId })
     // The saved pass names its shot, for another tab to show where it is.
     persist()
+    if (lost.aborted) break
 
     // The desk refuses these before the press, and this is the last place
     // before the server, so the same two checks stand here too.
@@ -1211,6 +1550,7 @@ async function walk(pass: Pass): Promise<void> {
       label: `Shot ${index + 1}`,
       order,
       lost,
+      last: position === indices.length - 1,
     })
 
     if (result === 'handed') break
@@ -1400,11 +1740,30 @@ if (typeof window !== 'undefined') {
     else letGo()
   })
 }
+if (typeof document !== 'undefined') {
+  // A phone thaws a frozen tab, or shows a hidden one again, with no pageshow.
+  // The save asks whether another page took over meanwhile (holdStands), and
+  // otherwise freshens the beat that other tabs read, before a slowed timer
+  // gets to it.
+  const back = () => {
+    if (holding()) persist()
+  }
+  document.addEventListener('resume', back)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') back()
+  })
+}
 
 // Another tab saved the run. While this one renders nothing it takes in that
-// tab's strip, and keeps an eye on what that tab has on the press.
+// tab's strip, and keeps an eye on what that tab has on the press. While this
+// one holds the press, no other page writes the run unless it has taken over.
 onStorage(RUN_KEY, (value) => {
-  if (walking) return
+  if (walking) {
+    // The value the other page wrote, rather than a read: a read falls back
+    // to this tab's own copy when that page removed the run.
+    holdStands(value)
+    return
+  }
   const saved = readStored(value)
   mirror(saved)
   lookElsewhere(saved)
