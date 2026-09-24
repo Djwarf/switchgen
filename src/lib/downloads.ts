@@ -9,6 +9,12 @@ import { useSyncExternalStore } from 'react'
  * up, and says whether to keep the partial, so a kept one resumes rather than
  * starting again. The LoRA picker used to own this reader; the vision tagger
  * and the catalogue need it too.
+ *
+ * A fetch is the server's, not the page's. The server goes on with it when
+ * the stream closes, which on a phone is the usual case: a reload, a tab the
+ * browser discarded, a locked screen, a change of network. So a lost stream
+ * is not a failed fetch. The page asks GET /api/download/status instead, and
+ * a reloaded page takes up the plans it finds running there.
  */
 
 export type FetchProgress = {
@@ -55,6 +61,83 @@ export type DownloadJob = {
 }
 
 /**
+ * A family fetch as GET /api/download/status lists it: the one running, or
+ * else the one started last, kept for ten minutes after it ends. The server
+ * may add the plan's whole file list and, on the file it is on, the job id
+ * and speed; the page takes them when they are there, and otherwise reads
+ * the id and speed off the matching entry in `downloads`.
+ */
+export type ServerPlan = {
+  family: string | null
+  state: 'running' | 'done' | 'error' | 'cancelled'
+  current: {
+    filename: string
+    index: number
+    count: number
+    done: number
+    total: number
+    pct: number
+    etaSec: number | null
+    jobId?: string
+    speed?: number
+  } | null
+  finished: string[]
+  error: string | null
+  files?: PlanFile[]
+}
+
+/** GET /api/download/status: the files being fetched now, and the plans. */
+export type DownloadStatus = { downloads: DownloadJob[]; plans: ServerPlan[] }
+
+/**
+ * The server answered the request without a stream, so nothing was started
+ * for it and there is nothing to follow. Anything else that ends a stream
+ * early is the connection, and the fetch may well be going on without it.
+ */
+class Refused extends Error {}
+
+/** How often a fetch the page follows through the server is asked about. */
+const POLL_MS = 2000
+
+/** Settles after `ms`, or rejects at once when `signal` aborts. */
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason)
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * What the server is fetching now and the plans it ran lately, or null when
+ * it did not answer (restarting, or the phone off the network). A server
+ * that answers without `plans` lists none.
+ */
+export async function readDownloadStatus(): Promise<DownloadStatus | null> {
+  try {
+    const res = await fetch('/api/download/status', { headers: { Accept: 'application/json' } })
+    if (!res.ok || !(res.headers.get('content-type') ?? '').includes('json')) return null
+    const data = (await res.json()) as Partial<DownloadStatus> | null
+    return {
+      downloads: Array.isArray(data?.downloads) ? data.downloads : [],
+      plans: Array.isArray(data?.plans) ? data.plans : [],
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * POST a download request and read its event stream. A refused request
  * answers JSON, and that error is thrown with the server's own sentence.
  */
@@ -85,7 +168,7 @@ async function streamDownload(
       onEvent({ event: 'done', family: data.family ?? null, files: [], bytes: 0 })
       return
     }
-    throw new Error(data.error ?? `HTTP ${res.status}`)
+    throw new Refused(data.error ?? `HTTP ${res.status}`)
   }
 
   const reader = res.body.getReader()
@@ -148,9 +231,9 @@ type Stream = {
 
 /**
  * A download stream that can be stopped for real. Aborting the fetch alone
- * only closes the socket, and the server is not guaranteed to notice: aria2c
- * went on to the end of the file, and a plan went on to its next one. So a
- * stop names the job to POST /api/download/cancel first. The id arrives with
+ * only closes the socket, and a plan that has begun goes on without its page
+ * (see the top of this file). So a stop names the job to POST
+ * /api/download/cancel first. The id arrives with
  * the 'start' frame, and a stop pressed before it (the server still checking
  * the plan) waits for that frame rather than hanging up on a job it cannot
  * name. After a stop, frames are not passed on, since the caller has already
@@ -203,10 +286,84 @@ function progressOf(job: DownloadJob, state: FetchProgress['state']): FetchProgr
   }
 }
 
+/** Said when the stream is lost before the server named the file it started. */
+const LOST_BEFORE_START =
+  'Lost touch with the server before the fetch began, and nothing is fetching for it there now.'
+
+/** The files the models listing names at all (server/api.mjs WEIGHTS): weights, not the tagger's model or tag list. */
+const LISTED = /\.(safetensors|gguf|ckpt|pt|pth|sft|bin)$/i
+
+/**
+ * Whether the models listing has a whole file at `dest` (relative to the
+ * models root), or null when it did not answer. The listing leaves out a file
+ * aria2c has not finished, so a name there is a file that landed.
+ */
+async function landedAt(dest: string): Promise<boolean | null> {
+  try {
+    const res = await fetch('/api/models', { headers: { Accept: 'application/json' } })
+    if (!res.ok) return null
+    const { files } = (await res.json()) as { files?: { rel?: string }[] }
+    return (files ?? []).some((f) => (f.rel ?? '').replace(/\\/g, '/') === dest)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Follow one file through the server's list after its stream was lost:
+ * progress while the server lists the job, and then how it ended. The status
+ * lists only family plans, so a file fetched by address is looked for in the
+ * models listing once its job has gone. Resolves once it landed; rejects with
+ * a plain sentence when it cannot be found there.
+ */
+async function followFile(
+  job: { id: string; filename: string; dest: string },
+  onProgress: (p: FetchProgress) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  let total = 0
+  const landedNow = () => {
+    onProgress({ state: 'done', pct: 1, done: total, total, speed: 0, etaSec: null, error: null })
+  }
+  for (;;) {
+    await wait(POLL_MS, signal)
+    const status = await readDownloadStatus()
+    // No answer is not an ending: the phone may be between networks.
+    if (!status) continue
+    const listed = status.downloads.find((j) => j.id === job.id)
+    if (listed && (listed.state === 'starting' || listed.state === 'downloading')) {
+      const p = progressOf(listed, listed.state)
+      total = p.total || total
+      onProgress(p)
+      continue
+    }
+    // The job leaves the list once its file is done or has failed; one still
+    // listed as done, failed or cancelled is on its way out.
+    if (listed) continue
+    if (status.plans.some((p) => p.finished.includes(job.filename))) return landedNow()
+    if (!LISTED.test(job.dest)) {
+      throw new Error(
+        `Lost touch with the server during the fetch, and it no longer lists ${job.filename}, so whether it ` +
+          'landed is not known here. Fetching it again finishes it, or finds it already there.',
+      )
+    }
+    const landed = await landedAt(job.dest)
+    if (landed === null) continue
+    if (landed) return landedNow()
+    throw new Error(
+      `Lost touch with the server during the fetch, and ${job.filename} is not in the models folder now. ` +
+        'Fetching it again takes up any part already on disk.',
+    )
+  }
+}
+
 /**
  * Fetch one file. Aborting `signal` rejects at once, so the caller can say it
  * stopped, while the stop itself goes on behind: the server is told to cancel
  * the job and keep the partial, so fetching the file again resumes it.
+ *
+ * When the stream is lost part way, the fetch goes on at the server, so this
+ * follows it there rather than reporting the connection as a failed fetch.
  */
 export async function downloadFile(
   spec: DownloadSpec,
@@ -215,22 +372,53 @@ export async function downloadFile(
 ): Promise<void> {
   signal?.throwIfAborted()
   let failure: string | null = null
+  let started: { id: string; filename: string; dest: string } | null = null
+  /** The stream said how the fetch ended, with 'done' or 'error'. */
+  let told = false
+  /** The stream is gone and the server's list is followed instead. */
+  let following = false
   const stream = openStream({ url: spec.url, filename: spec.filename, dest: spec.dest }, (e) => {
-    if (e.event === 'start') onProgress(progressOf(e.job, 'starting'))
-    else if (e.event === 'progress') onProgress(progressOf(e.job, 'downloading'))
+    if (e.event === 'start') {
+      started = { id: e.job.id, filename: e.job.filename, dest: e.job.dest }
+      onProgress(progressOf(e.job, 'starting'))
+    } else if (e.event === 'progress') onProgress(progressOf(e.job, 'downloading'))
     else if (e.event === 'file' || e.event === 'skip') onProgress(progressOf(e.job, 'done'))
     else if (e.event === 'error') {
       failure = e.job.error ?? 'the download failed'
       onProgress({ state: 'error', pct: 0, done: 0, total: 0, speed: 0, etaSec: null, error: failure })
     }
+    if (e.event === 'done' || e.event === 'error') told = true
   })
+  const lost = async (): Promise<void> => {
+    following = true
+    // Lost before the server named the job: it may still have begun, so the
+    // server's list is asked once before anything is said about it.
+    if (!started) {
+      await wait(POLL_MS, signal)
+      const status = await readDownloadStatus()
+      const job = status?.downloads.find((j) => j.family === null && j.filename === spec.filename)
+      if (!job) throw new Error(status ? LOST_BEFORE_START : 'Lost touch with the server before the fetch began.')
+      started = { id: job.id, filename: job.filename, dest: job.dest }
+    }
+    return followFile(started, onProgress, signal)
+  }
+  const outcome = stream.done.then(
+    () => (told ? undefined : lost()),
+    (err: unknown) => {
+      if (err instanceof Refused || signal?.aborted) throw err
+      return lost()
+    },
+  )
   await new Promise<void>((resolve, reject) => {
     const onAbort = () => {
-      void stream.stop(true)
+      // A followed fetch has no stream left to stop, so it is cancelled by
+      // the id its stream named, keeping the partial all the same.
+      if (following && started) void postCancel(started.id, true)
+      else void stream.stop(true)
       reject(signal?.reason ?? new DOMException('Stopped', 'AbortError'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
-    void stream.done.then(resolve, reject).finally(() => signal?.removeEventListener('abort', onAbort))
+    void outcome.then(resolve, reject).finally(() => signal?.removeEventListener('abort', onAbort))
   })
   if (failure) throw new Error(failure)
 }
@@ -247,13 +435,26 @@ export type PlanRun = {
   current: (FetchProgress & { filename: string; jobId: string; index: number; count: number }) | null
   finished: string[]
   error: string | null
-  /** This run's own stream. Also what tells a run apart from a later one for the same family. */
+  /** Stop this run at the server: the file it is on, and every file after it. */
   stop: (keepPartial: boolean) => Promise<void>
+  /** Tells this run apart from a later one for the same family. */
+  serial: number
+  /**
+   * The page follows this run by asking the server every couple of seconds
+   * rather than through a stream of its own: it was taken up after a reload,
+   * its stream was lost, or the page came back from the background.
+   */
+  followed: boolean
+  /** A followed run whose last question went unanswered; what it shows is the server's last answer. */
+  outOfTouch: boolean
 }
 
 let runs: ReadonlyMap<string, PlanRun> = new Map()
+let serials = 0
 const runListeners = new Set<() => void>()
 const landedListeners = new Set<(family: string) => void>()
+/** Runs whose landing has been announced, so a stream and the server's list cannot both announce it. */
+const announced = new Set<number>()
 
 function emitRuns(): void {
   for (const fn of [...runListeners]) {
@@ -275,9 +476,12 @@ function subscribeDownloads(fn: () => void): () => void {
   return () => { runListeners.delete(fn) }
 }
 
-function downloadRuns(): ReadonlyMap<string, PlanRun> {
+/** The runs as they stand. */
+export function downloadRuns(): ReadonlyMap<string, PlanRun> {
   return runs
 }
+
+const live = (run: PlanRun | undefined): run is PlanRun => run?.state === 'starting' || run?.state === 'running'
 
 /**
  * Hear about every family whose files all landed, with its catalogue id.
@@ -291,14 +495,21 @@ export function onPlanLanded(fn: (family: string) => void): () => void {
   return () => { landedListeners.delete(fn) }
 }
 
+function announceLanded(family: string, serial: number): void {
+  if (announced.has(serial)) return
+  announced.add(serial)
+  for (const fn of [...landedListeners]) {
+    try { fn(family) } catch { /* one broken listener must not stop the rest */ }
+  }
+}
+
 /**
  * Fetch everything a family is missing. One run per family at a time; a
  * second request for a running family is ignored. When every file has
  * landed the run reads 'done' and onPlanLanded's listeners hear of it.
  */
 export function startPlan(req: { family: string; model?: string | null; include?: string[]; force?: boolean }): void {
-  const existing = runs.get(req.family)
-  if (existing && (existing.state === 'starting' || existing.state === 'running')) return
+  if (live(runs.get(req.family))) return
 
   const body: Record<string, unknown> = { family: req.family }
   if (req.model) body.model = req.model
@@ -306,15 +517,17 @@ export function startPlan(req: { family: string; model?: string | null; include?
   if (req.force) body.force = true
 
   // A family stopped and fetched again gets a new run while the old stream
-  // may still be winding down, so each stream patches only its own run.
-  const own = () => runs.get(req.family)?.stop === stream.stop
+  // may still be winding down, so each stream patches only its own run, and
+  // only while the page reads the run through it: once the run is followed
+  // through the server, the server's list is what it shows.
+  const serial = ++serials
+  const mine = () => runs.get(req.family)?.serial === serial
+  const own = () => mine() && !runs.get(req.family)?.followed
   const stream = openStream(body, (e) => {
     if (e.event === 'done') {
       // The files are on disk whatever became of the run on screen.
-      if (own()) patchRun(req.family, { state: 'done', current: null })
-      for (const fn of [...landedListeners]) {
-        try { fn(req.family) } catch { /* one broken listener must not stop the rest */ }
-      }
+      if (mine()) patchRun(req.family, { state: 'done', current: null, outOfTouch: false })
+      announceLanded(req.family, serial)
       return
     }
     if (!own()) return
@@ -343,16 +556,26 @@ export function startPlan(req: { family: string; model?: string | null; include?
   })
 
   const next = new Map(runs)
-  next.set(req.family, { family: req.family, state: 'starting', files: [], current: null, finished: [], error: null, stop: stream.stop })
+  next.set(req.family, {
+    family: req.family, state: 'starting', files: [], current: null, finished: [], error: null,
+    stop: stream.stop, serial, followed: false, outOfTouch: false,
+  })
   runs = next
   emitRuns()
 
-  // A stop marks the run cancelled before it hangs up, so a run still going
-  // when the stream fails has failed.
-  stream.done.catch((err: unknown) => {
-    const run = runs.get(req.family)
-    if (own() && run && (run.state === 'starting' || run.state === 'running')) {
-      patchRun(req.family, { state: 'error', error: err instanceof Error ? err.message : String(err), current: null })
+  // A stop marks the run cancelled before it hangs up, and a refusal is the
+  // server's own answer, so a run still going when its stream ends any other
+  // way lost its connection, not its fetch: follow it through the server.
+  const lost = () => {
+    if (own()) follow(req.family)
+  }
+  stream.done.then(lost, (err: unknown) => {
+    if (!(err instanceof Refused)) {
+      lost()
+      return
+    }
+    if (own() && live(runs.get(req.family))) {
+      patchRun(req.family, { state: 'error', error: err.message, current: null })
     }
   })
 }
@@ -364,19 +587,222 @@ export function startPlan(req: { family: string; model?: string | null; include?
  */
 export async function cancelPlan(family: string, keepPartial = false): Promise<void> {
   const run = runs.get(family)
-  if (!run || (run.state !== 'starting' && run.state !== 'running')) return
-  patchRun(family, { state: 'cancelled', current: null })
+  if (!live(run)) return
+  patchRun(family, { state: 'cancelled', current: null, outOfTouch: false })
   await run.stop(keepPartial)
 }
 
 /** Forget a finished, failed or cancelled run, so the panel shows the family plain again. */
 export function forgetPlan(family: string): void {
   const run = runs.get(family)
-  if (!run || run.state === 'running' || run.state === 'starting') return
+  if (!run || live(run)) return
   const next = new Map(runs)
   next.delete(family)
   runs = next
   emitRuns()
+}
+
+// ---------------------------------------------------------------------------
+// Following a run through the server's list
+// ---------------------------------------------------------------------------
+
+/** Said when a followed run's plan is no longer listed. */
+export const PLAN_GONE =
+  'Lost track of this fetch: the server no longer lists it, either because it restarted or because the fetch ' +
+  'ended more than ten minutes ago. Dismiss this to read the disk again.'
+
+/**
+ * The server's entry for a family: the running plan when there is one, since
+ * only one plan runs per family, and otherwise the last one listed, which is
+ * the one that ended most recently.
+ */
+export function planFor(plans: readonly ServerPlan[], family: string): ServerPlan | null {
+  let last: ServerPlan | null = null
+  for (const p of plans) {
+    if (p.family !== family) continue
+    if (p.state === 'running') return p
+    last = p
+  }
+  return last
+}
+
+const num = (n: unknown): number => (typeof n === 'number' && Number.isFinite(n) ? n : 0)
+
+/** The file a running plan is on, with the id and speed of its job when the server lists it. */
+function currentOf(plan: ServerPlan, jobs: readonly DownloadJob[]): PlanRun['current'] {
+  const c = plan.current
+  const job = jobs.find((j) => j.family === plan.family && (!c || j.filename === c.filename))
+  if (!c && !job) return null
+  const state = job?.state === 'starting' ? 'starting' : 'downloading'
+  if (!c) return { ...progressOf(job!, state), filename: job!.filename, jobId: job!.id, index: job!.fileIndex, count: job!.fileCount }
+  return {
+    state,
+    pct: num(c.pct),
+    done: num(c.done),
+    total: num(c.total),
+    speed: num(c.speed ?? job?.speed),
+    etaSec: typeof c.etaSec === 'number' ? c.etaSec : null,
+    error: null,
+    filename: c.filename,
+    jobId: c.jobId ?? job?.id ?? '',
+    index: num(c.index),
+    count: num(c.count),
+  }
+}
+
+/**
+ * What a followed run shows, read off the server's list. A run whose stream
+ * was lost before the server said it began ('starting') is the server's only
+ * if a plan for its family is running: a lost request stops a plan during its
+ * checks, and an ended plan listed for the family is then an earlier one.
+ */
+export function followedFields(
+  run: Pick<PlanRun, 'family' | 'state' | 'files'>,
+  status: DownloadStatus,
+): Pick<PlanRun, 'state' | 'current' | 'finished' | 'error' | 'files' | 'outOfTouch'> {
+  const plan = planFor(status.plans, run.family)
+  if (!plan || (run.state === 'starting' && plan.state !== 'running')) {
+    return {
+      state: 'error',
+      current: null,
+      finished: [],
+      error: run.state === 'starting' ? LOST_BEFORE_START : PLAN_GONE,
+      files: run.files,
+      outOfTouch: false,
+    }
+  }
+  const current = plan.state === 'running' ? currentOf(plan, status.downloads) : null
+  const finished = Array.isArray(plan.finished) ? plan.finished : []
+  // A run taken up after a reload never saw the plan's list of files. The
+  // server's list is used when it sends one; otherwise the run names the
+  // files it knows of, those landed and the one being fetched.
+  const files = run.files.length
+    ? run.files
+    : Array.isArray(plan.files) && plan.files.length
+      ? plan.files
+      : [...finished, ...(current ? [current.filename] : [])].map((filename) => ({
+          filename, dest: '', sizeBytes: null, gated: false,
+        }))
+  return {
+    state: plan.state,
+    current,
+    finished,
+    error: plan.state === 'error' ? plan.error ?? 'the download failed' : null,
+    files,
+    outOfTouch: false,
+  }
+}
+
+/**
+ * Stop a followed run: find the file its plan is on in the server's list and
+ * cancel that job by id, as a stream's own stop does. Between two files no
+ * job is listed for a moment, so it asks again a few times.
+ */
+async function cancelOnServer(family: string, keepPartial: boolean): Promise<void> {
+  for (let tries = 0; tries < 5; tries++) {
+    const status = await readDownloadStatus()
+    if (status) {
+      const onIt = planFor(status.plans, family)?.current?.jobId
+      const job = status.downloads.find((j) => (onIt ? j.id === onIt : j.family === family))
+      if (job?.state === 'starting' || job?.state === 'downloading') {
+        await postCancel(job.id, keepPartial)
+        return
+      }
+      // Already stopping, or nothing is running for the family any more.
+      if (job?.state === 'cancelled') return
+      if (!job && planFor(status.plans, family)?.state !== 'running') return
+    }
+    await wait(1000)
+  }
+}
+
+/**
+ * Follow a live run through the server's list from now on. The first look
+ * is a poll away rather than at once, which gives a plan whose request was
+ * lost during its checks the moment it needs to show up in the list.
+ */
+function follow(family: string): void {
+  const run = runs.get(family)
+  if (!live(run) || run.followed) return
+  patchRun(family, { followed: true, stop: (keepPartial) => cancelOnServer(family, keepPartial) })
+  schedulePoll()
+}
+
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+
+function schedulePoll(): void {
+  if (pollTimer !== null) return
+  if (![...runs.values()].some((r) => r.followed && live(r))) return
+  pollTimer = setTimeout(() => {
+    pollTimer = null
+    void resumeRuns()
+  }, POLL_MS)
+}
+
+function applyStatus(status: DownloadStatus | null): void {
+  for (const run of [...runs.values()]) {
+    if (!run.followed || !live(run)) continue
+    if (!status) {
+      if (!run.outOfTouch) patchRun(run.family, { outOfTouch: true })
+      continue
+    }
+    const fields = followedFields(run, status)
+    patchRun(run.family, fields)
+    if (fields.state === 'done') announceLanded(run.family, run.serial)
+  }
+  // A plan running at the server that no run here knows of: started before a
+  // reload, or from another tab. Taken up so it shows, with its Stop. So is
+  // one whose run here has failed, which covers a run this page lost track
+  // of: the server running a plan for the family is the later news.
+  for (const plan of status?.plans ?? []) {
+    const family = plan.family
+    if (typeof family !== 'string' || plan.state !== 'running') continue
+    const here = runs.get(family)
+    if (here && here.state !== 'error') continue
+    const run: PlanRun = {
+      family, state: 'running', files: [], current: null, finished: [], error: null,
+      stop: (keepPartial) => cancelOnServer(family, keepPartial),
+      serial: ++serials, followed: true, outOfTouch: false,
+    }
+    const next = new Map(runs)
+    next.set(family, { ...run, ...followedFields(run, status!) })
+    runs = next
+    emitRuns()
+  }
+  schedulePoll()
+}
+
+let resuming: Promise<void> | null = null
+
+/**
+ * Ask the server where its fetches stand: bring every followed run up to
+ * date, and take up the plans running there that no run here knows of. Runs
+ * once when the page loads, again whenever it comes back into view, and
+ * every couple of seconds while a followed run is going.
+ */
+export function resumeRuns(): Promise<void> {
+  resuming ??= (async () => {
+    try {
+      applyStatus(await readDownloadStatus())
+    } finally {
+      resuming = null
+    }
+  })()
+  return resuming
+}
+
+// A phone that slept may hold a stream open that will never speak again: the
+// connection went with the network it was on, and nothing tells the page. So
+// when the page comes back into view, every run that has begun is followed
+// through the server from then on, and anything started meanwhile is taken
+// up. Not in a test, which has no document.
+if (typeof document !== 'undefined') {
+  void resumeRuns()
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return
+    for (const run of [...runs.values()]) if (run.state === 'running') follow(run.family)
+    void resumeRuns()
+  })
 }
 
 /**

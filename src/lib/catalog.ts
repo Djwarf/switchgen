@@ -149,6 +149,11 @@ export function noToken(plan: CatalogPlan): string | null {
  * too little disk, a URL that failed its last check, or a gated file with no
  * token each hold it back, and each asks something different of the reader.
  * So the server's own sentences are quoted rather than summed up.
+ *
+ * A file on disk under the catalogue's name but not its size is not fetched
+ * over, and the verdict of a plan that will not run here leaves it out, so
+ * the question names it: once fetched, the family counts as installed and
+ * loads that file, which nothing here has checked.
  */
 export function heldBack(plan: CatalogPlan): string {
   const parts = plan.fits
@@ -156,5 +161,13 @@ export function heldBack(plan: CatalogPlan): string {
     : ['The server holds this back.', ...(plan.blockers.length ? plan.blockers : [plan.verdict])]
   const token = noToken(plan)
   if (token) parts.push(token)
+  const asIs = plan.asIs ?? []
+  if (asIs.length) {
+    const one = asIs.length === 1
+    parts.push(
+      `The fetch leaves ${asIs.join(', ')} as ${one ? 'it is' : 'they are'} on disk: not the size the catalogue ` +
+        `lists, and nothing here has checked that ${one ? 'it loads' : 'they load'}.`,
+    )
+  }
   return parts.join(' ')
 }

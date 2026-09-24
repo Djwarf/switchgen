@@ -33,7 +33,8 @@ import {
   type StackEntry,
 } from '../../lib/loras'
 import { Badge, Rail, RING, Tap, clamp } from './bits'
-import { MEASURED_SINGLES, capFor, ratioText } from './measured'
+import { MEASURED_SINGLES, capFor } from './measured'
+import { measuredText } from './measuredText'
 
 export function Row({
   entry,
@@ -192,11 +193,7 @@ export function Row({
           <span className="uppercase tracking-[0.14em] text-[0.5625rem] text-grey-500">
             measured here
           </span>{' '}
-          <span className="tabular-nums">
-            {points
-              .map((p) => `${ratioText(p.ratio)} of base at ${p.strength.toFixed(1)}`)
-              .join(', ')}
-          </span>
+          <span className="tabular-nums">{measuredText(points, !!info?.trigger.trim())}</span>
           . Sharpness, on Pony Diffusion V6 XL at one held seed. It says nothing about whether the
           anatomy comes out right.
         </p>

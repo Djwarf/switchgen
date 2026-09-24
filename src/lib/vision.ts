@@ -220,6 +220,11 @@ export type VisionReport = {
   considered: { ranked: number; noTagData: number }
   /** Present when nothing could be read, with the reason in plain words. */
   unavailable?: string
+  /**
+   * The server would not start a reader while memory was short (see
+   * VisionBusy). Nothing was read, and asking again later is the remedy.
+   */
+  busy?: 'memory'
 }
 
 export type VisionCapabilities = {
@@ -539,6 +544,25 @@ function anatomyFromRating(rating: ImageRating | null): AnatomyLevel {
 // The server side
 // ---------------------------------------------------------------------------
 
+/**
+ * The server would not start a reader because memory is short. A render
+ * holds most of it, and a reader on top can take the machine under the line
+ * where it stops ComfyUI to free memory, losing the render. The message is
+ * the server's own sentence, with both of its figures, and is shown as it
+ * stands. Nothing was read; the same request can be made again once the
+ * render is done.
+ */
+export class VisionBusy extends Error {
+  readonly busy = 'memory' as const
+}
+
+/** The error for a refused answer: VisionBusy when the server said memory is short. */
+function refusal(status: number, data: Record<string, unknown>, fallback: string): Error {
+  const message = typeof data.error === 'string' && data.error ? data.error : fallback
+  if (data.busy === 'memory') return new VisionBusy(message)
+  return Object.assign(new Error(message), { status, data })
+}
+
 function refBody(source: ImageSource): { json: string } | { bytes: Blob } {
   if (source instanceof Blob) return { bytes: source }
   const ref: ImageRef = typeof source === 'string' ? { kind: 'output', rel: source } : source
@@ -564,7 +588,7 @@ async function post(path: string, source: ImageSource, extra?: Record<string, un
     throw new Error('the vision endpoint is not mounted on this server')
   }
   const data = parsed as Record<string, unknown>
-  if (!res.ok) throw Object.assign(new Error(String(data.error ?? res.statusText)), { status: res.status, data })
+  if (!res.ok) throw refusal(res.status, data, res.statusText)
   return data
 }
 
@@ -670,7 +694,8 @@ export async function inspectImage(
     data = await post(path, file, undefined, options.signal)
   } catch (err) {
     if ((err as { name?: string }).name === 'AbortError') throw err
-    return { ...empty, unavailable: String((err as Error).message ?? err) }
+    const unavailable = String((err as Error).message ?? err)
+    return err instanceof VisionBusy ? { ...empty, unavailable, busy: 'memory' } : { ...empty, unavailable }
   }
 
   const tagRows = (data.tag as { rows?: TagRow[] } | undefined)?.rows ?? []
@@ -717,7 +742,9 @@ export type TaggedRow = ImageTags & { kind: ImageKind; rel: string; error?: stri
  * For the archive's "tag everything that has no tags" pass. Rows come back
  * with the caller's own reference attached, so a batch is reassembled by
  * reference rather than by trusting array order. A row with `error` set is a
- * file the server could not read; the others are still good.
+ * file the server could not read; the others are still good. A server short
+ * of memory refuses the whole batch with a VisionBusy, which is a pause, not
+ * a failure: nothing in the batch was read, and it can be asked again.
  */
 export async function tagImages(refs: readonly ImageRef[], signal?: AbortSignal): Promise<TaggedRow[]> {
   if (!refs.length) return []
@@ -732,7 +759,7 @@ export async function tagImages(refs: readonly ImageRef[], signal?: AbortSignal)
   try { data = JSON.parse(text) as Record<string, unknown> } catch {
     throw new Error('the vision endpoint is not mounted on this server')
   }
-  if (!res.ok) throw new Error(String(data.error ?? res.statusText))
+  if (!res.ok) throw refusal(res.status, data, res.statusText)
   const rows = (data.tag as { rows?: (TagRow & { kind?: ImageKind; rel?: string })[] } | undefined)?.rows ?? []
   return rows.map(row => ({
     width: row.width,

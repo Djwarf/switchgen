@@ -110,7 +110,15 @@ export function Reading(props: ReadingProps) {
     void installFiles(files.length ? files : caps.install.files, setInstalling)
       .then(() => refreshCapabilities())
       .then((c) => setCaps(c))
-      .catch((e: unknown) => setInstallError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => {
+        setInstallError(e instanceof Error ? e.message : String(e))
+        // A fetch this page lost touch with goes on at the server and may
+        // have landed all the same, so the server is asked what is there.
+        // An unanswered probe is not an answer and is not put on screen.
+        return refreshCapabilities().then((c) => {
+          if (c.server !== null) setCaps(c)
+        })
+      })
       .finally(() => setInstalling(null))
   }
 
@@ -192,6 +200,15 @@ function PictureReading({
     const bases = base ? [base] : undefined
     void inspectImage(source, { bases, limit: 4 })
       .then((r) => {
+        // Nothing read at all: the server refused (short of memory while a
+        // render runs, in its own words) or did not answer. That is not a
+        // reading of this picture, so it is neither kept for a second look
+        // nor laid out as one; the reason is said under the link, which
+        // stays, so asking again later is one tap.
+        if (r.unavailable && !r.tags && !r.facts) {
+          setError(r.unavailable)
+          return
+        }
         readings.set(cacheKey, r)
         setReport(r)
         if (!r.unavailable) onRead?.(r)

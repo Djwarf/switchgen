@@ -5,7 +5,8 @@
  * this app has a verified graph for, what each is missing, how big that is,
  * and whether the server thinks it will fit. Fetching runs through the same
  * download server the add-on picker uses, and keeps going if the reader
- * leaves this panel: the run lives in a store, not in this component.
+ * leaves this panel: the run lives in a store, not in this component, and
+ * the fetch itself at the server, which a reloaded page takes up again.
  *
  * Two facts shape the copy. The catalogue and the registry were written
  * apart, so a family is matched to its catalogue entry by the files it loads
@@ -320,13 +321,20 @@ export function CataloguePanel({
           const plan = plans[id]
           const files = cat.installed.missing
           const gated = cat.installed.gatedMissing.length > 0
-          // A cautioned plan's verdict already names the files kept as they are.
-          const cautioned =
+          // The verdict of a plan that fits quotes the server's reasons, and
+          // those name each file kept as it is, so a row held back only for a
+          // missing token leaves them to it. A plan that will not run here
+          // quotes only what blocks it, so there the row still names them:
+          // otherwise nothing would say, as the reader decides whether to
+          // fetch anyway, that the fetch leaves those files alone.
+          const verdictNamesThem =
             !run &&
             plan !== undefined &&
             plan !== 'loading' &&
-            (!plan.fits || (plan.gated.files.length > 0 && !plan.gated.tokenPresent))
-          const keptAsIs = cautioned ? [] : cat.installed.files.filter((f) => f.conflict && loads(row.def, f.filename))
+            plan.fits &&
+            plan.gated.files.length > 0 &&
+            !plan.gated.tokenPresent
+          const keptAsIs = verdictNamesThem ? [] : cat.installed.files.filter((f) => f.conflict && loads(row.def, f.filename))
           const failed = askFailed[id]
           return (
             <li key={row.def.id} className="py-2">
@@ -359,10 +367,32 @@ export function CataloguePanel({
                     <Link onClick={() => void cancelPlan(id)}>Stop</Link>
                   </p>
                   <Meter pct={run.current?.pct ?? 0} label={`Fetching ${row.def.label}`} />
+                  {/* Until the server says the fetch has begun it is still on its
+                      checks, and a page that hangs up then calls the fetch off
+                      (see POST /api/download). So only a run that has begun is
+                      promised to outlive the page. */}
+                  <p className="mt-0.5 text-caption text-grey-500">
+                    {run.outOfTouch
+                      ? 'The server is not answering. These figures are from its last answer, and this page keeps asking.'
+                      : run.state === 'running'
+                        ? 'The server carries on with it if this page is closed or the phone is locked.'
+                        : 'Keep this page open until the fetch begins. From then on the server carries on with it if the page is closed or the phone is locked.'}
+                  </p>
                 </div>
               ) : run && run.state === 'error' ? (
                 <p className="mt-1 text-caption text-ink-error">
-                  {run.error} <Link onClick={() => forgetPlan(id)}>Dismiss</Link>
+                  {run.error}{' '}
+                  <Link
+                    onClick={() => {
+                      // A failed run may have left a partial behind, or have
+                      // landed after all when it was lost track of, so the
+                      // row is read again from the disk.
+                      forgetPlan(id)
+                      void reread()
+                    }}
+                  >
+                    Dismiss
+                  </Link>
                 </p>
               ) : run && run.state === 'cancelled' ? (
                 <p className="mt-1 text-caption italic text-grey-700">
