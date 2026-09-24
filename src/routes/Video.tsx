@@ -29,9 +29,14 @@
 import { OfferList } from '../components/result/ResultActions'
 import { videoOffersFor } from '../components/result/videoOffers'
 import { LoraRack } from '../components/video/LoraRack'
+import { drawingLeft, drawnFraction, nextPace, passOf, refusalsFor, type SamplingPass } from '../components/video/progress'
 import { EMPTY_LIBRARY, loadLoraLibrary, loadStack, missingTriggers, resolveStack, saveStack, targetFor, type LoraLibrary, type LoraStack } from '../lib/loras'
-import { chainVideoStack, videoLorasToRun } from '../lib/videoLoras'
-import { clipMemory, releaseComfyMemory, waitForIdleComfy } from '../lib/clipMemory'
+import { chainVideoStack, restoreRack, videoLorasToRun } from '../lib/videoLoras'
+import { clipMemory, releaseComfyMemory, releaseIfOthersAhead, waitForIdleComfy } from '../lib/clipMemory'
+import { WAITS_IN_PAGE, holdAwake, wakeLockAvailable } from '../lib/wakeLock'
+import { copyText } from '../lib/clipboard'
+import { thumbUrl } from '../lib/thumbs'
+import { annotatedRef } from '../lib/continuation'
 import { CataloguePanel } from '../components/advanced/CataloguePanel'
 import { faultBody, faultOf, faultTitle, faultWhere, type Fault } from '../lib/faults'
 import { availabilityOf, inventoryFrom } from '../lib/availability'
@@ -54,10 +59,15 @@ import { onPlanLanded } from '../lib/downloads'
 
 import {
   ComfyError,
+  LostJob,
   cancelJob,
   connect,
+  connectionState,
+  fetchPastRun,
   fileUrl,
+  followPrompt,
   listJobs,
+  newPromptId,
   objectInfo,
   run,
   systemStats,
@@ -67,6 +77,7 @@ import {
   type ApiWorkflow,
   type ConnectionState,
   type FileRef,
+  type Followed,
   type OutputFile,
   type ProgressEvent as ComfyProgress,
   type ServerJob,
@@ -702,9 +713,29 @@ export type VideoJob = {
   max: number
   stage: string
   previewUrl: string | null
+  /** When the clip was made on the desk. The card's clock counts from here, wait and all. */
   startedAt: number
+  /**
+   * When ComfyUI began running it, as the page heard it. What the record says
+   * the clip took is counted from here and not from the press: a clip that
+   * waited behind others, in the lane or in ComfyUI's queue, did not take the
+   * wait to make, and the desk's estimates are medians of these figures.
+   */
+  ranAt: number | null
+  /** The first step of the drawing, so the plate knows the drawing has begun. */
   samplingAt: number | null
+  /**
+   * The pass drawing now, on a family that samples in two (Wan 2.2 14B). Each
+   * pass is reported by ComfyUI as its own step 1 of N, so without it the bar
+   * ran to the end, fell back to a tenth, and the time left grew several
+   * times over. Null for a family that samples once.
+   */
+  pass: SamplingPass | null
+  /** When the current pass's steps were first read, and at which step: its pace. */
+  pace: { at: number; step: number } | null
   finishedAt: number | null
+  /** How long ComfyUI took over the clip, as filed. Null when that was not measured. */
+  tookMs: number | null
   error: string | null
   /** The classified failure, with ComfyUI's node and per-input detail when it gave them. */
   fault: Fault | null
@@ -712,6 +743,11 @@ export type VideoJob = {
   loras?: HistoryEntry['loras']
   files: OutputFile[]
   entryId: string | null
+  /**
+   * The record that already names the file, when ComfyUI answered from its
+   * cache with a clip it had made before. Nothing new is filed for it.
+   */
+  repeatOf: string | null
   composition: Composition
   graph: ApiWorkflow
   frames: number
@@ -719,10 +755,34 @@ export type VideoJob = {
   /** Position in ComfyUI's own queue; 0 means it is the one running. */
   queuePos: number | null
   cancelRequested: boolean
+  /**
+   * True once ComfyUI said it took the clip out of its hands at a Stop. Only
+   * then can a stop explain ComfyUI having no record of the clip: a stop that
+   * never reached it (ComfyUI down, or back up and knowing nothing of the id)
+   * explains nothing, and the clip was lost with ComfyUI, not stopped.
+   */
+  stopLanded: boolean
+  /**
+   * The id the clip's prompt is going under, from the moment the page made it
+   * until ComfyUI says it has the prompt; null otherwise. The clip is kept
+   * for the tab under this id before the prompt goes (SENT_KEY), so a page
+   * that goes before ComfyUI answers leaves the next one a clip to follow.
+   * Without it the clip rendered unfollowed and a second Make rendered it
+   * twice. On a clip taken up after a reload it stays set until ComfyUI
+   * shows it has the prompt, since the page that sent it may never have
+   * got it there.
+   */
+  sendingAs: string | null
   /** True when ComfyUI releases its cached models before this clip runs. */
   release: boolean
   /** What a clip that has not been sent yet is waiting for, in a sentence. */
   waitNote: string | null
+  /**
+   * True for a clip an earlier page in this tab sent, followed here through
+   * ComfyUI's queue. ComfyUI reports steps and previews only to the page that
+   * sent a prompt, so this one has neither.
+   */
+  resumed: boolean
 }
 
 let jobs: VideoJob[] = []
@@ -741,19 +801,52 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
  * the one before had left resident.
  */
 let releaseLane: Promise<void> = Promise.resolve()
+
+/**
+ * Take a place at the back of the lane: the turn to wait for, and the
+ * function that says this clip has settled.
+ *
+ * The lane's promise stands for every heavy clip so far, never for the last
+ * one alone. A clip stopped while it waits settles before the clip ahead of
+ * it, and a clip followed after a reload never waits at all; either one
+ * standing for the whole lane let the next clip go while an older one still
+ * waited for an empty queue, and the two then released and sent together.
+ */
+function joinLane(): { turn: Promise<void>; leave: () => void } {
+  const turn = releaseLane
+  let leave = () => {}
+  const settled = new Promise<void>((resolve) => {
+    leave = resolve
+  })
+  releaseLane = Promise.all([turn, settled]).then(() => undefined)
+  return { turn, leave }
+}
+
 /** Clips still waiting their turn, so Stop can call the wait off. */
 const waiting = new Map<string, AbortController>()
+
+/**
+ * The lane held after a heavy clip was lost.
+ *
+ * A heavy clip that ComfyUI forgets part way went down with ComfyUI, and the
+ * likeliest cause on this machine is earlyoom killing it for memory. The
+ * clips waiting behind it need as much, and they found the restarted ComfyUI
+ * empty and went straight in, towards the same end, with nobody asked. The
+ * picture batch and the reel stop in this case; the lane now waits for the
+ * reader's word instead.
+ */
+let laneHold: { promise: Promise<void>; release: () => void } | null = null
 
 /**
  * The lane, kept for this tab.
  *
  * A clip waiting in the lane has not reached ComfyUI, so nothing on the
- * server knows about it. A clip in ComfyUI's queue outlives the page that
- * sent it; one waiting here would vanish with a reload, without a trace. So
- * from the moment a clip joins the lane until the moment before its prompt
- * goes, it is written to this tab's session storage, with the graph as it
- * was built and everything its record will say, and the next page in the
- * tab puts it back in the lane in the same order.
+ * server knows about it; one waiting here would vanish with a reload, without
+ * a trace. So from the moment a clip joins the lane until the moment before
+ * its prompt goes, it is written to this tab's session storage, with the
+ * graph as it was built and everything its record will say, and the next page
+ * in the tab puts it back in the lane in the same order. As its prompt goes
+ * it is kept under SENT_KEY instead, until it settles.
  *
  * Session storage, not local storage, because it belongs to the tab: no other
  * tab reads it, so two tabs can never both send one clip. The one way a tab
@@ -766,13 +859,30 @@ const waiting = new Map<string, AbortController>()
  *
  * Closing the tab still loses what waits, so while anything waits the page
  * asks the browser to check with the reader before it goes (a browser may
- * skip that on a page nobody has pressed anything on yet), and the desk says
- * where waiting clips live.
+ * skip that on a page nobody has pressed anything on yet), asks for the
+ * screen to stay on where the browser allows it unless the lane is held, and
+ * the desk says where waiting clips live and that a hidden or locked page
+ * sends nothing.
  */
 const LANE_KEY = 'switchgen.videolane.v1'
 /** Clips an earlier page left that this page would not send by itself. */
 const LEFT_KEY = 'switchgen.videolane.v1.left'
-/** This page, so a page back from the browser's cache can tell whether a later one took its lane. */
+/**
+ * Clips whose prompts ComfyUI has, or that are on their way to it, kept for
+ * this tab until they settle.
+ *
+ * The socket that reports a clip belongs to the page that sent it, and a
+ * reload or a tab the phone threw away in the background took that page with
+ * it. The clip went on rendering, but the desk forgot it: no progress, no
+ * Stop, the section bar calling it somebody else's, and nothing filed when it
+ * landed. So the next page in the tab takes each one up again, by its prompt
+ * id, follows it through ComfyUI's queue and files it the same way. The same
+ * rules as the lane decide which page does that.
+ */
+const SENT_KEY = 'switchgen.videosent.v1'
+/** Sent clips an earlier page left that this page would not follow by itself. */
+const LEFT_SENT_KEY = 'switchgen.videosent.v1.left'
+/** This page, so a page back from the browser's cache can tell whether a later one took its clips. */
 const PAGE = globalThis.crypto?.randomUUID?.() ?? `page_${Date.now()}_${Math.random().toString(36).slice(2)}`
 
 /** One clip waiting in the lane, with what a later page needs to send and file it. */
@@ -786,12 +896,35 @@ export type LaneClip = {
   loras?: HistoryEntry['loras']
 }
 
+/** One clip in ComfyUI's hands, with what a later page needs to follow and file it. */
+export type SentClip = LaneClip & {
+  promptId: string
+  /** When it began running, if the page that sent it heard. */
+  ranAt: number | null
+  release: boolean
+  /**
+   * True when it was kept on its way, before ComfyUI said it had it: the
+   * page that sent it may have gone before the prompt got there.
+   */
+  sending?: boolean
+}
+
 /** This page's waiting clips, oldest first. */
 let laneClips: LaneClip[] = []
 /** What an earlier page left and this one did not take up by itself. */
 let leftOver: LaneClip[] = []
 /** False when the tab would not keep the last write, so a reload would lose the lane. */
 let laneKept = true
+/** Sent clips an earlier page left and this one did not take up by itself. */
+let leftSent: SentClip[] = []
+/** False when the tab would not keep the last write of the sent clips. */
+let sentKept = true
+/**
+ * Set when this page came back from the browser's cache to find that another
+ * page in the tab had taken its clips over. It reloads at once; until then it
+ * files nothing, since the other page does.
+ */
+let handedOver = false
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 
@@ -808,8 +941,18 @@ function isLaneClip(v: unknown): v is LaneClip {
   )
 }
 
+function isSentClip(v: unknown): v is SentClip {
+  return (
+    isLaneClip(v) &&
+    typeof (v as Record<string, unknown>).promptId === 'string' &&
+    ((v as Record<string, unknown>).ranAt === null || typeof (v as Record<string, unknown>).ranAt === 'number') &&
+    typeof (v as Record<string, unknown>).release === 'boolean' &&
+    ((v as Record<string, unknown>).sending === undefined || typeof (v as Record<string, unknown>).sending === 'boolean')
+  )
+}
+
 /** A saved lane as written, or null when there is none or it cannot be read. */
-function readLane(raw: string | null): { writer: string; released: boolean; clips: LaneClip[] } | null {
+function readLane(raw: string | null): { writer: string; released: boolean; held: boolean; clips: LaneClip[] } | null {
   let v: unknown
   try {
     v = JSON.parse(raw ?? 'null')
@@ -820,8 +963,51 @@ function readLane(raw: string | null): { writer: string; released: boolean; clip
   return {
     writer: typeof v.writer === 'string' ? v.writer : '',
     released: v.released === true,
+    held: v.held === true,
     clips: v.clips.filter(isLaneClip),
   }
+}
+
+/** Saved sent clips as written, or null when there are none or they cannot be read. */
+function readSent(raw: string | null): { writer: string; released: boolean; jobs: SentClip[] } | null {
+  let v: unknown
+  try {
+    v = JSON.parse(raw ?? 'null')
+  } catch {
+    return null
+  }
+  if (!isObj(v) || !Array.isArray(v.jobs)) return null
+  return {
+    writer: typeof v.writer === 'string' ? v.writer : '',
+    released: v.released === true,
+    jobs: v.jobs.filter(isSentClip),
+  }
+}
+
+/** The id a clip is in ComfyUI's hands under, or on its way there under; null before it goes. */
+const sentUnder = (j: VideoJob): string | null => j.promptId ?? j.sendingAs
+
+/** True for a clip sent, or on its way, and not settled: one a later page would have to follow. */
+const outThere = (j: VideoJob): boolean => sentUnder(j) !== null && unfinished(j)
+
+/** The clips a page has in ComfyUI's hands or on their way there, oldest first: sent and not settled. */
+function sentClipsOf(list: readonly VideoJob[]): SentClip[] {
+  return list
+    .filter(outThere)
+    .map((j) => ({
+      id: j.id,
+      promptId: sentUnder(j)!,
+      startedAt: j.startedAt,
+      ranAt: j.ranAt,
+      composition: j.composition,
+      graph: j.graph,
+      familyLabel: j.familyLabel,
+      modelLabel: j.modelLabel,
+      release: j.release,
+      ...(j.sendingAs !== null ? { sending: true } : {}),
+      ...(j.loras ? { loras: j.loras } : {}),
+    }))
+    .reverse()
 }
 
 function stayPut(e: BeforeUnloadEvent): void {
@@ -829,27 +1015,63 @@ function stayPut(e: BeforeUnloadEvent): void {
 }
 
 let holding = false
-function holdPage(on: boolean): void {
-  if (typeof window === 'undefined' || on === holding) return
-  holding = on
-  if (on) window.addEventListener('beforeunload', stayPut)
-  else window.removeEventListener('beforeunload', stayPut)
+/** Lets the screen lock again; set while clips wait in the lane to be sent. */
+let letSleep: (() => void) | null = null
+/** Hold the page for as long as clips wait in the lane, as the lane now stands. */
+function holdPage(): void {
+  if (typeof window === 'undefined') return
+  const waits = laneClips.length > 0
+  if (waits !== holding) {
+    holding = waits
+    if (waits) window.addEventListener('beforeunload', stayPut)
+    else window.removeEventListener('beforeunload', stayPut)
+  }
+  // A locked phone suspends the page, and nothing more leaves the lane until
+  // it wakes. Where the browser allows it (a secure page only), the screen is
+  // asked to stay on while clips wait to be sent; the desk says so either
+  // way. Not while the lane is held: nothing goes until the reader says, and
+  // a phone left after the first lost clip kept its screen on for nothing.
+  const sends = waits && laneHold === null
+  if (sends && !letSleep) letSleep = holdAwake('Clips waiting in the Video desk lane')
+  else if (!sends && letSleep) {
+    letSleep()
+    letSleep = null
+  }
 }
 
 /** Write this page's lane, or clear it when nothing waits. `released` says the page is going. */
 function saveLane(released = false): void {
   if (laneClips.length) {
-    laneKept = tabStore.set(LANE_KEY, JSON.stringify({ writer: PAGE, released, clips: laneClips }))
+    laneKept = tabStore.set(
+      LANE_KEY,
+      JSON.stringify({ writer: PAGE, released, held: laneHold !== null, clips: laneClips }),
+    )
   } else {
     tabStore.remove(LANE_KEY)
     laneKept = true
   }
-  holdPage(laneClips.length > 0)
+  holdPage()
 }
 
 function saveLeftOver(): void {
   if (leftOver.length) tabStore.set(LEFT_KEY, JSON.stringify({ clips: leftOver }))
   else tabStore.remove(LEFT_KEY)
+}
+
+/** Write this page's sent clips, or clear them when none is out. `released` says the page is going. */
+function saveSent(released = false): void {
+  if (handedOver) return
+  const sent = sentClipsOf(jobs)
+  if (sent.length) sentKept = tabStore.set(SENT_KEY, JSON.stringify({ writer: PAGE, released, jobs: sent }))
+  else {
+    tabStore.remove(SENT_KEY)
+    sentKept = true
+  }
+}
+
+function saveLeftSent(): void {
+  if (leftSent.length) tabStore.set(LEFT_SENT_KEY, JSON.stringify({ jobs: leftSent }))
+  else tabStore.remove(LEFT_SENT_KEY)
 }
 
 function joinSavedLane(clip: LaneClip): void {
@@ -861,7 +1083,38 @@ function joinSavedLane(clip: LaneClip): void {
 function leaveSavedLane(id: string): void {
   if (!laneClips.some((c) => c.id === id)) return
   laneClips = laneClips.filter((c) => c.id !== id)
+  // Nothing is left to hold once the last waiting clip has gone.
+  if (!laneClips.length && laneHold) {
+    laneHold.release()
+    laneHold = null
+  }
   saveLane()
+}
+
+/** Hold the clips waiting in the lane until the reader says (see laneHold). */
+function holdLane(): void {
+  if (laneHold || !laneClips.length) return
+  let release = () => {}
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  laneHold = { promise, release }
+  saveLane()
+  announce()
+}
+
+/** The reader's word: send the held clips after all. */
+function sendHeld(): void {
+  const hold = laneHold
+  laneHold = null
+  hold?.release()
+  saveLane()
+  announce()
+}
+
+/** The reader's word: call the held clips off. */
+function stopHeld(): void {
+  for (const c of laneClips) void stopJob(c.id)
 }
 
 /** Put a saved clip back in the lane, as it was when it was made. */
@@ -879,6 +1132,9 @@ function resumeClip(c: LaneClip): void {
   })
 }
 
+const wasDiscarded = () =>
+  typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
+
 /**
  * Take in what the last page in this tab left, once, when the module loads.
  * The saved lane is cleared either way: taken up, it is written again as
@@ -891,12 +1147,30 @@ function restoreLane(): void {
   tabStore.remove(LANE_KEY)
   leftOver = left?.clips ?? []
   if (saved?.clips.length) {
-    const discarded =
-      typeof document !== 'undefined' && (document as Document & { wasDiscarded?: boolean }).wasDiscarded === true
-    if (saved.released || discarded) for (const c of saved.clips) resumeClip(c)
-    else leftOver = [...leftOver, ...saved.clips.filter((c) => !leftOver.some((l) => l.id === c.id))]
+    if (saved.released || wasDiscarded()) {
+      for (const c of saved.clips) resumeClip(c)
+      // Held when the page went, so held still: nothing was said since.
+      if (saved.held) holdLane()
+    } else leftOver = [...leftOver, ...saved.clips.filter((c) => !leftOver.some((l) => l.id === c.id))]
   }
   saveLeftOver()
+}
+
+/**
+ * The same for clips the last page had sent: followed from here when that
+ * page handed them on, otherwise put to the reader. Following one twice
+ * would not render it twice, but it could file it twice.
+ */
+function restoreSent(): void {
+  const saved = readSent(tabStore.get(SENT_KEY))
+  const left = readSent(tabStore.get(LEFT_SENT_KEY))
+  tabStore.remove(SENT_KEY)
+  leftSent = left?.jobs ?? []
+  if (saved?.jobs.length) {
+    if (saved.released || wasDiscarded()) for (const s of saved.jobs) followSent(s)
+    else leftSent = [...leftSent, ...saved.jobs.filter((s) => !leftSent.some((l) => l.id === s.id))]
+  }
+  saveLeftSent()
 }
 
 /** Send what an earlier page left, from this page, at the reader's word. */
@@ -911,6 +1185,22 @@ function sendLeftOver(): void {
 function forgetLeftOver(): void {
   leftOver = []
   saveLeftOver()
+  announce()
+}
+
+/** Follow what an earlier page sent, from this page, at the reader's word. */
+function followLeftSent(): void {
+  const sent = leftSent
+  leftSent = []
+  saveLeftSent()
+  for (const s of sent) followSent(s)
+  announce()
+}
+
+/** Stop following them here. ComfyUI goes on making them. */
+function forgetLeftSent(): void {
+  leftSent = []
+  saveLeftSent()
   announce()
 }
 
@@ -968,10 +1258,18 @@ export const videoJobs = {
   leftOver: (): LaneClip[] => leftOver,
   sendLeftOver,
   forgetLeftOver,
+  /** Clips an earlier page in this tab sent and did not hand on, which this page will not follow by itself. */
+  leftSent: (): SentClip[] => leftSent,
+  followLeftSent,
+  forgetLeftSent,
   /** False when this tab would not keep the waiting clips, so a reload would lose them. */
   laneKept: (): boolean => laneKept,
   /** Clips in this page's lane that have not been sent yet. */
   waitingCount: (): number => laneClips.length,
+  /** True while the lane waits for the reader's word after a heavy clip was lost. */
+  held: (): boolean => laneHold !== null,
+  sendHeld,
+  stopHeld,
 }
 
 /**
@@ -1001,8 +1299,11 @@ async function stopJob(id: string): Promise<void> {
   }
   patchJob(id, { cancelRequested: true, stage: 'Stopping' })
   try {
-    await cancelJob(job.promptId)
-    // `false` means it had already finished; the terminal event settles it.
+    // `false` means it had already finished, and the terminal event settles
+    // it, or that ComfyUI does not know the id, which a restart does to
+    // every job it had. Only a stop ComfyUI took is kept, and a second press
+    // that finds the clip already gone does not undo the first (see fail).
+    if (await cancelJob(job.promptId)) patchJob(id, { stopLanded: true })
   } catch (err) {
     patchJob(id, { error: (err as Error).message })
   }
@@ -1024,34 +1325,204 @@ type StartOptions = {
   note?: string
 }
 
-function startJob(opts: StartOptions): string {
-  const id = opts.id ?? globalThis.crypto?.randomUUID?.() ?? `job_${Date.now()}_${Math.random().toString(36).slice(2)}`
-  const job: VideoJob = {
-    id,
+/** A clip that has not been heard of by ComfyUI yet. */
+function newJob(c: LaneClip & { release: boolean }): VideoJob {
+  return {
+    id: c.id,
     promptId: null,
     status: 'submitting',
-    familyLabel: opts.familyLabel,
-    modelLabel: opts.modelLabel,
-    prompt: opts.composition.prompt,
+    familyLabel: c.familyLabel,
+    modelLabel: c.modelLabel,
+    prompt: c.composition.prompt,
     value: 0,
     max: 0,
     stage: 'Sending it to the press',
     previewUrl: null,
-    startedAt: opts.startedAt ?? Date.now(),
+    startedAt: c.startedAt,
+    ranAt: null,
     samplingAt: null,
+    pass: null,
+    pace: null,
     finishedAt: null,
+    tookMs: null,
     error: null,
     fault: null,
-    loras: opts.loras,
+    loras: c.loras,
     files: [],
     entryId: null,
-    composition: opts.composition,
-    graph: opts.graph,
-    frames: opts.composition.length ?? 0,
-    fps: opts.composition.fps ?? 0,
+    repeatOf: null,
+    composition: c.composition,
+    graph: c.graph,
+    frames: c.composition.length ?? 0,
+    fps: c.composition.fps ?? 0,
     queuePos: null,
     cancelRequested: false,
-    release: !!opts.release,
+    stopLanded: false,
+    sendingAs: null,
+    release: c.release,
+    waitNote: null,
+    resumed: false,
+  }
+}
+
+const sameFile = (a: FileRef, b: FileRef) =>
+  a.filename === b.filename && (a.subfolder ?? '') === (b.subfolder ?? '') && (a.type || 'output') === (b.type || 'output')
+
+/** The record that already names a file, if one does. */
+function recordNaming(file: FileRef): HistoryEntry | null {
+  return history.all().find((e) => sameFile(e.file, file) || !!e.files?.some((f) => sameFile(f, file))) ?? null
+}
+
+/** True for a file ComfyUI answered from its cache: the one an earlier run with the same settings wrote. */
+const fromCache = (f: OutputFile) => f.cached === true
+
+/**
+ * When ComfyUI says it began and ended a run, from its own record. Given up
+ * after a few seconds, so a slow answer cannot hold the lane.
+ */
+async function timesOfRun(promptId: string): Promise<{ startedAt: number | null; finishedAt: number | null } | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const read = fetchPastRun(promptId).then(
+    (run) => (run ? { startedAt: run.startedAt, finishedAt: run.finishedAt } : null),
+    () => null,
+  )
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), 5000)
+  })
+  try {
+    return await Promise.race([read, late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** File a clip that landed, the one way for a clip sent here and for one followed after a reload. */
+async function finish(id: string, files: OutputFile[]): Promise<void> {
+  // When the page heard of the ending, which is when it ended only if the
+  // page was awake to hear it. See below.
+  let finishedAt = Date.now()
+  const before = jobById(id)
+  if (!before || handedOver) return
+  const file = files.find((f) => f.kind === 'video') ?? files[0] ?? null
+  // Asked again with the same settings, ComfyUI hands back the file it made
+  // the first time without drawing anything, and filing it again would put a
+  // second record on one file.
+  const known = file && fromCache(file) ? recordNaming(file) : null
+  let entryId: string | null = known?.id ?? null
+  let tookMs: number | null = null
+  if (file && !known) {
+    // The end is ComfyUI's, from its record. A clip that landed while the
+    // phone was locked is heard of when the page wakes, and one taken up
+    // after a reload when the page comes back, which can be long after it
+    // landed. Filed with the page's clock, such a clip took the whole wait
+    // to make and was dated to the moment it was read, and the desk's
+    // estimates, medians of these figures, crept up with each one.
+    const past = before.promptId ? await timesOfRun(before.promptId) : null
+    const current = jobById(id)
+    if (!current || handedOver) return
+    if (past?.finishedAt != null) finishedAt = past.finishedAt
+    const ranAt = before.ranAt ?? past?.startedAt ?? null
+    // The start may be the page's, as it heard it, and the end ComfyUI's; an
+    // end before the start is the two clocks disagreeing and measures nothing.
+    tookMs = ranAt !== null && finishedAt >= ranAt ? finishedAt - ranAt : null
+    try {
+      const entry = history.add(
+        recordOf(current.composition, {
+          file,
+          files: files.length > 1 ? files : undefined,
+          kind: file.kind,
+          promptId: current.promptId ?? '',
+          // 0 when it was not measured, which the estimates leave out.
+          durationMs: tookMs ?? 0,
+          seed: current.composition.seed,
+          familyLabel: current.familyLabel,
+          modelLabel: current.modelLabel,
+          at: finishedAt,
+          loras: current.loras,
+        }),
+      )
+      entryId = entry.id
+    } catch {
+      // A full archive must never cost the reader the clip itself.
+    }
+  }
+  patchJob(id, {
+    status: 'done',
+    files,
+    entryId,
+    repeatOf: known?.id ?? null,
+    finishedAt,
+    tookMs,
+    stage: 'Done',
+    previewUrl: null,
+    queuePos: null,
+  })
+  saveSent()
+}
+
+/**
+ * Settle a clip that did not land. The same classification the Pictures desk
+ * uses, so a clip that failed on a bad frame names the node instead of saying
+ * something went wrong.
+ */
+function fail(id: string, err: unknown): void {
+  if (handedOver) return
+  const f = faultOf(err)
+  const job = jobById(id)
+  // A job the reader stopped and ComfyUI then forgot was stopped, not lost:
+  // a dequeued prompt leaves no record, and blaming a restart for the
+  // reader's own stop would be false. But only a stop that can explain it:
+  // one ComfyUI took (stopLanded) while the clip waited. A stop pressed on a
+  // clip frozen by a restart never reached a live job, and calling the loss
+  // a stop hid the restart and skipped the hold below, so the next heavy
+  // clip went into the restarted ComfyUI with nobody asked. A running clip
+  // that is stopped ends on its interrupt, never as lost, and one ComfyUI
+  // says has ended may have left its file (mayExist), which is for the
+  // reader to look for.
+  if (f.lost && !f.mayExist && job?.cancelRequested && job.stopLanded && job.status !== 'running') {
+    patchJob(id, {
+      status: 'cancelled',
+      error: null,
+      fault: { ...f, lost: false, cancelled: true },
+      finishedAt: Date.now(),
+      previewUrl: null,
+      stage: 'Stopped',
+      queuePos: null,
+    })
+    saveSent()
+    return
+  }
+  // A clip taken up after a reload that ComfyUI never showed it had: the
+  // page that sent it went while it was on its way (see NOT_SENT).
+  const notSent = f.lost && !!job?.sendingAs
+  patchJob(id, {
+    status: f.cancelled ? 'cancelled' : 'error',
+    error: f.message || 'Something went wrong.',
+    fault: f,
+    finishedAt: Date.now(),
+    previewUrl: null,
+    stage: f.cancelled ? 'Stopped' : notSent ? 'Not sent' : f.lost ? 'Lost' : 'Failed',
+    queuePos: null,
+  })
+  saveSent()
+  // Before the lane lets the next heavy clip go: see laneHold. Not for a clip
+  // that may never have reached ComfyUI, which says nothing of its memory.
+  if (f.lost && job?.release && !notSent) holdLane()
+}
+
+function startJob(opts: StartOptions): string {
+  const id = opts.id ?? globalThis.crypto?.randomUUID?.() ?? `job_${Date.now()}_${Math.random().toString(36).slice(2)}`
+  const job: VideoJob = {
+    ...newJob({
+      id,
+      startedAt: opts.startedAt ?? Date.now(),
+      composition: opts.composition,
+      graph: opts.graph,
+      familyLabel: opts.familyLabel,
+      modelLabel: opts.modelLabel,
+      loras: opts.loras,
+      release: !!opts.release,
+    }),
     waitNote: opts.note ?? null,
   }
 
@@ -1061,10 +1532,9 @@ function startJob(opts: StartOptions): string {
   let leaveLane = () => {}
   let turn: Promise<void> = Promise.resolve()
   if (opts.release) {
-    turn = releaseLane
-    releaseLane = new Promise<void>((resolve) => {
-      leaveLane = resolve
-    })
+    const place = joinLane()
+    turn = place.turn
+    leaveLane = place.leave
     joinSavedLane({
       id,
       startedAt: job.startedAt,
@@ -1083,8 +1553,23 @@ function startJob(opts: StartOptions): string {
     const current = jobById(id)
     if (!current) return
     if (e.phase === 'queued') {
-      patchJob(id, { promptId: e.promptId, status: 'queued', stage: 'Queued' })
-      if (current.cancelRequested) void cancelJob(e.promptId).catch(() => undefined)
+      patchJob(id, { promptId: e.promptId, sendingAs: null, status: 'queued', stage: 'Queued' })
+      // Kept for the tab as ComfyUI's now, so the next page follows it as a
+      // clip that got there (SENT_KEY).
+      saveSent()
+      if (current.cancelRequested) {
+        void cancelJob(e.promptId).then(
+          (landed) => {
+            if (landed) patchJob(id, { stopLanded: true })
+          },
+          () => undefined,
+        )
+      }
+      // A release is only this clip's if nothing ran between it and the
+      // prompt, and a reel shot or a picture sent from another desk or tab
+      // in that moment spends it. ComfyUI applies a release sent while other
+      // work is ahead after that work, so one sent now reaches this clip.
+      else if (current.release) void releaseIfOthersAhead(e.promptId)
     } else if (e.phase === 'running') {
       // A heavy clip releases for itself on an empty queue, but something of
       // ours sent in the moment between its release and its prompt runs first
@@ -1097,15 +1582,23 @@ function startJob(opts: StartOptions): string {
       ) {
         void releaseComfyMemory()
       }
-      const sampling = e.max > 1
+      const now = Date.now()
+      const stage = stageOf(current.graph, e.node)
+      const drawing = stage === 'Drawing' && e.max > 1
+      const nodePass = passOf(current.graph, e.node)
       patchJob(id, {
         status: 'running',
         value: e.value,
         max: e.max,
-        stage: stageOf(current.graph, e.node),
-        samplingAt: sampling && current.samplingAt === null ? Date.now() : current.samplingAt,
+        stage,
+        pass: nodePass ?? current.pass,
+        pace: nextPace(current, { pass: nodePass, drawing, value: e.value }, now),
+        ranAt: current.ranAt ?? now,
+        samplingAt: drawing && current.samplingAt === null ? now : current.samplingAt,
         queuePos: 0,
       })
+      // Its start, for the page that may have to file it after a reload.
+      if (current.ranAt === null) saveSent()
     } else if (e.phase === 'preview') {
       patchJob(id, { previewUrl: e.url })
     }
@@ -1126,13 +1619,28 @@ function startJob(opts: StartOptions): string {
           })
         }
         if (!(await unlessStopped(turn, stop.signal))) throw stopped()
-        const idle = await waitForIdleComfy(stop.signal, (ahead) =>
-          patchJob(id, {
-            stage: 'Waiting for the press',
-            waitNote: `ComfyUI has ${ahead} ${ahead === 1 ? 'job' : 'jobs'} to finish first. This clip waits for them, so the memory they hold can be released before it starts.`,
-          }),
-        )
-        if (!idle) throw stopped()
+        // A hold can also land while this clip waits for the queue, when a
+        // clip followed after a reload is lost, so it is asked again after.
+        for (;;) {
+          while (laneHold) {
+            patchJob(id, {
+              stage: 'Held',
+              waitNote: 'Held until you say, because the heavy clip before it was lost.',
+            })
+            if (!(await unlessStopped(laneHold.promise, stop.signal))) throw stopped()
+          }
+          const idle = await waitForIdleComfy(stop.signal, (ahead) =>
+            patchJob(id, {
+              stage: ahead < 0 ? 'Waiting for ComfyUI' : 'Waiting for the press',
+              waitNote:
+                ahead < 0
+                  ? 'ComfyUI is not answering; it may be restarting. This clip waits until it answers, then releases its memory and goes.'
+                  : `ComfyUI has ${ahead} ${ahead === 1 ? 'job' : 'jobs'} to finish first. This clip waits for them, so the memory they hold can be released before it starts.`,
+            }),
+          )
+          if (!idle) throw stopped()
+          if (!laneHold) break
+        }
         patchJob(id, { stage: 'Releasing memory', waitNote: null })
         await releaseComfyMemory()
         if (stop.signal.aborted) throw stopped()
@@ -1144,82 +1652,114 @@ function startJob(opts: StartOptions): string {
       }
       patchJob(id, { stage: 'Sending it to the press' })
     }
-    return run(opts.graph, onEvent)
+    // The prompt's id is made here and the clip kept for the tab under it
+    // before the prompt goes, in the same turn it left the saved lane, so no
+    // page can go in between. A page that goes before ComfyUI answers (the
+    // phone throws the tab away just after Make, or a reload) then leaves the
+    // next page an id to follow the clip by, where it had none: the clip
+    // rendered unfollowed with no Stop, and a second Make rendered it twice.
+    const promptId = newPromptId()
+    patchJob(id, { sendingAs: promptId })
+    saveSent()
+    return run(opts.graph, onEvent, { promptId })
   }
 
   void queue()
-    .then((files) => {
-      const current = jobById(id)
-      if (!current) return
-      const finishedAt = Date.now()
-      const file = files.find((f) => f.kind === 'video') ?? files[0] ?? null
-      let entryId: string | null = null
-      if (file) {
-        try {
-          const entry = history.add(
-            recordOf(current.composition, {
-              file,
-              files: files.length > 1 ? files : undefined,
-              kind: file.kind,
-              promptId: current.promptId ?? '',
-              durationMs: finishedAt - current.startedAt,
-              seed: current.composition.seed,
-              familyLabel: current.familyLabel,
-              modelLabel: current.modelLabel,
-              at: finishedAt,
-              loras: current.loras,
-            }),
-          )
-          entryId = entry.id
-        } catch {
-          // A full archive must never cost the reader the clip itself.
-        }
-      }
-      patchJob(id, {
-        status: 'done',
-        files,
-        entryId,
-        finishedAt,
-        stage: 'Done',
-        previewUrl: null,
-        queuePos: null,
-      })
-    })
-    .catch((err: unknown) => {
-      // The same classification the Pictures desk uses, so a clip that failed
-      // on a bad frame names the node instead of saying something went wrong.
-      // run() rejects with a lost job itself when ComfyUI no longer knows the
-      // prompt, having first looked in /history for a clip that finished.
-      const f = faultOf(err)
-      // A job the reader stopped and ComfyUI then forgot was stopped, not
-      // lost: a dequeued prompt leaves no record, and blaming a restart for
-      // the reader's own stop would be false.
-      if (f.lost && jobById(id)?.cancelRequested) {
-        patchJob(id, {
-          status: 'cancelled',
-          error: null,
-          fault: { ...f, lost: false, cancelled: true },
-          finishedAt: Date.now(),
-          previewUrl: null,
-          stage: 'Stopped',
-          queuePos: null,
-        })
-        return
-      }
-      patchJob(id, {
-        status: f.cancelled ? 'cancelled' : 'error',
-        error: f.message || 'Something went wrong.',
-        fault: f,
-        finishedAt: Date.now(),
-        previewUrl: null,
-        stage: f.cancelled ? 'Stopped' : f.lost ? 'Lost' : 'Failed',
-        queuePos: null,
-      })
-    })
+    .then(
+      (files) => finish(id, files),
+      (err: unknown) => fail(id, err),
+    )
     // Settled either way, so the next heavy clip may take its turn.
     .finally(() => leaveLane())
 
   return id
+}
+
+/** Said of a clip followed after a reload that ComfyUI no longer knows. */
+const LOST_AFTER_RELOAD =
+  'We lost track of this clip after the page reloaded. ComfyUI has no record of it any more, which usually means it restarted. If it finished first, its file may be on disk: open the Archive and press “Look for files with no record”.'
+
+/**
+ * Said of a clip taken up after a reload that was kept on its way and that
+ * ComfyUI has nothing under. Whether it never got there or ComfyUI has
+ * restarted since, no answer tells, so neither is claimed.
+ */
+const NOT_SENT =
+  'This clip may never have reached ComfyUI. The page went away while it was being sent, and ComfyUI has nothing under its number, so nothing is running for it, and the desk will not send it again by itself. If ComfyUI did get it and has restarted since, its file may be on disk if it finished first: open the Archive and press “Look for files with no record”.'
+
+/**
+ * A followed prompt's ending, as run() would have ended: files, or the error
+ * it rejects with. `onItsWay` is true while ComfyUI has not yet shown it has
+ * the prompt at all.
+ */
+function outcomeOf(promptId: string, r: Followed, onItsWay: boolean): OutputFile[] {
+  if (r.status === 'done') return r.files
+  if (r.status === 'cancelled') throw new ComfyError('Job stopped. Nothing was saved.', { cancelled: true, promptId })
+  if (r.status === 'error') throw new ComfyError(r.message, { promptId, node: r.node, nodeType: r.nodeType })
+  throw new LostJob(onItsWay ? NOT_SENT : LOST_AFTER_RELOAD, promptId)
+}
+
+/**
+ * Take up a clip an earlier page in this tab sent. It is a live job again,
+ * with its prompt id, so the section bar counts it as this tab's and Stop
+ * reaches it, and it is filed the way a clip sent from here is.
+ */
+function followSent(s: SentClip): void {
+  if (jobs.some((j) => j.id === s.id || sentUnder(j) === s.promptId)) return
+  // A heavy clip holds its place in the lane as it did on the page that sent
+  // it, so clips taken up behind it wait for it to settle, and are held if it
+  // is lost, rather than go the moment a restarted ComfyUI reads as empty.
+  // It is in ComfyUI's queue already, so it takes no turn of its own.
+  let leaveLane = () => {}
+  if (s.release) leaveLane = joinLane().leave
+  // Kept on its way: the page that sent it may have gone before the prompt
+  // got there, so it is not called queued until ComfyUI shows it has it.
+  const onItsWay = s.sending === true
+  jobs = [
+    {
+      ...newJob(s),
+      promptId: s.promptId,
+      sendingAs: onItsWay ? s.promptId : null,
+      status: onItsWay ? 'submitting' : 'queued',
+      stage: onItsWay ? 'Asking ComfyUI whether it has it' : 'Queued',
+      ranAt: s.ranAt,
+      resumed: true,
+    },
+    ...jobs,
+  ]
+  saveSent()
+  announce()
+  // Seen waiting by this page, so the moment it is seen running is its start,
+  // to within one ask of the queue. One already running when this page
+  // loaded started earlier, and its start is read from ComfyUI's record.
+  let seenWaiting = false
+  void followPrompt(s.promptId, {
+    onState: (state) => {
+      const current = jobById(s.id)
+      if (state === 'queued') seenWaiting = true
+      if (!current || !unfinished(current)) return
+      // Queued or running, ComfyUI has it: it got there.
+      const arrived = current.sendingAs !== null
+      const moved = current.status !== state
+      if (moved) {
+        patchJob(s.id, {
+          status: state,
+          sendingAs: null,
+          stage: current.cancelRequested ? 'Stopping' : state === 'running' ? 'Running' : 'Queued',
+          ...(state === 'running'
+            ? { queuePos: 0, ranAt: current.ranAt ?? (seenWaiting ? Date.now() : null) }
+            : {}),
+        })
+      } else if (arrived) patchJob(s.id, { sendingAs: null })
+      if (arrived || (moved && state === 'running' && current.ranAt === null && seenWaiting)) saveSent()
+    },
+  })
+    .then((r) => outcomeOf(s.promptId, r, !!jobById(s.id)?.sendingAs))
+    .then(
+      (files) => finish(s.id, files),
+      (err: unknown) => fail(s.id, err),
+    )
+    .finally(() => leaveLane())
 }
 
 /**
@@ -1229,8 +1769,9 @@ function startJob(opts: StartOptions): string {
  * Finding a job the server has forgotten is not done here. run() follows every
  * prompt it queued for that itself, settles one that finished from its
  * /history record so the clip is still filed, and rejects with a lost job when
- * there is no record at all, which the catch in startJob reports. A second
- * watch here raced it and called a finished clip lost.
+ * there is no record at all, which the catch in startJob reports; followPrompt
+ * does the same for a clip taken up after a reload. A second watch here raced
+ * them and called a finished clip lost.
  */
 function managePoll(): void {
   const live = jobs.some(unfinished)
@@ -1241,24 +1782,36 @@ function managePoll(): void {
   }
 }
 
+/**
+ * True while a read of the queue is out. A ComfyUI that stalls without
+ * closing its socket answers nothing for as long as it stalls, and a new read
+ * every five seconds on top of the last filled the browser's few connections
+ * to this server, so the archive, the thumbnails and the plate stopped too.
+ */
+let reconciling = false
+
 async function reconcile(): Promise<void> {
-  if (!jobs.some(unfinished)) return
-
-  let listed: ServerJob[]
+  if (reconciling || !jobs.some(unfinished)) return
+  reconciling = true
   try {
-    const page = await listJobs({ status: ['pending', 'in_progress'], limit: 100 })
-    listed = page.jobs
-  } catch {
-    return // the connection notice covers an unreachable server
-  }
+    let listed: ServerJob[]
+    try {
+      const page = await listJobs({ status: ['pending', 'in_progress'], limit: 100 })
+      listed = page.jobs
+    } catch {
+      return // the connection notice covers an unreachable server
+    }
 
-  // Read again after the await: a job may have settled while the list was on
-  // its way, and its place in line is then nobody's business. A clip that is
-  // drawing has no place in line; its progress events keep it at 0.
-  for (const job of jobs.filter(unfinished)) {
-    if (!job.promptId || job.status === 'running') continue
-    const ahead = jobsAhead(listed, job.promptId)
-    if (ahead !== null && ahead !== job.queuePos) patchJob(job.id, { queuePos: ahead })
+    // Read again after the await: a job may have settled while the list was on
+    // its way, and its place in line is then nobody's business. A clip that is
+    // drawing has no place in line; its progress events keep it at 0.
+    for (const job of jobs.filter(unfinished)) {
+      if (!job.promptId || job.status === 'running') continue
+      const ahead = jobsAhead(listed, job.promptId)
+      if (ahead !== null && ahead !== job.queuePos) patchJob(job.id, { queuePos: ahead })
+    }
+  } finally {
+    reconciling = false
   }
 }
 
@@ -1280,31 +1833,38 @@ function jobsAhead(listed: readonly ServerJob[], promptId: string): number | nul
 
 if (typeof window !== 'undefined') {
   // A reload or a close says it is going, so the next page in the tab takes
-  // the lane up at once instead of asking.
+  // the lane and the sent clips up at once instead of asking.
   window.addEventListener('pagehide', () => {
     if (laneClips.length) saveLane(true)
+    if (jobs.some(outThere)) saveSent(true)
   })
   // Back from the browser's cache. If another page ran in this tab meanwhile,
-  // it took this lane up, may have sent some of it, and saved what is left,
-  // so this page's copy is out of date and must never be sent. The page
-  // starts again from the saved lane instead, as a reload does. Otherwise the
-  // lane is simply this page's again.
+  // it took this page's lane and sent clips up, may have sent or filed some,
+  // and saved what is left, so this page's copy is out of date and must never
+  // be sent or filed. The page starts again from what was saved instead, as a
+  // reload does. Otherwise they are simply this page's again.
   window.addEventListener('pageshow', (e) => {
-    if (!e.persisted || !laneClips.length) return
-    const saved = readLane(tabStore.get(LANE_KEY))
-    if (laneKept && saved?.writer !== PAGE) {
+    if (!e.persisted) return
+    const outHere = jobs.some(outThere)
+    const laneTaken = laneClips.length > 0 && laneKept && readLane(tabStore.get(LANE_KEY))?.writer !== PAGE
+    const sentTaken = outHere && sentKept && readSent(tabStore.get(SENT_KEY))?.writer !== PAGE
+    if (laneTaken || sentTaken) {
+      handedOver = true
       const stale = laneClips
       laneClips = []
       for (const c of stale) waiting.get(c.id)?.abort()
-      holdPage(false)
+      holdPage()
       window.location.reload()
       return
     }
-    saveLane()
+    if (laneClips.length) saveLane()
+    if (outHere) saveSent()
   })
 }
 
-// Last in the engine, so everything it calls is defined.
+// Last in the engine, so everything it calls is defined. Sent clips first, so
+// the lane's clips see them ahead in ComfyUI's queue.
+restoreSent()
 restoreLane()
 
 // ---------------------------------------------------------------------------
@@ -1356,7 +1916,7 @@ function HoldToStop({ jobId, label = 'Hold to stop' }: { jobId: string; label?: 
         type="button"
         {...hold.bind}
         aria-label={hold.armed ? 'Press again to stop this clip' : 'Hold to stop this clip'}
-        className={`sg-hold relative block w-full overflow-hidden border border-burgundy-900 px-4 py-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] text-burgundy-900 ${RING}`}
+        className={`sg-hold relative flex w-full items-center justify-center overflow-hidden border border-burgundy-900 px-4 py-2 text-[0.625rem] font-semibold uppercase tracking-[0.16em] text-burgundy-900 [@media(pointer:coarse)]:min-h-11 ${RING}`}
       >
         <span
           aria-hidden
@@ -1518,12 +2078,14 @@ const store = deskStore('video')
 /**
  * Why the press cannot run yet, in the reader's words. Null means it can.
  * `addOns` is how many rack files the clip would chain; see clipMemory.
+ * `offline` is true while ComfyUI's socket is closed.
  */
 function reasonFor(
   family: VideoFamily | null,
   c: Composition,
   hardware: Hardware | null,
   addOns: number,
+  offline: boolean,
 ): string | null {
   if (!family) return 'No video model is installed.'
   // First, because it is the one the reader cannot guess: a clip this size
@@ -1537,9 +2099,15 @@ function reasonFor(
   if (c.mode === 'i2v' && !family.canStartFromPicture) return `${family.label} works from words only.`
   if (c.mode === 'i2v' && !c.source?.name) return 'Add a start frame, or work from words.'
   // Uploaded by an older player, which sent the whole clip rather than a frame.
-  if (c.mode === 'i2v' && c.source && VIDEO_EXT.test(c.source.name)) {
+  // An output handed over in place carries its folder after the name.
+  if (c.mode === 'i2v' && c.source && VIDEO_EXT.test(c.source.ref?.filename ?? c.source.name.replace(/ \[\w+\]$/, ''))) {
     return 'The start frame is a whole clip, not one frame of it. Clear it and use one frame.'
   }
+  // While ComfyUI restarts, a clip pressed anyway fails at once, unless it is
+  // heavy and waits in the lane for ComfyUI to answer. Last, because it
+  // passes by itself and the rest still stand when it does. Said as the
+  // Pictures desk and the reel say it.
+  if (offline) return 'ComfyUI is not answering, so nothing can be queued.'
   return null
 }
 
@@ -1597,6 +2165,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const records = useSyncExternalStore(history.subscribe, history.all)
   const allJobs = useSyncExternalStore(videoJobs.subscribe, videoJobs.snapshot)
   const leftOver = useSyncExternalStore(videoJobs.subscribe, videoJobs.leftOver)
+  const leftSent = useSyncExternalStore(videoJobs.subscribe, videoJobs.leftSent)
+  const laneHeld = useSyncExternalStore(videoJobs.subscribe, videoJobs.held)
 
   const [cat, setCat] = useState<Catalogue | null>(null)
   const [catError, setCatError] = useState<string | null>(null)
@@ -1608,7 +2178,8 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   const [viewing, setViewing] = useState<HistoryEntry | null>(null)
   const [justFinished, setJustFinished] = useState<{ id: string; ms: number } | null>(null)
   const [reuseNotice, setReuseNotice] = useState<{
-    no: number
+    /** Where the settings came from, as the notice says it: `No. 1,204`. */
+    from: string
     /** Everything the reader should know about what was and was not carried over. */
     notes: string[]
     /** True when `Make another` queued a clip straight after loading. */
@@ -1869,82 +2440,46 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
     [setSource],
   )
 
+  // An output is handed to LoadImage where it lies, by its annotated name, as
+  // the reel does. It used to be fetched to the browser and uploaded straight
+  // back into ComfyUI's input folder: a full-size picture down and up again
+  // over the phone's link, every time one was chosen.
   const adoptFromArchive = useCallback(
-    async (entry: HistoryEntry) => {
-      setUploading(true)
+    (entry: HistoryEntry) => {
       setNotice(null)
-      try {
-        const res = await fetch(fileUrl(entry.file))
-        if (!res.ok) throw new Error(`the file is no longer on disk (HTTP ${res.status})`)
-        const blob = await res.blob()
-        const name = await uploadImage(blob, entry.file.filename)
-        setSource({
-          name,
-          ref: entry.file,
-          previewUrl: fileUrl(entry.file),
-          label: entry.file.filename,
-          width: entry.width ?? undefined,
-          height: entry.height ?? undefined,
-          fromEntryId: entry.id,
-        })
-        store.patch({ mode: 'i2v' })
-      } catch (err) {
-        setNotice({
-          kind: 'error',
-          title: 'We could not use that picture',
-          body: `${(err as Error).message}. The record is still in your archive.`,
-        })
-      } finally {
-        setUploading(false)
-      }
+      setSource({
+        name: annotatedRef(entry.file),
+        ref: entry.file,
+        previewUrl: thumbUrl(entry.file, 256),
+        label: entry.file.filename,
+        width: entry.width ?? undefined,
+        height: entry.height ?? undefined,
+        fromEntryId: entry.id,
+      })
+      store.patch({ mode: 'i2v' })
     },
     [setSource],
   )
 
-  // A source handed over by the archive arrives with a ref and no input name;
-  // LoadImage reads the *input* folder, so it has to be uploaded once. The ref
-  // guard keeps the upload from restarting every time this effect re-runs.
-  const adopting = useRef<string | null>(null)
+  // A source handed over by the archive arrives with a ref and no name. It is
+  // given its annotated name here, the same way, with no copy.
   useEffect(() => {
     const src = composition.source
     const ref = src?.ref
     if (!src || src.name || !ref) return
-    const key = `${ref.subfolder}/${ref.filename}`
-    if (adopting.current === key) return
-    adopting.current = key
-    setUploading(true)
-    ;(async () => {
-      try {
-        // A clip is not a start frame. LoadImage decodes every frame of one,
-        // and the next clip would take all of them as its opening. An older
-        // player sent the whole clip this way, and a draft saved then may
-        // still hold it.
-        if (VIDEO_EXT.test(ref.filename)) {
-          setSource(null)
-          setNotice({
-            kind: 'correction',
-            title: 'Correction',
-            body: 'The start frame waiting here was a whole clip, not one frame of it, so it was taken off. Open the clip and use one frame.',
-          })
-          return
-        }
-        const res = await fetch(fileUrl(ref))
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const blob = await res.blob()
-        const name = await uploadImage(blob, ref.filename)
-        setSource({ ...src, name, previewUrl: src.previewUrl ?? fileUrl(ref) })
-      } catch {
-        setNotice({
-          kind: 'correction',
-          title: 'Correction',
-          body: 'That start frame could not be loaded into ComfyUI. Choose another picture.',
-        })
-        setSource(null)
-      } finally {
-        adopting.current = null
-        setUploading(false)
-      }
-    })()
+    // A clip is not a start frame. LoadImage decodes every frame of one, and
+    // the next clip would take all of them as its opening. An older player
+    // sent the whole clip this way, and a draft saved then may still hold it.
+    if (VIDEO_EXT.test(ref.filename)) {
+      setSource(null)
+      setNotice({
+        kind: 'correction',
+        title: 'Correction',
+        body: 'The start frame waiting here was a whole clip, not one frame of it, so it was taken off. Open the clip and use one frame.',
+      })
+      return
+    }
+    setSource({ ...src, name: annotatedRef(ref), previewUrl: src.previewUrl ?? thumbUrl(ref, 256) })
   }, [composition.source, setSource])
 
   // Paste anywhere on the desk.
@@ -2039,13 +2574,32 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   // press will read: `stack` follows `family` (see above).
   const addOns = useMemo(() => (family ? addOnCount(rackToRun(family, lib, stack).ran) : 0), [family, lib, stack])
   const blockedReason = useMemo(
-    () => reasonFor(family, composition, hardware, addOns),
-    [family, composition, hardware, addOns],
+    () => reasonFor(family, composition, hardware, addOns, connection === 'closed'),
+    [family, composition, hardware, addOns, connection],
   )
   const memory = useMemo(
     () => (family ? clipMemory(family.def, clipOf(family, composition), hardware, addOns) : null),
     [family, composition, hardware, addOns],
   )
+
+  // The verdict each length would get at this shape, and each shape at this
+  // length, with this rack, asked the way the press asks it. A chip the press
+  // would refuse used to take the tap and then grey the button out, leaving
+  // the reader to try the others one by one.
+  const refusedLength = useMemo(() => {
+    if (!family) return []
+    return refusalsFor(lengths, (f) => {
+      const v = clipMemory(family.def, { width: composition.width, height: composition.height, frames: f }, hardware, addOns)
+      return v.level === 'refuse' ? v.reason : null
+    })
+  }, [family, lengths, composition.width, composition.height, hardware, addOns])
+  const refusedShape = useMemo(() => {
+    if (!family) return []
+    return refusalsFor(shapes, (sh) => {
+      const v = clipMemory(family.def, { width: sh.width, height: sh.height, frames }, hardware, addOns)
+      return v.level === 'refuse' ? v.reason : null
+    })
+  }, [family, shapes, frames, hardware, addOns])
 
   /**
    * Queue the clip — or several, with successive seeds.
@@ -2075,7 +2629,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       return false
     }
     const chained = addOnCount(resolvedLoras(fam).ran)
-    if (reasonFor(fam, c, hardware, chained)) return false
+    // Read afresh, not from this render: `Make another` and the shortcut run
+    // from callbacks that may predate the last change of connection.
+    if (reasonFor(fam, c, hardware, chained, connectionState() === 'closed')) return false
 
     const runs = c.runs ?? 1
     const first = c.seedLocked ? c.seed : randomSeed()
@@ -2171,7 +2727,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       setReuseNotice(
         applied.clobbered || notes.length
           ? {
-              no: entry.no,
+              from: `No. ${entry.no.toLocaleString('en-GB')}`,
               notes,
               ran,
               undo: () => {
@@ -2184,6 +2740,51 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
       if (!run) promptRef.current?.focus()
     },
     [cat, families, make, rackOf, updateStack],
+  )
+
+  /**
+   * Put a clip that failed or was lost back on the desk, as it was sent, with
+   * its add-on rack. It has no record to reuse, and by the time a long clip
+   * fails the draft usually holds the next idea, so this is the one way back
+   * to it short of rebuilding it from memory. Nothing runs: the reader
+   * presses Make, so the memory check and the lane apply again. A draft it
+   * replaces can be put back, as with a record.
+   */
+  const putBack = useCallback(
+    (job: VideoJob) => {
+      const prior = store.get()
+      const familyId = job.composition.familyId
+      const priorRack = rackOf(familyId)
+      // The prompt as typed. The one sent carries the add-ons' words, which
+      // the rack adds again on the next run.
+      const typed: Composition = { ...job.composition }
+      delete typed.positive
+      store.set(typed)
+      const l = libRef.current
+      const rack = restoreRack(
+        { familyId, loras: job.loras },
+        l === EMPTY_LIBRARY ? null : new Set(l.all.filter((i) => i.installed).map((i) => i.file)),
+      )
+      updateStack(rack.next, familyId)
+      dismissJob(job.id)
+      setViewing(null)
+      const clobbered = prior.prompt.trim().length > 0 && prior.prompt.trim() !== typed.prompt.trim()
+      setReuseNotice(
+        clobbered || rack.note
+          ? {
+              from: 'the clip that did not finish',
+              notes: rack.note ? [rack.note] : [],
+              ran: false,
+              undo: () => {
+                store.set(prior)
+                updateStack(priorRack, familyId)
+              },
+            }
+          : null,
+      )
+      promptRef.current?.focus()
+    },
+    [rackOf, updateStack],
   )
 
   // Ctrl/⌘+Enter runs, from inside the prompt too — the one deliberate
@@ -2217,9 +2818,11 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
   // rhythm without ever opening a log.
   useEffect(() => {
     const done = myJobs.find((j) => j.status === 'done' && j.finishedAt)
-    if (!done || !done.finishedAt) return
+    // What ComfyUI took, as filed; a clip whose start was never heard has no
+    // such figure, and its wait is not its making.
+    if (!done || !done.finishedAt || done.tookMs === null) return
     if (Date.now() - done.finishedAt > 4000) return
-    setJustFinished({ id: done.id, ms: done.finishedAt - done.startedAt })
+    setJustFinished({ id: done.id, ms: done.tookMs })
     const t = setTimeout(() => setJustFinished(null), 4000)
     return () => clearTimeout(t)
   }, [myJobs])
@@ -2268,28 +2871,25 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
   if (catError && !cat) return <ServerDown onRetry={() => setAttempt((a) => a + 1)} detail={catError} />
 
-  const progress = runningJob
-    ? runningJob.max > 1
-      ? clamp(runningJob.value / runningJob.max, 0, 0.97)
-      : 0.03
-    : 0
-
-  const elapsed = runningJob ? now - runningJob.startedAt : 0
+  // From when ComfyUI began the clip: a wait in the lane or its queue is not
+  // part of how long the clip takes, and the estimate below is not either.
+  const elapsed = runningJob?.ranAt != null ? now - runningJob.ranAt : 0
 
   const remaining = (() => {
-    if (!runningJob) return null
-    if (runningEstimate) {
+    if (!runningJob || runningJob.status !== 'running') return null
+    if (runningEstimate && runningJob.ranAt !== null) {
       const left = runningEstimate.ms - elapsed
       if (left <= 0) return 'Running long. Still working.'
       return `About ${duration(left)} left, from your last ${runningEstimate.runs} runs.`
     }
-    if (runningJob.samplingAt && runningJob.value >= 2 && runningJob.max > 1) {
-      const perStep = (now - runningJob.samplingAt) / runningJob.value
-      const left = perStep * (runningJob.max - runningJob.value)
-      if (left <= 0) return null
-      return `About ${duration(left)} left of the drawing, at this run's pace. Developing and encoding follow.`
-    }
-    return null
+    const left = drawingLeft(runningJob, now)
+    if (left === null) return null
+    const pass = runningJob.pass
+    return pass
+      ? `About ${duration(left)} left of the drawing, at this pass's pace${
+          pass.index < pass.count ? ', not counting the change of model between passes' : ''
+        }. Developing and encoding follow.`
+      : `About ${duration(left)} left of the drawing, at this run's pace. Developing and encoding follow.`
   })()
 
   return (
@@ -2596,10 +3196,25 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
           {!cat ? (
             <p className="text-small italic text-grey-500">Reading what this machine has…</p>
           ) : !family ? (
-            <Notice tone="correction" title="Correction" >
-              No video model is installed.{' '}
-              {offer?.blocked.length ? `${offer.blocked[0].label} ${offer.blocked[0].why.replace(/\.$/, '')}.` : ''}
-            </Notice>
+            <>
+              <Notice tone="correction" title="Correction">
+                No video model is installed.{' '}
+                {offer?.blocked.length ? `${offer.blocked[0].label} ${offer.blocked[0].why.replace(/\.$/, '')}.` : ''}
+              </Notice>
+              {/* The first family has to come from somewhere. The catalogue
+                  used to sit only in the margin of all controls, which needs
+                  a family to show at all, so with none installed there was no
+                  way to it but placing files by hand. */}
+              <div className="mt-4 border-t border-grey-300 pt-3">
+                <CataloguePanel
+                  modes={['video']}
+                  onInstalled={() => {
+                    resetCatalogue()
+                    setAttempt((a) => a + 1)
+                  }}
+                />
+              </div>
+            </>
           ) : (
             <>
               {/* Source tabs */}
@@ -2731,11 +3346,12 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                             type="button"
                             title={e.prompt || e.file.filename}
                             aria-label={`Use ${e.prompt || e.file.filename} as the start frame`}
-                            onClick={() => void adoptFromArchive(e)}
+                            onClick={() => adoptFromArchive(e)}
                             className="h-12 w-12 border border-grey-300 hover:border-burgundy-900"
                           >
+                            {/* A 48 px tile: one 256 px thumbnail covers it on any screen. */}
                             <img
-                              src={fileUrl(e.file)}
+                              src={thumbUrl(e.file, 256)}
                               alt=""
                               loading="lazy"
                               className="h-full w-full object-cover"
@@ -2817,11 +3433,18 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                   ariaLabel="How long the clip runs"
                   value={frames}
                   onChange={(v) => store.edit({ length: v }, 'length')}
-                  options={lengths.map((f) => ({
-                    value: f,
-                    label: clipLength(f, fps),
-                    caption: `${f} frames`,
-                  }))}
+                  options={lengths.map((f, i) => {
+                    const refused = refusedLength[i] ?? null
+                    return {
+                      value: f,
+                      label: clipLength(f, fps),
+                      // Said on the chip, since a title never shows on a phone.
+                      caption: refused ? `${f} frames, too long` : `${f} frames`,
+                      title: refused ?? undefined,
+                      // The chosen one stays pressable, so its refusal can be read.
+                      disabled: refused !== null && f !== frames,
+                    }
+                  })}
                 />
               </div>
 
@@ -2835,12 +3458,17 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                     const [w, h] = String(v).split('x').map(Number)
                     if (Number.isFinite(w) && Number.isFinite(h)) store.edit({ width: w, height: h }, 'width', 'height')
                   }}
-                  options={shapes.map((s) => ({
-                    value: `${s.width}x${s.height}`,
-                    label: s.label.split(' ')[0],
-                    caption: times(s.width, s.height),
-                    title: s.note,
-                  }))}
+                  options={shapes.map((s, i) => {
+                    const refused = refusedShape[i] ?? null
+                    const chosen = s.width === composition.width && s.height === composition.height
+                    return {
+                      value: `${s.width}x${s.height}`,
+                      label: s.label.split(' ')[0],
+                      caption: refused ? `${times(s.width, s.height)}, too large` : times(s.width, s.height),
+                      title: refused ?? s.note,
+                      disabled: refused !== null && !chosen,
+                    }
+                  })}
                 />
                 {(() => {
                   const chosen = shapes.find((s) => s.width === composition.width && s.height === composition.height)
@@ -2943,7 +3571,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               {reuseNotice ? (
                 <div className="mt-4">
                   <Notice tone="correction" title="Settings loaded">
-                    from No. {reuseNotice.no.toLocaleString('en-GB')}.{' '}
+                    from {reuseNotice.from}.{' '}
                     {reuseNotice.ran ? 'A clip is queued with them, on a new seed.' : 'Nothing has run yet.'}{' '}
                     {reuseNotice.notes.join(' ')}{' '}
                     <button
@@ -3026,6 +3654,73 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
             </div>
           ) : null}
 
+          {/* Clips an earlier page sent, which this page will not follow on a guess */}
+          {leftSent.length ? (
+            <div className="mb-4">
+              <Notice tone="warning" title={leftSent.length === 1 ? 'A clip sent before this page' : 'Clips sent before this page'}>
+                {leftSent.length === 1 ? 'One clip was' : `${leftSent.length} clips were`} sent to ComfyUI from this
+                tab by the page before this one, which went away without handing {leftSent.length === 1 ? 'it' : 'them'}{' '}
+                on, as happens when the phone closes a tab in the background, a page crashes or a tab is copied.{' '}
+                {leftSent.some((c) => c.sending)
+                  ? 'One marked as on its way was still being sent when the page went, so it may never have got there: following it finds out, and shows it as not sent if it did not. '
+                  : null}
+                If
+                this tab was copied from one that is still open, that one is following {leftSent.length === 1 ? 'it' : 'them'}{' '}
+                already, and following from here as well could file {leftSent.length === 1 ? 'it' : 'them'} twice.
+                <ul className="my-1 list-none p-0">
+                  {leftSent.map((c) => (
+                    <li key={c.id} className="truncate italic">
+                      {c.composition.prompt || 'No words'} · {c.modelLabel || c.familyLabel}
+                      {c.sending ? ' · on its way' : ''}
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => videoJobs.followLeftSent()}
+                >
+                  Follow {leftSent.length === 1 ? 'it' : 'them'} from here
+                </button>{' '}
+                ·{' '}
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => videoJobs.forgetLeftSent()}
+                >
+                  Forget {leftSent.length === 1 ? 'it' : 'them'}
+                </button>{' '}
+                Forgetting does not stop ComfyUI making {leftSent.length === 1 ? 'it' : 'any'} that got there; the
+                Archive’s “Look for files with no record” files {leftSent.length === 1 ? 'it once it has' : 'them once they have'}{' '}
+                landed.
+              </Notice>
+            </div>
+          ) : null}
+
+          {/* The lane, held after a heavy clip was lost */}
+          {laneHeld && waitingHere ? (
+            <div className="mb-4">
+              <Notice tone="warning" title={waitingHere === 1 ? 'A clip held back' : 'Clips held back'}>
+                The heavy clip before {waitingHere === 1 ? 'this one' : 'these'} was lost: ComfyUI no longer knew it,
+                which usually means ComfyUI restarted, as it does when memory runs out.{' '}
+                {waitingHere === 1 ? 'The clip waiting behind it needs' : `The ${waitingHere} clips waiting behind it need`}{' '}
+                as much memory, so the desk holds {waitingHere === 1 ? 'it' : 'them'} rather than send{' '}
+                {waitingHere === 1 ? 'it' : 'them'} the same way without a word from you.{' '}
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => videoJobs.sendHeld()}
+                >
+                  Send {waitingHere === 1 ? 'it' : 'them'} anyway
+                </button>{' '}
+                ·{' '}
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => videoJobs.stopHeld()}
+                >
+                  Stop {waitingHere === 1 ? 'it' : 'them'}
+                </button>
+              </Notice>
+            </div>
+          ) : null}
+
           {/* Where waiting clips live: nothing outside this tab knows about them yet */}
           {waitingHere ? (
             <p className="mb-3 text-caption italic text-grey-700">
@@ -3033,7 +3728,10 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               in this tab until {waitingHere === 1 ? 'it is' : 'they are'} sent to ComfyUI.{' '}
               {videoJobs.laneKept()
                 ? `A reload picks ${waitingHere === 1 ? 'it' : 'them'} up again; closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`
-                : `This browser will not let the desk keep ${waitingHere === 1 ? 'it' : 'them'}, so a reload or closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`}
+                : `This browser will not let the desk keep ${waitingHere === 1 ? 'it' : 'them'}, so a reload or closing the tab loses ${waitingHere === 1 ? 'it' : 'them'}.`}{' '}
+              {WAITS_IN_PAGE}
+              {/* A held lane lets the screen lock: nothing goes until the reader says. */}
+              {wakeLockAvailable() && !laneHeld ? ' The page asks for the screen to stay on while clips wait.' : ''}
             </p>
           ) : null}
 
@@ -3043,7 +3741,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
               <div className="flex items-baseline justify-between gap-3">
                 <span className="text-[0.625rem] font-semibold uppercase tracking-[0.18em] text-grey-700">
                   {job.max > 1 && job.stage === 'Drawing'
-                    ? `Drawing · step ${job.value} of ${job.max}`
+                    ? `Drawing${job.pass ? `, pass ${job.pass.index} of ${job.pass.count}` : ''} · step ${job.value} of ${job.max}`
                     : job.stage === 'Loading the model'
                       ? 'Loading the model · about a minute the first time'
                       : job.stage}
@@ -3055,10 +3753,7 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 <div
                   className="h-full bg-burgundy-900"
                   style={{
-                    width: `${Math.round(
-                      (job.id === runningJob?.id ? progress : job.max > 1 ? clamp(job.value / job.max, 0, 0.97) : 0.03) *
-                        100,
-                    )}%`,
+                    width: `${Math.round(drawnFraction(job) * 100)}%`,
                     transition: 'width 200ms linear',
                   }}
                 />
@@ -3078,6 +3773,13 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
               {job.waitNote && !job.promptId ? (
                 <p className="mt-1 text-caption italic text-grey-700 tabular-nums">{job.waitNote}</p>
+              ) : null}
+
+              {job.resumed ? (
+                <p className="mt-1 text-caption italic text-grey-700">
+                  Picked up after the page reloaded. ComfyUI reports steps and previews only to the page that sent a
+                  clip, so none show here; it is filed when it lands.
+                </p>
               ) : null}
 
               {job.previewUrl ? (
@@ -3101,11 +3803,30 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 tone={failed.status === 'cancelled' ? 'correction' : 'error'}
                 title={faultTitle(failed.fault ?? faultOf(new Error(failed.error ?? '')))}
               >
-                {faultBody(failed.fault ?? faultOf(new Error(failed.error ?? '')))}{' '}
+                {/* A lost heavy clip holds the lane behind it (see laneHold), so
+                    the desk is not free again, and a second go is not the offer. */}
+                {faultBody(failed.fault ?? faultOf(new Error(failed.error ?? '')), {
+                  held: failed.release && laneHeld,
+                })}{' '}
                 {failed.fault && faultWhere(failed.fault) ? (
                   <span className="block text-caption">{faultWhere(failed.fault)}</span>
                 ) : null}
-                <button className="underline" onClick={() => dismissJob(failed.id)}>
+                {/* A clip the reader stopped wants no second go offered. */}
+                {failed.status === 'error' ? (
+                  <>
+                    <button
+                      className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                      onClick={() => putBack(failed)}
+                    >
+                      Put these settings back
+                    </button>{' '}
+                    ·{' '}
+                  </>
+                ) : null}
+                <button
+                  className="inline-flex items-center underline [@media(pointer:coarse)]:min-h-11"
+                  onClick={() => dismissJob(failed.id)}
+                >
                   Dismiss
                 </button>
               </Notice>
@@ -3152,9 +3873,18 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
                 ) : null}
                 <p className="mt-2 text-caption text-grey-700 tabular-nums">
                   {shown.entry
-                    ? `Made by ${shown.entry.modelLabel} · ${dateline(shown.entry.at)} · ${duration(shown.entry.durationMs)}`
+                    ? `Made by ${shown.entry.modelLabel} · ${dateline(shown.entry.at)}${
+                        // 0 is a time nobody measured, not a clip made in no time.
+                        shown.entry.durationMs > 0 ? ` · ${duration(shown.entry.durationMs)}` : ''
+                      }`
                     : 'From the archive'}
                 </p>
+                {!viewing && newestDone?.repeatOf && shown.entry?.id === newestDone.repeatOf ? (
+                  <p className="mt-1 text-caption italic text-grey-700">
+                    ComfyUI had made this exact clip before, so it sent the same file back without drawing it again.
+                    Nothing new was filed.
+                  </p>
+                ) : null}
                 <p className="mt-1 text-caption text-grey-500 tabular-nums">
                   {shown.frames ? `${shown.frames} frames · ${clipLength(shown.frames, shown.fps || 1)} · ` : ''}
                   {shown.fps ? `${shown.fps} fps · ` : ''}
@@ -3271,7 +4001,9 @@ export default function Video({ renderPlayer, onNavigate }: VideoProps = {}) {
 
 function WorkflowPeek({ build }: { build: () => ApiWorkflow | null }) {
   const built = build()
-  const [copied, setCopied] = useState(false)
+  // Over plain http the browser has no clipboard API, so copyText falls back
+  // and can fail; the word says which.
+  const [copied, setCopied] = useState<'yes' | 'no' | null>(null)
   if (!built) {
     return <p className="mb-4 text-caption italic text-grey-500">Nothing to show until a style is chosen.</p>
   }
@@ -3282,16 +4014,13 @@ function WorkflowPeek({ build }: { build: () => ApiWorkflow | null }) {
         type="button"
         className="mb-1 text-caption text-burgundy-900 underline"
         onClick={() => {
-          void navigator.clipboard?.writeText(text).then(
-            () => {
-              setCopied(true)
-              setTimeout(() => setCopied(false), 2000)
-            },
-            () => setCopied(false),
-          )
+          void copyText(text).then((ok) => {
+            setCopied(ok ? 'yes' : 'no')
+            setTimeout(() => setCopied(null), 2000)
+          })
         }}
       >
-        {copied ? 'Copied' : 'Copy the JSON'}
+        {copied === 'yes' ? 'Copied' : copied === 'no' ? 'Could not copy' : 'Copy the JSON'}
       </button>
       <pre className="max-h-64 overflow-auto border border-grey-300 bg-newsprint-aged p-2 font-mono text-[0.65rem] leading-tight">
         {text}

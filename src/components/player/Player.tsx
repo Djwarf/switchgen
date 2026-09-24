@@ -530,15 +530,32 @@ function PlayerBody({
     [setSpeed, speed],
   )
 
+  /**
+   * An iPhone has no full screen for an element, only the video's own player,
+   * so there the clip goes full screen on its own and the player's controls
+   * stay behind; the phone's player brings its own. The optional call used to
+   * skip the whole expression, its catch included, so the button did nothing
+   * and said nothing.
+   */
   const toggleFullscreen = useCallback(() => {
     const root = rootRef.current
     if (!root) return
     if (document.fullscreenElement === root) {
       void document.exitFullscreen().catch(() => {})
+      return
+    }
+    const video = videoRef.current as (HTMLVideoElement & { webkitEnterFullscreen?: () => void }) | null
+    if (typeof root.requestFullscreen === 'function') {
+      void root.requestFullscreen().catch(() => say('error', 'This browser would not go full screen for us.'))
+    } else if (typeof video?.webkitEnterFullscreen === 'function') {
+      try {
+        // Throws until the clip's first frame has loaded.
+        video.webkitEnterFullscreen()
+      } catch {
+        say('error', 'This browser would not go full screen for us. Try again once the clip has loaded.')
+      }
     } else {
-      void root.requestFullscreen?.().catch(() =>
-        say('error', 'This browser would not go full screen for us.'),
-      )
+      say('error', 'This browser has no full screen for us to use.')
     }
   }, [say])
 

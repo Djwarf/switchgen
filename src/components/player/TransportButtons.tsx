@@ -191,7 +191,7 @@ export function LinkAction({
       title={hint}
       aria-haspopup={expanded === undefined ? undefined : 'menu'}
       aria-expanded={expanded}
-      className={`text-caption text-burgundy-900 underline decoration-burgundy-900 underline-offset-2 transition-colors duration-100 hover:text-burgundy-700 disabled:cursor-not-allowed disabled:text-grey-400 disabled:no-underline ${RING}`}
+      className={`inline-flex items-center text-caption text-burgundy-900 underline decoration-burgundy-900 underline-offset-2 transition-colors duration-100 hover:text-burgundy-700 disabled:cursor-not-allowed disabled:text-grey-400 disabled:no-underline [@media(pointer:coarse)]:min-h-11 ${RING}`}
     >
       {children}
     </button>
