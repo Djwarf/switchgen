@@ -2,6 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { PassPanel } from '../src/components/advanced/PassPanel'
+import { detailRedraw, detailSentence } from '../src/lib/refine'
 
 // The detail passes offered before the picture, and the note under them about
 // the region pass, which the finished picture offers along with whichever of
@@ -39,5 +40,27 @@ describe('the note on the region pass', () => {
 
   it('names all three when all three are listed', () => {
     expect(render({ face: true, hand: true, hires: true })).toContain('along with these three')
+  })
+})
+
+describe('what the face pass says it does', () => {
+  // The Impact Pack's arithmetic, not a measurement: the padded crop is
+  // capped at 1024 pixels, so a small face comes back at about 1024 over the
+  // crop factor, and a large one is never scaled down.
+  it('draws a face 80 pixels across again at about 410', () => {
+    const r = detailRedraw('face', 80)
+    expect(r.redrawn).toBeCloseTo(409.6, 1)
+    expect(r.cells).toBe(2621)
+  })
+
+  it('never shrinks a face larger than the cap allows', () => {
+    expect(detailRedraw('face', 600).redrawn).toBe(600)
+  })
+
+  it('says so in the panel, in figures the arithmetic gives', () => {
+    const said = detailSentence('face')
+    expect(said).toContain('about 410')
+    expect(said).not.toContain('nine thousand')
+    expect(render({ face: true, hand: false, hires: false })).toContain(said)
   })
 })

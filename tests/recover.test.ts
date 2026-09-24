@@ -1,6 +1,7 @@
 import { rmSync, utimesSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { PastRun } from '../src/lib/comfy'
 import type * as History from '../src/lib/history'
 import type * as Recover from '../src/lib/recover'
 import { call, mounted, tempRoots, type Handler } from './http'
@@ -15,6 +16,8 @@ let server: Handler
 /** While set, asking ComfyUI how the files were made waits for it. */
 let gate: Promise<void> | null = null
 let askedComfy = false
+/** What ComfyUI's /history answers while set; unset, ComfyUI has forgotten everything. */
+let comfyHistory: Record<string, unknown> | null = null
 let h: typeof History
 let recover: typeof Recover
 
@@ -27,6 +30,9 @@ beforeAll(async () => {
     if (url !== '/api/outputs') {
       askedComfy = true
       if (gate) await gate
+      if (comfyHistory && url.startsWith('/comfy/history')) {
+        return new Response(JSON.stringify(comfyHistory), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } })
     }
     const r = await call(server, { url })
@@ -108,6 +114,48 @@ describe('what a recovery pass sends', () => {
     vi.useRealTimers()
   })
 
+  it('files a name two runs have written with the run under way when the file on disk was written', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    // Written at 60 s past the epoch, in ms as the server lists it.
+    const at = (name: string) => {
+      writeFileSync(path.join(outputs, name), 'x')
+      utimesSync(path.join(outputs, name), 60, 60)
+    }
+    at('rerun.png')
+    at('forgot.png')
+    /** A /history entry as ComfyUI keeps it, times in ms. */
+    const run = (id: string, name: string, startedAt: number, finishedAt: number) => [
+      id,
+      {
+        prompt: [1, id, { '9': { class_type: 'SaveImage', inputs: { filename_prefix: 'x' } } }, {}, ['9']],
+        outputs: { '9': { images: [{ filename: name, subfolder: '', type: 'output' }] } },
+        status: {
+          status_str: 'success',
+          messages: [['execution_start', { timestamp: startedAt }], ['execution_success', { timestamp: finishedAt }]],
+        },
+      },
+    ]
+    // Oldest first, as /history lists them. rerun.png was made, deleted, and
+    // made again under the same name; forgot.png's own run is forgotten, and
+    // only one that made an earlier file under its name is remembered.
+    comfyHistory = Object.fromEntries([
+      run('old', 'rerun.png', 500, 1000),
+      run('new', 'rerun.png', 55_000, 59_000),
+      run('older', 'forgot.png', 500, 1000),
+    ])
+    later()
+    try {
+      const r = await recover.recoverUnfiled()
+      expect(r.filed).toBe(2)
+      expect(recordOf('rerun.png')?.promptId).toBe('new')
+      expect(recordOf('forgot.png')?.promptId).toBe('')
+      expect(recordOf('forgot.png')?.familyId).toBe('unknown')
+    } finally {
+      comfyHistory = null
+      vi.useRealTimers()
+    }
+  })
+
   it('does not file a second record for a file its desk filed while ComfyUI was being asked', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     aged('raced.png')
@@ -118,7 +166,7 @@ describe('what a recovery pass sends', () => {
     askedComfy = false
 
     const pass = recover.recoverUnfiled()
-    await vi.waitFor(() => { if (!askedComfy) throw new Error('not asked yet') })
+    await vi.waitFor(() => { if (!askedComfy) throw new Error('not asked yet') }, { timeout: 5000 })
     // The desk that made raced.png files it now, with how it was made.
     const desk = h.add({
       desk: 'images', kind: 'image', mode: 't2i',
@@ -138,5 +186,29 @@ describe('what a recovery pass sends', () => {
     expect(raced[0]!.prompt).toBe('the desk\'s words')
     expect(recordOf('calm.png')?.recovered).toBe(true)
     vi.useRealTimers()
+  })
+})
+
+describe('the run that wrote a file', () => {
+  const run = (promptId: string, startedAt: number | null, finishedAt: number | null): PastRun => ({
+    promptId, startedAt, finishedAt, graph: {}, files: [], status: 'success', clientId: null, error: null,
+  })
+
+  it('is the one under way when the file was written, newest first', () => {
+    const runs = [run('new', 4000, 5000), run('old', 500, 1000)]
+    expect(recover.runThatWrote(runs, 4900)?.promptId).toBe('new')
+  })
+
+  it('is none when every run remembered ended long before the file was written', () => {
+    expect(recover.runThatWrote([run('old', 500, 1000)], 60_000)).toBeUndefined()
+  })
+
+  it('is not a later run that found the file already made', () => {
+    const runs = [run('cached', 70_000, 70_100), run('writer', 500, 1000)]
+    expect(recover.runThatWrote(runs, 900)?.promptId).toBe('writer')
+  })
+
+  it('is a run with no times at all', () => {
+    expect(recover.runThatWrote([run('untimed', null, null)], 123_456)?.promptId).toBe('untimed')
   })
 })

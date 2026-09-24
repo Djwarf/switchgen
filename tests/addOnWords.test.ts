@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LoraIndexEntry } from '../src/lib/loraIndex'
+import { MEASURED_SINGLES } from '../src/components/loras/measured'
+import { measuredText } from '../src/components/loras/measuredText'
 import { INTENTS, TAG_STYLE_NOTE, intentReport } from '../src/lib/intent'
 import { withLoras } from '../src/lib/refine'
 import { suggest } from '../src/lib/suggest'
@@ -139,5 +141,19 @@ describe('what the picture reader says about an add-on', () => {
       expect(why, file).toMatch(/add-on/)
       expect(why, file).not.toMatch(/LoRA/)
     }
+  })
+})
+
+describe('the line under a measured add-on in the rack', () => {
+  it('compares it with the picture made with no add-ons, not with a base', () => {
+    const line = measuredText(MEASURED_SINGLES[ANATOMY_HELPER]!, false)
+    expect(line).toBe('0.81x as sharp as no add-ons at 0.3, 0.72x at 0.5, 0.44x at 0.8')
+    plain(line, ANATOMY_HELPER)
+  })
+
+  it('says an add-on that takes a word was measured without it', () => {
+    const line = measuredText(MEASURED_SINGLES[MICRO_DETAILS]!, true)
+    expect(line.endsWith(', without its word')).toBe(true)
+    plain(line, MICRO_DETAILS)
   })
 })

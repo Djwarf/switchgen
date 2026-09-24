@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { STOPPING, waitingLine } from '../src/components/compose/RunButton'
 
 // The Pictures desk's Stop as the section bar and the running slug call it.
 // ComfyUI is stood in for; nothing is sent anywhere.
@@ -78,5 +79,33 @@ describe('Stop from outside the Pictures desk', () => {
     expect(m.cancelJob).toHaveBeenCalledWith('p1')
     expect(m.run).toHaveBeenCalledTimes(1)
     expect(desk.pressSnapshot().job?.status).toBe('done')
+  })
+})
+
+describe('the line under a batch once Stop is pressed', () => {
+  // Stop drops the rest of the batch at once, but the picture on the press can
+  // take seconds to let go. Until it does, the job still counts the pictures
+  // behind it, and the line under the button said they waited to be sent.
+  it('says no pictures wait while the one on the press is stopping', async () => {
+    const desk = await import('../src/routes/Pictures')
+    m.run.mockImplementation((_graph: unknown, onProgress: (ev: unknown) => void) => {
+      onProgress({ phase: 'queued', promptId: 'p1' })
+      return new Promise(() => {})
+    })
+    // A cancel that has not landed yet, as on a long node.
+    m.cancelJob.mockImplementation(() => new Promise(() => {}))
+    const one = (label: string) => ({ graph: {}, label }) as unknown as import('../src/routes/Pictures').RunPlan
+    desk.startRuns([one('first'), one('second'), one('third')])
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(waitingLine(desk.pressSnapshot().job, true)).toContain('2 more pictures')
+
+    desk.stopPress()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const job = desk.pressSnapshot().job!
+    expect(job.status).toBe('queued')
+    expect(job.stage).toBe(STOPPING)
+    expect([job.index, job.total]).toEqual([1, 3])
+    expect(waitingLine(job, true)).toBeNull()
+    expect(m.run).toHaveBeenCalledTimes(1)
   })
 })

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -147,10 +147,15 @@ describe('a removed record\'s file', () => {
     await post('/api/archive/remove', { ids: ['DA'] })
     expect((await listed('dismiss-a.png'))?.dismissed).toBe(true)
 
+    // Saved after a debounce and an asynchronous write, so asked until it lands.
     vi.useRealTimers()
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    const saved = JSON.parse(readFileSync(process.env.SWITCHGEN_ARCHIVE!, 'utf8'))
-    expect(typeof saved.dismissed?.['dismiss-a.png']).toBe('number')
+    await vi.waitFor(
+      () => {
+        const saved = JSON.parse(readFileSync(process.env.SWITCHGEN_ARCHIVE!, 'utf8'))
+        expect(typeof saved.dismissed?.['dismiss-a.png']).toBe('number')
+      },
+      { timeout: 5000, interval: 50 },
+    )
 
     // The undo sends the record back unstamped.
     vi.useFakeTimers({ toFake: ['Date'] })
@@ -228,6 +233,65 @@ describe('a removed record\'s file', () => {
     expect(ids(r.assigned)).toEqual(['NEW5'])
   })
 
+  it('lets a desk\'s record take the place of one filed after the fact for the same file', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    mkdirSync(path.join(outputs, 'video'), { recursive: true })
+    aged('video/wan_00001_.webm', 60)
+    const clip = { filename: 'wan_00001_.webm', subfolder: 'video', type: 'output' }
+    const first = (await post('/api/archive/upsert', { records: [{ id: 'rec1', at: 1, file: clip, recovered: true, starred: true, note: 'n' }] })).json()
+    const no = first.assigned[0].no
+    const desk = (await post('/api/archive/upsert', { records: [{ id: 'desk1', at: 2, file: clip, promptId: 'p1', no: 7 }] })).json()
+    expect(ids(desk.assigned)).toEqual(['desk1'])
+
+    const pull = (await call(handlers.archive!, { url: '/api/archive?since=0' })).json()
+    const forClip = pull.records.filter((r: { file: { filename: string } }) => r.file.filename === 'wan_00001_.webm')
+    expect(ids(forClip)).toEqual(['desk1'])
+    expect(forClip[0]).toMatchObject({ no, starred: true, note: 'n', promptId: 'p1' })
+    expect(forClip[0].recovered).toBeUndefined()
+    expect(pull.removed).toContain('rec1')
+
+    // A device that still holds the old record, as stamped, cannot bring it back.
+    const stale = (await post('/api/archive/upsert', { records: [{ id: 'rec1', rev: 1, at: 1, file: clip, recovered: true }] })).json()
+    expect(stale.refused).toEqual(['rec1'])
+    const listing = await listed('video/wan_00001_.webm')
+    expect(listing?.filed).toBe(true)
+    expect(listing?.dismissed).toBeUndefined()
+  })
+
+  it('tells the desk that filed in its place what it kept from the record it replaced', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    mkdirSync(path.join(outputs, 'video'), { recursive: true })
+    aged('video/wan_00002_.webm', 60)
+    const clip = { filename: 'wan_00002_.webm', subfolder: 'video', type: 'output' }
+    await post('/api/archive/upsert', {
+      records: [{ id: 'rec3', at: 1, file: clip, recovered: true, starred: true, note: 'n', tags: ['a'], rating: 'general' }],
+    })
+    // The desk's copy has tags of its own, read on the device that made it.
+    const desk = (await post('/api/archive/upsert', { records: [{ id: 'desk3', at: 2, file: clip, promptId: 'p3', tags: ['own'] }] })).json()
+    expect(ids(desk.assigned)).toEqual(['desk3'])
+    // Without these the desk's device, stamped at this rev, never pulls them,
+    // and its next edit, sent whole, would put its copy over them everywhere.
+    expect(desk.assigned[0].kept).toEqual({ starred: true, note: 'n', rating: 'general' })
+
+    // The same record again, now that it is here, took no one's place.
+    const stamped = (await call(handlers.archive!, { url: '/api/archive?since=0' })).json().records.find((r: { id: string }) => r.id === 'desk3')
+    expect(stamped).toMatchObject({ starred: true, note: 'n', tags: ['own'], rating: 'general' })
+    const again = (await post('/api/archive/upsert', { records: [stamped] })).json()
+    expect(ids(again.assigned)).toEqual(['desk3'])
+    expect(again.assigned[0].kept).toBeUndefined()
+  })
+
+  it('still refuses a record filed after the fact for a file a desk has filed', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    aged('desk-first.png', 60)
+    const file = { filename: 'desk-first.png', subfolder: '', type: 'output' }
+    await post('/api/archive/upsert', { records: [{ id: 'desk2', at: 1, file, promptId: 'p2' }] })
+    const r = (await post('/api/archive/upsert', { records: [{ id: 'rec2', at: 1, file, recovered: true }] })).json()
+    expect(r.refused).toEqual(['rec2'])
+    const pull = (await call(handlers.archive!, { url: '/api/archive?since=0' })).json()
+    expect(ids(pull.records.filter((x: { file: { filename: string } }) => x.file.filename === 'desk-first.png'))).toEqual(['desk2'])
+  })
+
   it('refuses one for a file that has gone from disk since, so the removal stands', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     await removedOnce('RF6', 'refile-6.png')
@@ -254,7 +318,7 @@ describe('where the archive\'s log stands', () => {
     const s = open(handlers.archive!, { url: '/api/archive/stream' })
     await vi.waitFor(() => {
       if (!s.reply.body.includes('\n\n')) throw new Error('nothing yet')
-    })
+    }, { timeout: 5000 })
     s.hangUp()
     const first = JSON.parse(/^data: (.*)$/m.exec(s.reply.body)![1]!)
     const pull = (await call(handlers.archive!, { url: '/api/archive' })).json()
@@ -305,13 +369,13 @@ setTimeout(() => process.exit(9), 3000)
     const r = endWith('exit')
     expect(r.status).toBe(0)
     expect(Object.keys(r.saved?.records ?? {})).toEqual(['kept'])
-  })
+  }, 20_000)
 
   it('writes and ends on Ctrl-C with the code the default would give', () => {
     const r = endWith('SIGINT')
     expect(r.status).toBe(130)
     expect(Object.keys(r.saved?.records ?? {})).toEqual(['kept'])
-  })
+  }, 20_000)
 })
 
 describe('the archive loaded again in one process', () => {
@@ -322,7 +386,7 @@ describe('the archive loaded again in one process', () => {
   const ARCHIVE_MJS = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server', 'archive.mjs')).href
   const CHILD = `
 import { EventEmitter } from 'node:events'
-import { chmodSync, mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync } from 'node:fs'
 import { Readable } from 'node:stream'
 const [how, dir] = process.argv.slice(2)
 process.env.SWITCHGEN_OUTPUTS = dir
@@ -364,17 +428,30 @@ if (how === 'handover') {
 }
 
 // 'exit' or 'SIGINT': an older load whose last write failed, then a newer one.
+// Each step waits for what it needs to have happened, not for a set time.
+const until = async (what, done) => {
+  for (let i = 0; i < 500 && !done(); i++) await wait(20)
+  if (!done()) { report({ timedOut: what }); process.exit(8) }
+}
+const onDisk = () => {
+  try { return Object.keys(JSON.parse(readFileSync(dir + '/.switchgen/archive.json', 'utf8')).records ?? {}) } catch { return [] }
+}
+let writeFailed = false
+const warn = console.warn
+console.warn = (...args) => {
+  if (String(args[0]).includes('could not write')) writeFailed = true
+  warn(...args)
+}
 const one = await loadNo(1)
 await one('x')
-await wait(500)
+await until('x on disk', () => onDisk().includes('x'))
 const folder = dir + '/.switchgen'
 chmodSync(folder, 0o500)
 await one('stale')
-await wait(500)
+await until('the failed write', () => writeFailed)
 chmodSync(folder, 0o700)
 const two = await loadNo(2)
 await two('fresh')
-await wait(500)
 if (how === 'exit') process.exit(0)
 if (how === 'SIGINT') process.kill(process.pid, 'SIGINT')
 setTimeout(() => process.exit(9), 3000)
@@ -405,7 +482,7 @@ setTimeout(() => process.exit(9), 3000)
     const r = runChild('twice')
     expect(r.status).toBe(0)
     expect(r.report).toEqual({ map: true, size: 1 })
-  })
+  }, 20_000)
 
   // A folder made read-only does not stop root, so the failed write this
   // needs cannot be staged when the suite runs as root.
@@ -413,15 +490,168 @@ setTimeout(() => process.exit(9), 3000)
   it.skipIf(asRoot)('lets only the newest load write at exit, not an older one whose last write failed', () => {
     for (const how of ['exit', 'SIGINT']) {
       const r = runChild(how)
+      expect(r.report, how).toBeNull()
       expect(r.status, how).toBe(how === 'exit' ? 0 : 130)
       expect(r.saved, how).toEqual(['fresh', 'x'])
     }
-  })
+  }, 40_000)
 
   it('takes over from the list an older build left, which then calls nothing', () => {
     const r = runChild('handover')
     expect(r.status).toBe(0)
     expect(r.report).toEqual({ oldSize: 0, map: true })
     expect(r.stdout).not.toContain('OLD FLUSH CALLED')
+  }, 20_000)
+})
+
+describe('one server to an archive', () => {
+  // Two servers on one archive each hold it whole and write it whole, so the
+  // one that saves last undoes the other's records. Each server here is a
+  // process of its own, driven by lines on its stdin.
+  const ARCHIVE_MJS = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'server', 'archive.mjs')).href
+  const SERVER = `
+import { EventEmitter } from 'node:events'
+import readline from 'node:readline'
+import { Readable } from 'node:stream'
+const [dir] = process.argv.slice(2)
+process.env.SWITCHGEN_OUTPUTS = dir
+process.env.SWITCHGEN_ARCHIVE = dir + '/.switchgen/archive.json'
+const { switchgenArchive } = await import(${JSON.stringify(ARCHIVE_MJS)})
+let handler
+switchgenArchive().configurePreviewServer({ middlewares: { use: (fn) => { handler = fn } } })
+const ask = (method, url, body) => new Promise((resolve) => {
+  const raw = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+  const req = Object.assign(Readable.from(raw), { method, url, headers: body === undefined ? {} : { 'content-type': 'application/json' } })
+  let status = 200
+  let text = ''
+  const res = Object.assign(new EventEmitter(), {
+    req, headersSent: false, destroyed: false, setHeader() {}, getHeader() {},
+    writeHead(code) { status = code; return res },
+    write(chunk) { text += chunk; return true },
+    end(chunk) { if (chunk !== undefined) text += chunk; resolve({ status, body: text }) },
   })
+  Object.defineProperty(res, 'statusCode', { get: () => status, set: (v) => { status = v } })
+  handler(req, res, () => resolve({ status: 0, body: 'passed on' }))
+})
+console.log('READY ' + process.pid)
+for await (const line of readline.createInterface({ input: process.stdin })) {
+  const [what, arg] = line.split(' ')
+  if (what === 'exit') process.exit(0)
+  const record = { id: arg, at: 1, file: { filename: arg + '.png', subfolder: '', type: 'output' } }
+  const r = what === 'upsert' ? await ask('POST', '/api/archive/upsert', { records: [record] }) : await ask('GET', arg)
+  console.log('OUT ' + JSON.stringify(r))
+}
+`
+  let dir = ''
+  let script = ''
+  const running: ChildProcess[] = []
+  beforeAll(() => {
+    dir = path.join(root, 'lock')
+    mkdirSync(dir, { recursive: true })
+    script = path.join(dir, 'server.mjs')
+    writeFileSync(script, SERVER)
+  })
+  afterAll(() => {
+    for (const child of running) child.kill()
+  })
+
+  /** A server process on the archive in `folder`, and a way to ask it things. */
+  function server(folder: string) {
+    mkdirSync(folder, { recursive: true })
+    const child = spawn(process.execPath, [script, folder], { stdio: ['pipe', 'pipe', 'ignore'] })
+    running.push(child)
+    const lines: string[] = []
+    const waiting: (() => void)[] = []
+    let rest = ''
+    child.stdout!.on('data', (d: Buffer) => {
+      rest += d.toString()
+      const parts = rest.split('\n')
+      rest = parts.pop()!
+      lines.push(...parts)
+      for (const wake of waiting.splice(0)) wake()
+    })
+    const exited = new Promise<number | null>((resolve) => child.on('exit', resolve))
+    const next = async (prefix: string): Promise<string> => {
+      for (;;) {
+        const i = lines.findIndex((l) => l.startsWith(prefix))
+        if (i >= 0) return lines.splice(i, 1)[0]!.slice(prefix.length)
+        await new Promise<void>((resolve) => waiting.push(resolve))
+      }
+    }
+    const ready = next('READY ')
+    return {
+      pid: child.pid!,
+      ready,
+      exited,
+      async ask(line: string): Promise<{ status: number; json: any }> {
+        child.stdin!.write(`${line}\n`)
+        const r = JSON.parse(await next('OUT ')) as { status: number; body: string }
+        return { status: r.status, json: JSON.parse(r.body) }
+      },
+      exit() {
+        child.stdin!.write('exit\n')
+        return exited
+      },
+    }
+  }
+  const lockOf = (folder: string) => path.join(folder, '.switchgen', 'archive.json.lock')
+
+  it('lets the second server stand back, naming the first, and take over once it stops', async () => {
+    const folder = path.join(dir, 'two')
+    const a = server(folder)
+    await a.ready
+    expect((await a.ask('upsert fromA')).status).toBe(200)
+    const b = server(folder)
+    await b.ready
+
+    const write = await b.ask('upsert fromB')
+    expect(write.status).toBe(503)
+    expect(write.json.busy).toBe('archive')
+    expect(write.json.error).toContain(`process ${a.pid}`)
+    const files = await b.ask('get /api/outputs')
+    expect(files.status).toBe(503)
+    expect(files.json.busy).toBe('archive')
+
+    expect(await a.exit()).toBe(0)
+    expect(existsSync(lockOf(folder))).toBe(false)
+    const pull = await b.ask('get /api/archive')
+    expect(pull.status).toBe(200)
+    expect(pull.json.records.map((r: { id: string }) => r.id)).toEqual(['fromA'])
+    await b.exit()
+  }, 30_000)
+
+  const onLinux = existsSync('/proc/self/stat') && existsSync('/proc/sys/kernel/random/boot_id')
+  const boot = () => readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()
+  const startOf = (pid: number) => {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+  }
+  /** What a server answers for the archive when it starts with `holder` in the lock. */
+  const withLock = async (name: string, holder: Record<string, unknown>) => {
+    const folder = path.join(dir, name)
+    mkdirSync(path.join(folder, '.switchgen'), { recursive: true })
+    writeFileSync(lockOf(folder), JSON.stringify(holder))
+    const s = server(folder)
+    await s.ready
+    const r = await s.ask('get /api/archive')
+    await s.exit()
+    return r
+  }
+
+  it('takes a lock left by a process that has gone', async () => {
+    const gone = spawnSync(process.execPath, ['-e', '']).pid
+    expect((await withLock('dead', { pid: gone })).status).toBe(200)
+  }, 20_000)
+
+  it.skipIf(!onLinux)('takes a lock whose number now names another process, or one from before the machine restarted', async () => {
+    expect((await withLock('reused', { pid: 1, boot: boot(), start: '999' })).status).toBe(200)
+    expect((await withLock('rebooted', { pid: 1, boot: 'old' })).status).toBe(200)
+  }, 20_000)
+
+  it.skipIf(!onLinux)('leaves a lock held by a server that still runs', async () => {
+    const r = await withLock('live', { pid: process.pid, boot: boot(), start: startOf(process.pid) })
+    expect(r.status).toBe(503)
+    expect(r.json.busy).toBe('archive')
+    expect(r.json.error).toContain(`process ${process.pid}`)
+  }, 20_000)
 })

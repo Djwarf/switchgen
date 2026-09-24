@@ -100,3 +100,38 @@ describe('reusing a record with add-ons', () => {
     expect(session.deskStore('video').get()).toEqual(before)
   })
 })
+
+describe('the file a source picture is', () => {
+  it('reads the folder annotation on a LoadImage name', () => {
+    expect(session.sourceFile({ name: 'sub/x.png [output]' })).toEqual({ filename: 'x.png', subfolder: 'sub', type: 'output' })
+  })
+
+  it('takes a plain name as a file in the input folder', () => {
+    expect(session.sourceFile({ name: 'sg_1.png' })).toMatchObject({ filename: 'sg_1.png', type: 'input' })
+  })
+
+  it('falls back to the picture it was taken from before the name is filled in', () => {
+    const ref = { filename: 'r.png', subfolder: 'a', type: 'output' }
+    expect(session.sourceFile({ name: '', ref })).toBe(ref)
+  })
+
+  it('shows a source kept past a reload from the server, not from a blob that died with the page', async () => {
+    disk.set('switchgen.desk.video.v1', JSON.stringify({ desk: 'video', mode: 'i2v', prompt: '', source: { name: 'sg_1.png', previewUrl: 'blob:x' } }))
+    vi.resetModules()
+    const fresh = await import('../src/lib/session')
+    const shown = fresh.deskStore('video').get().source?.previewUrl ?? ''
+    expect(shown).toContain('filename=sg_1.png')
+    expect(shown).toContain('type=input')
+    expect(shown).not.toContain('blob:')
+  })
+})
+
+describe('a record sent to the Pictures plate', () => {
+  it('is taken once', () => {
+    const entry = record({})
+    expect(session.takePlateRequest()).toBeNull()
+    session.requestPlate(entry)
+    expect(session.takePlateRequest()).toBe(entry)
+    expect(session.takePlateRequest()).toBeNull()
+  })
+})

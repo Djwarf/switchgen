@@ -56,3 +56,10 @@ describe('a gated file with no token', () => {
     expect(noToken(plan({}))).toBeNull()
   })
 })
+
+describe('a fetch held back with a file on disk that is not the catalogue\'s', () => {
+  it('says the fetch leaves that file as it is', () => {
+    const text = heldBack(plan({ fits: false, blockers: ['Too little RAM.'], asIs: ['c.bin'] }))
+    expect(text).toContain('The fetch leaves c.bin as it is on disk')
+  })
+})

@@ -29,9 +29,13 @@ export function call(handler: Handler, opts: Request): Promise<Reply> {
 /**
  * Like {@link call}, but the reply is handed over at once and fills as the
  * handler writes, so a test can read a stream (server-sent events, say)
- * before the handler ends it. `done` settles when it does.
+ * before the handler ends it. `done` settles when it does, and `ran` when the
+ * handler's own work does, whether or not it answered.
  */
-export function open(handler: Handler, opts: Request): { reply: Reply; done: Promise<Reply>; hangUp: () => void } {
+export function open(
+  handler: Handler,
+  opts: Request,
+): { reply: Reply; done: Promise<Reply>; hangUp: () => void; ran: Promise<unknown> } {
   const method = opts.method ?? 'GET'
   const raw = opts.body === undefined ? [] : [Buffer.from(JSON.stringify(opts.body))]
   const headers: Record<string, string> = { ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}), ...opts.headers }
@@ -45,6 +49,7 @@ export function open(handler: Handler, opts: Request): { reply: Reply; done: Pro
     json: () => JSON.parse(reply.body),
   }
   let hangUp = () => {}
+  let ran: unknown
   const done = new Promise<Reply>((resolve) => {
     const res = Object.assign(new EventEmitter(), {
       req,
@@ -87,12 +92,16 @@ export function open(handler: Handler, opts: Request): { reply: Reply; done: Pro
       res.destroyed = true
       res.emit('close')
     }
-    handler(req, res, () => {
+    ran = handler(req, res, () => {
       reply.passed = true
       resolve(reply)
     })
   })
-  return { reply, done, hangUp }
+  // What the handler itself returned, settled: a middleware that returns
+  // without answering (a client already gone) leaves `done` pending for good,
+  // and this is how a test hears that it has finished. Only a route called
+  // bare says so; one mounted through `safely` returns nothing.
+  return { reply, done, hangUp, ran: Promise.resolve(ran) }
 }
 
 /** The server-sent events a reply holds so far, in order. */

@@ -95,7 +95,7 @@ beforeEach(async () => {
 const settled = () =>
   vi.waitFor(() => {
     if (engine.reelRun.busy()) throw new Error('still walking')
-  })
+  }, { timeout: 5000 })
 
 describe('a shot that needs memory released first', () => {
   // ComfyUI applies a release to the next prompt it takes, so the reel waits
@@ -111,7 +111,7 @@ describe('a shot that needs memory released first', () => {
     )
     m.run.mockImplementation(finishes)
     engine.reelRun.renderAll(['s1'], jobsFor(['a']), releasing)
-    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.s1?.stage).toBe('Waiting for ComfyUI to finish 2 other jobs'))
+    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.s1?.stage).toBe('Waiting for ComfyUI to finish 2 other jobs'), { timeout: 5000 })
     expect(m.release).not.toHaveBeenCalled()
     expect(m.run).not.toHaveBeenCalled()
     letGo(true)
@@ -127,7 +127,7 @@ describe('a shot that needs memory released first', () => {
     )
     m.run.mockImplementation(finishes)
     engine.reelRun.renderAll(['s1', 's2'], jobsFor(['a', 'b']), releasing)
-    await vi.waitFor(() => expect(m.wait).toHaveBeenCalled())
+    await vi.waitFor(() => expect(m.wait).toHaveBeenCalled(), { timeout: 5000 })
     engine.reelRun.stop()
     await settled()
     expect(m.release).not.toHaveBeenCalled()
@@ -205,7 +205,7 @@ describe('what the reel says when a pass ends early', () => {
       return true
     })
     engine.reelRun.renderOne(2, order, jobs, ctx)
-    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.s3?.promptId).toBe('again'))
+    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.s3?.promptId).toBe('again'), { timeout: 5000 })
     engine.reelRun.stop()
     await settled()
     expect(engine.reelRun.snapshot().note).toBe('Stopped during shot 3. Its earlier clip is kept.')

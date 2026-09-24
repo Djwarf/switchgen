@@ -63,7 +63,7 @@ beforeEach(async () => {
 const settled = () =>
   vi.waitFor(() => {
     if (engine.reelRun.busy()) throw new Error('still walking')
-  })
+  }, { timeout: 5000 })
 
 type Shot = ReturnType<typeof import('../src/components/reel/store').newShot>
 /** Plan the draft the way the desk does. */

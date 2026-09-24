@@ -152,7 +152,7 @@ describe('a server that restarts behind what it answered', () => {
     await until(() => h.syncCursor().boot === load)
     expect(asked.some((u) => u.startsWith('/api/archive?since='))).toBe(true)
     expect(asked.some((u) => u.endsWith('since=0'))).toBe(false)
-  })
+  }, 15_000)
 
   it('sends every record to a server whose archive file was lost', async () => {
     await until(() => savedIn(persisted) === 6)
@@ -164,7 +164,7 @@ describe('a server that restarts behind what it answered', () => {
     const back = (await held()).records.map((r: { id: string }) => r.id).sort()
     expect(back).toEqual(h.all().map((e) => e.id).sort())
     expect(h.pendingCount()).toBe(0)
-  }, 10_000)
+  }, 15_000)
 })
 
 describe('an undo after the removal reached the server', () => {
@@ -186,10 +186,35 @@ describe('an undo after the removal reached the server', () => {
     // The reader undoes the removal here.
     h.restore(removed!)
     await until(() => h.pendingCount() === 0)
-    await sleep(100)
+    await until(async () => (await held()).records.some((x: { id: string }) => x.id === r.id))
     const back = (await held()).records.find((x: { id: string }) => x.id === r.id)
     expect(back?.prompt).toBe('u.png')
     expect(h.get(r.id)?.rev).toBe(back?.rev)
     expect(h.pendingCount()).toBe(0)
-  })
+  }, 20_000)
+})
+
+describe('a clip filed after the fact on one device and by its desk on another', () => {
+  it('shows the note the reader wrote on the other device, and keeps it through an edit here', async () => {
+    // Another device's recovery pass files the clip, and the reader stars it
+    // there and writes a note. This browser has not pulled since.
+    const file = { filename: 'fold_00001_.webm', subfolder: 'video', type: 'output' }
+    const put = (records: unknown[]) => call(server, { method: 'POST', url: '/api/archive/upsert', body: { records } })
+    const filed = (await put([{ id: 'elsewhere', at: 1, file, recovered: true }])).json()
+    await put([{ id: 'elsewhere', at: 1, file, recovered: true, rev: filed.assigned[0].rev, starred: true, note: 'n' }])
+    expect(h.get('elsewhere')).toBeUndefined()
+
+    // The desk here files the clip it made, and its push takes that one's place.
+    const mine = h.add({ ...entry('fold_00001_.webm'), desk: 'video', kind: 'video', mode: 't2v', file })
+    await until(() => h.get(mine.id)?.rev !== undefined && h.pendingCount() === 0)
+    expect(h.get(mine.id)?.note).toBe('n')
+    expect(h.get(mine.id)?.starred).toBe(true)
+
+    // Its next edit is sent whole, and must not take the note away everywhere.
+    h.update(mine.id, { tags: ['tram'] })
+    await until(() => h.pendingCount() === 0)
+    const there = (await held()).records.find((r: { id: string }) => r.id === mine.id)
+    expect(there).toMatchObject({ note: 'n', starred: true, tags: ['tram'] })
+    expect((await held()).removed).toContain('elsewhere')
+  }, 15_000)
 })

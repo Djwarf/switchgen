@@ -186,12 +186,59 @@ describe('pricing one file of a family that lists several', () => {
   })
 
   it('prices the file it is asked about when deciding a family is available', () => {
-    // The family lists four checkpoints and is offered only with all of them.
+    // All four of the family's checkpoints are installed here, so each of the
+    // two files asked about is available and priced on its own size.
     const inv = inventoryFrom(objectInfo({ ckpt: il.models }))
     const bytes = (m: string) => {
       const a = availabilityOf(il, inv, hw, sizes, m)
       return a.ok ? a.verdict?.footprint.weightBytes : undefined
     }
     expect(bytes('NoobAI-XL-v1.1.safetensors')! - bytes('waiMatureIllustrious_v30.safetensors')!).toBe(5 * GiB)
+  })
+})
+
+describe('a family that lists several weight files, with one of them installed', () => {
+  // A family that lists several checkpoints loads one per run, so the one
+  // asked about is all it needs; one placed on its own used to read as
+  // needing the other three, and was left out of every list on the desk.
+  const GiB = 1024 ** 3
+  const il = family('sdxl-illustrious')
+  const wai = 'waiMatureIllustrious_v30.safetensors'
+  const hw: Hardware = {
+    cpu: { cores: 8, model: 'test' },
+    ram: { total: 64 * GiB, free: 64 * GiB },
+    gpu: { name: 'test', vramTotal: 16 * GiB, vramUsed: 0, vramFree: 16 * GiB },
+    disk: null,
+    platform: 'test',
+  }
+  const sizes = new Map([[wai, { name: wai, rel: wai, folder: 'checkpoints', size: 7 * GiB, mtime: 0 } as ModelFile]])
+
+  it('is available for the file that is there', () => {
+    const inv = inventoryFrom(objectInfo({ ckpt: [wai] }))
+    expect(missingFilesFor(il, inv, wai)).toEqual([])
+    expect(availabilityOf(il, inv, hw, sizes, wai).ok).toBe(true)
+  })
+
+  it('still needs every file when no file is named', () => {
+    const inv = inventoryFrom(objectInfo({ ckpt: [wai] }))
+    expect(missingFilesFor(il, inv)).toEqual(il.models.filter((m) => m !== wai))
+  })
+
+  it('still needs the files the graph names beside the weights', () => {
+    const z = family('z-image')
+    const inv = inventoryFrom(objectInfo({ unet: ['Z-Image-Turbo-fp8mix.safetensors'], vae: ['ae.safetensors'] }))
+    expect(missingFilesFor(z, inv, 'Z-Image-Turbo-fp8mix.safetensors')).toEqual(['qwen_3_4b.safetensors', 'Flux/ae.safetensors'])
+  })
+
+  it('needs both halves of a pair that loads both, whichever half is named', () => {
+    const pair = family('wan22-14b-t2v')
+    const [high] = pair.models
+    const inv = inventoryFrom(objectInfo({
+      gguf: [high!],
+      clipGguf: ['umt5-xxl-encoder-Q4_K_M.gguf'],
+      vae: ['wan_2.1_vae.safetensors'],
+    }))
+    expect(missingFilesFor(pair, inv, high)).not.toEqual([])
+    expect(availabilityOf(pair, inv, null, new Map(), high).ok).toBe(false)
   })
 })

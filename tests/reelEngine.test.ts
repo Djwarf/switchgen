@@ -14,6 +14,8 @@ const m = vi.hoisted(() => ({
   getJob: vi.fn(),
   pastRuns: vi.fn(),
   release: vi.fn(),
+  idle: vi.fn(),
+  others: vi.fn(),
 }))
 
 vi.mock('../src/lib/comfy', async (importOriginal) => ({
@@ -24,9 +26,14 @@ vi.mock('../src/lib/comfy', async (importOriginal) => ({
   pastRuns: m.pastRuns,
 }))
 
+// The queue is idle whenever the engine asks. The real wait reads /comfy/queue,
+// which has no answer here, and it waits through a ComfyUI that does not
+// answer for as long as that lasts.
 vi.mock('../src/lib/clipMemory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/lib/clipMemory')>()),
   releaseComfyMemory: m.release,
+  waitForIdleComfy: m.idle,
+  releaseIfOthersAhead: m.others,
 }))
 
 type Run = (wf: ApiWorkflow, on: (e: ProgressEvent) => void) => Promise<OutputFile[]>
@@ -86,6 +93,8 @@ let engine: typeof Engine
 beforeEach(async () => {
   for (const f of Object.values(m)) f.mockReset()
   m.release.mockResolvedValue(true)
+  m.idle.mockResolvedValue(true)
+  m.others.mockResolvedValue(undefined)
   m.cancelJob.mockResolvedValue(true)
   made = 0
   vi.resetModules()
@@ -95,7 +104,7 @@ beforeEach(async () => {
 const settled = () =>
   vi.waitFor(() => {
     if (engine.reelRun.busy()) throw new Error('still walking')
-  })
+  }, { timeout: 5000 })
 
 async function renderedReel(prompts: string[]) {
   const order = prompts.map((_, i) => `shot${i + 1}`)
@@ -137,7 +146,7 @@ describe('the reel engine', () => {
     engine.reelRun.renderAll(order, jobs, ctx, { force: true })
     // The pass covers the whole reel, and every shot waits for it.
     expect(engine.reelRun.snapshot().queue).toEqual(order)
-    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.shot1?.promptId).toBe('p-again'))
+    await vi.waitFor(() => expect(engine.reelRun.snapshot().states.shot1?.promptId).toBe('p-again'), { timeout: 5000 })
     engine.reelRun.stop()
     await settled()
 

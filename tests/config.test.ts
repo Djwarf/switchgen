@@ -7,8 +7,8 @@ type Plugin = { name?: string; configureServer?: unknown; configurePreviewServer
 type Proxy = Record<string, { configure?: (proxy: EventEmitter, options: unknown) => void }>
 type Config = {
   plugins: unknown[]
-  server: { cors?: unknown; proxy: Proxy }
-  preview: { cors?: unknown; proxy: Proxy }
+  server: { cors?: unknown; strictPort?: boolean; proxy: Proxy }
+  preview: { cors?: unknown; strictPort?: boolean; proxy: Proxy }
 }
 
 let config: Config
@@ -28,6 +28,11 @@ describe('the Vite config', () => {
     // Vite's default lets a page on any localhost port read what this server answers.
     expect(config.server.cors).toBe(false)
     expect(config.preview.cors).toBe(false)
+  })
+
+  it('never moves either server to another port, where it would share the archive with the one on this port', () => {
+    expect(config.server.strictPort).toBe(true)
+    expect(config.preview.strictPort).toBe(true)
   })
 
   it('mounts the ComfyUI write guard in both servers, ahead of everything else', () => {

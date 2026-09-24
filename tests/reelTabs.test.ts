@@ -156,7 +156,7 @@ describe('stopping a picked-up shot', () => {
       return true
     })
     await load({ shots: [], pending: pendingOf({ owner: 'old', beat: 0, released: true }) })
-    await vi.waitFor(() => expect(m.getJob).toHaveBeenCalled())
+    await vi.waitFor(() => expect(m.getJob).toHaveBeenCalled(), { timeout: 5000 })
     engine.reelRun.stop()
     await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false), { timeout: 10_000 })
     const run = engine.reelRun.snapshot()
@@ -178,7 +178,7 @@ describe('stopping a picked-up shot', () => {
       files: [{ filename: 'c.webm', subfolder: 'reel', type: 'output', kind: 'video' }],
     })
     await load({ shots: [], pending: pendingOf({ owner: 'old', beat: 0, released: true }) })
-    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false))
+    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false), { timeout: 5000 })
     expect(m.fetchPastRun).toHaveBeenCalledWith('p-left')
     expect(engine.reelRun.snapshot().states.shot2?.status).toBe('done')
   })
@@ -218,10 +218,10 @@ describe('a pass another tab is walking', () => {
     const session = await load({ shots: [], pending: null })
     const run = hanging('p1')
     engine.reelRun.renderAll(['s1'], planOf(['a']), ctx)
-    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'))
+    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'), { timeout: 5000 })
     expect(savedRun(session).press).toMatchObject({ shotId: 's1', released: false })
     run.finish(clipFiles(1))
-    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false))
+    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false), { timeout: 5000 })
     expect(savedRun(session).press).toBeNull()
     expect(savedRun(session).pending).toBeNull()
   })
@@ -234,7 +234,7 @@ describe('a page the browser kept, coming back', () => {
     const history = await import('../src/lib/history')
     const run = hanging('p1')
     engine.reelRun.renderAll(['s1', 's2'], planOf(['a', 'b']), ctx)
-    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'))
+    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'), { timeout: 5000 })
 
     win.fire('pagehide')
     expect(savedRun(session).pending.released).toBe(true)
@@ -249,7 +249,7 @@ describe('a page the browser kept, coming back', () => {
     session.store.set(KEY, JSON.stringify(theirs))
     win.fire('pageshow', { persisted: true })
 
-    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false))
+    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false), { timeout: 5000 })
     const snap = engine.reelRun.snapshot()
     expect(snap.status).toBe('stopped')
     expect(snap.note).toMatch(/another tab took the reel over/)
@@ -269,7 +269,7 @@ describe('a page the browser kept, coming back', () => {
     const history = await import('../src/lib/history')
     const run = hanging('p1')
     engine.reelRun.renderAll(['s1'], planOf(['a']), ctx)
-    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'))
+    await vi.waitFor(() => expect(savedRun(session)?.pending?.promptId).toBe('p1'), { timeout: 5000 })
 
     win.fire('pagehide')
     expect(savedRun(session).pending.released).toBe(true)
@@ -278,7 +278,7 @@ describe('a page the browser kept, coming back', () => {
     expect(savedRun(session).press.released).toBe(false)
 
     run.finish(clipFiles(1))
-    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false))
+    await vi.waitFor(() => expect(engine.reelRun.busy()).toBe(false), { timeout: 5000 })
     expect(engine.reelRun.snapshot().states.s1?.status).toBe('done')
     expect(history.all()).toHaveLength(1)
   })

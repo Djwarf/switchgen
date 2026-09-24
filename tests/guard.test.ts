@@ -1,9 +1,9 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 // @ts-expect-error the server is plain ESM without a declaration for its helpers
-import { confineReal, guardMutation, guardOrigin, hostAllowed, proxyWriteGuard, revalidateFiles, safely, sameOrigin, upgradeAllowed } from '../server/guard.mjs'
+import { confineReal, guardMutation, guardOrigin, hostAllowed, proxyWriteGuard, revalidateFiles, safely, sameOrigin, sse, upgradeAllowed } from '../server/guard.mjs'
 import { call } from './http'
 
 const req = (headers: Record<string, string>, method = 'POST') => ({ headers, method })
@@ -209,5 +209,36 @@ describe('generated files coming back through the proxy', () => {
     expect(answer('/history')).toEqual({})
     expect(answer('/viewer')).toEqual({})
     expect(answer('/view_metadata/x')).toEqual({})
+  })
+})
+
+describe('an event on a stream whose reader has gone', () => {
+  // A fetch goes on after its page has gone (POST /api/download), so its
+  // events keep coming for a response that is closed or already ended.
+  const gone = (over: Record<string, unknown>) => ({
+    destroyed: false,
+    writableEnded: false,
+    write: vi.fn(() => {
+      throw new Error('write after end')
+    }),
+    ...over,
+  })
+
+  it('is not written to a closed response', () => {
+    const res = gone({ destroyed: true })
+    expect(() => sse(res, 'progress', { pct: 0.5 })).not.toThrow()
+    expect(res.write).not.toHaveBeenCalled()
+  })
+
+  it('is not written to an ended one', () => {
+    const res = gone({ writableEnded: true })
+    expect(() => sse(res, 'progress', { pct: 0.5 })).not.toThrow()
+    expect(res.write).not.toHaveBeenCalled()
+  })
+
+  it('is written to one still open', () => {
+    const res = { destroyed: false, writableEnded: false, write: vi.fn(() => true) }
+    sse(res, 'file', { id: 'a' })
+    expect(res.write).toHaveBeenCalledWith('event: file\ndata: {"id":"a"}\n\n')
   })
 })

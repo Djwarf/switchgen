@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { call, events, mounted, open, tempRoots, type Handler, type Reply } from './http'
@@ -10,13 +11,17 @@ import { call, events, mounted, open, tempRoots, type Handler, type Reply } from
  * logs every file it is started on.
  *
  * `df` and `nvidia-smi` are stood in for too, so the fit check reads the same
- * disk and card on every machine. RAM is still this machine's; every family
- * here needs a few kilobytes of it.
+ * disk and card on every machine, and free RAM reads as all of it: the check
+ * wants 2 GB of working set free, which a busy machine running the suite (or
+ * rendering beside it) does not always have.
  */
 let root = ''
 let models = ''
 let log = ''
 let h: Handler
+/** The route itself, not wrapped by `safely`, so a test can hear it finish. */
+let bare: Handler
+let publicPlans: (list: Iterable<Record<string, unknown>>, now?: number) => any[]
 
 const url = (name: string, size: number, ms = 0) => `https://example.invalid/${name}?size=${size}&ms=${ms}`
 const dep = (filename: string, size: number, ms = 0) => ({
@@ -95,14 +100,21 @@ beforeAll(async () => {
     deps: [
       dep('c.bin', 1000),
       dep('d.bin', 300),
-      dep('a1.bin', 400, 1000),
-      dep('s1.bin', 3000, 2500),
-      dep('a2.bin', 400, 600),
-      dep('s2.bin', 3000, 2500),
-      dep('a3.bin', 400, 600),
-      dep('s3.bin', 3000, 3000),
+      // Each plan's own file takes long enough for the other plan to have
+      // passed its checks and started on the shared one, even on a slow runner,
+      // and the shared file long enough for the first plan to meet it there.
+      dep('a1.bin', 400, 1500),
+      dep('s1.bin', 3000, 4000),
+      dep('a2.bin', 400, 1500),
+      dep('s2.bin', 3000, 4000),
+      dep('a3.bin', 400, 1500),
+      dep('s3.bin', 3000, 4000),
       dep('e.bin', 10),
       { ...dep('n.bin', 0), sizeBytes: null },
+      dep('h1.bin', 400, 800),
+      dep('h2.bin', 300, 300),
+      dep('k1.bin', 3000, 4000),
+      { ...dep('w1.bin', 0), url: `${url('w1.bin', 50)}&hang=1`, sizeBytes: null },
     ],
     families: [
       family('C', ['c.bin', 'd.bin']),
@@ -114,15 +126,25 @@ beforeAll(async () => {
       family('B3', ['s3.bin']),
       family('E', ['e.bin']),
       family('N', ['n.bin']),
+      family('H', ['h1.bin', 'h2.bin']),
+      family('K', ['k1.bin']),
+      family('W', ['w1.bin']),
     ],
   }
   process.env.SWITCHGEN_CATALOG = path.join(root, 'catalog.json')
   writeFileSync(process.env.SWITCHGEN_CATALOG, JSON.stringify(catalogue))
 
   // The size probe: a one-byte ranged GET, answered with the size in the URL.
-  vi.stubGlobal('fetch', async (u: string) => {
-    const size = new URL(u).searchParams.get('size')
-    return new Response('x', { status: 206, headers: { 'content-range': `bytes 0-0/${size}` } })
+  // One marked `hang` never answers, and gives up only when it is called off.
+  vi.stubGlobal('fetch', async (u: string, init?: RequestInit) => {
+    const q = new URL(u).searchParams
+    if (q.has('hang')) {
+      probesHanging += 1
+      return new Promise((_, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('called off', 'AbortError')))
+      })
+    }
+    return new Response('x', { status: 206, headers: { 'content-range': `bytes 0-0/${q.get('size')}` } })
   })
 
   mkdirSync(path.join(models, 'test'), { recursive: true })
@@ -131,10 +153,17 @@ beforeAll(async () => {
   // The catalogue's own file, at the size it lists.
   writeFileSync(path.join(models, 'test', 'e.bin'), Buffer.alloc(10, 101))
 
-  h = mounted((await import('../server/downloads.mjs')).switchgenDownloads())
+  const downloads = await import('../server/downloads.mjs')
+  publicPlans = downloads.publicPlans
+  bare = (downloads as unknown as { downloadsMiddleware: Handler }).downloadsMiddleware
+  h = mounted(downloads.switchgenDownloads())
+  vi.spyOn(os, 'freemem').mockReturnValue(os.totalmem())
 })
 
+let probesHanging = 0
+
 afterAll(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   rmSync(root, { recursive: true, force: true })
 })
@@ -144,7 +173,8 @@ const started = () => readFileSync(log, 'utf8').split('\n').filter(Boolean)
 const fetchOf = (family: string) => open(h, { method: 'POST', url: '/api/download', body: { family } })
 const startOf = (r: Reply, filename: string) =>
   events(r).find((e) => e.event === 'start' && e.data.filename === filename)?.data as { id: string } | undefined
-const until = (what: () => unknown) => vi.waitFor(() => { if (!what()) throw new Error('not yet') }, { timeout: 10_000, interval: 20 })
+const until = (what: () => unknown) =>
+  vi.waitFor(async () => { if (!(await what())) throw new Error('not yet') }, { timeout: 10_000, interval: 20 })
 
 describe('a file under the catalogue\'s name that is not the catalogue\'s', () => {
   it('counts as installed, so the family fits and only the missing file is planned', async () => {
@@ -220,6 +250,7 @@ describe('two plans that share a file', () => {
     const a = fetchOf('A1')
     await until(() => startOf(a.reply, 'a1.bin'))
     const b = fetchOf('B1')
+    await until(() => startOf(b.reply, 's1.bin'))
     const [ra, rb] = await Promise.all([a.done, b.done])
 
     expect(started().filter((f) => f === 's1.bin')).toHaveLength(1)
@@ -236,6 +267,7 @@ describe('two plans that share a file', () => {
     const a = fetchOf('A2')
     await until(() => startOf(a.reply, 'a2.bin'))
     const b = fetchOf('B2')
+    await until(() => startOf(b.reply, 's2.bin'))
     await until(() => startOf(a.reply, 's2.bin'))
     const waiting = startOf(a.reply, 's2.bin')!.id
     const cancel = (await call(h, { method: 'POST', url: '/api/download/cancel', body: { id: waiting, keepPartial: false } })).json()
@@ -253,6 +285,7 @@ describe('two plans that share a file', () => {
     const a = fetchOf('A3')
     await until(() => startOf(a.reply, 'a3.bin'))
     const b = fetchOf('B3')
+    await until(() => startOf(b.reply, 's3.bin'))
     await until(() => startOf(a.reply, 's3.bin'))
     const fetching = startOf(b.reply, 's3.bin')!.id
     const cancel = (await call(h, { method: 'POST', url: '/api/download/cancel', body: { id: fetching, keepPartial: false } })).json()
@@ -266,4 +299,111 @@ describe('two plans that share a file', () => {
     expect(statSync(file('s3.bin')).size).toBe(3000)
     expect(existsSync(file('s3.bin.aria2'))).toBe(false)
   }, 20_000)
+})
+
+describe('a fetch whose page goes', () => {
+  const status = async () => (await call(h, { url: '/api/download/status' })).json()
+  const planOf = async (family: string) => (await status()).plans.find((p: { family: string }) => p.family === family)
+
+  it('goes on to the end, and the status lists it for a page that comes back', async () => {
+    const page = fetchOf('H')
+    await until(() => startOf(page.reply, 'h1.bin'))
+    page.hangUp()
+
+    const st = await status()
+    const plan = st.plans.find((p: { family: string }) => p.family === 'H')
+    expect(plan.state).toBe('running')
+    expect(st.downloads.map((d: { id: string }) => d.id)).toContain(plan.current.jobId)
+
+    await until(async () => (await planOf('H'))?.state !== 'running')
+    const ended = await planOf('H')
+    expect(ended.state).toBe('done')
+    expect(ended.finished).toEqual(['h1.bin', 'h2.bin'])
+    expect(statSync(file('h1.bin')).size).toBe(400)
+    expect(statSync(file('h2.bin')).size).toBe(300)
+    expect(existsSync(file('h1.bin.aria2'))).toBe(false)
+    expect(existsSync(file('h2.bin.aria2'))).toBe(false)
+  }, 20_000)
+
+  it('is still stopped by Stop, which names the file it is on', async () => {
+    const page = fetchOf('K')
+    await until(() => startOf(page.reply, 'k1.bin'))
+    page.hangUp()
+    await until(async () => (await planOf('K'))?.current?.jobId)
+    const { jobId } = (await planOf('K')).current
+    const cancel = await call(h, { method: 'POST', url: '/api/download/cancel', body: { id: jobId, keepPartial: false } })
+    expect(cancel.status).toBe(200)
+
+    await until(async () => (await planOf('K'))?.state !== 'running')
+    const ended = await planOf('K')
+    expect(ended.state).toBe('cancelled')
+    expect(ended.current).toBeNull()
+    expect(ended.error).toBe('cancelled')
+  }, 20_000)
+
+  it('is called off when the page goes before the plan starts', async () => {
+    const before = started().length
+    const page = open(bare, { method: 'POST', url: '/api/download', body: { family: 'W' } })
+    page.hangUp()
+    await page.ran
+    expect(events(page.reply).some((e) => e.event === 'plan')).toBe(false)
+    expect(started()).toHaveLength(before)
+    expect(await planOf('W')).toBeUndefined()
+  })
+
+  it('calls off the size probe of a file fetched by address when the page goes during it', async () => {
+    const before = probesHanging
+    const page = open(bare, {
+      method: 'POST',
+      url: '/api/download',
+      body: { url: `${url('by-address.bin', 50)}&hang=1`, dest: 'test/by-address.bin' },
+    })
+    await until(() => probesHanging > before)
+    page.hangUp()
+    // The probe never answers by itself (the server's own limit on it is 30
+    // s), so the route finishes in time only if the hang-up reached it.
+    const finished = await Promise.race([
+      page.ran.then(() => true),
+      new Promise((resolve) => setTimeout(resolve, 5000, false)),
+    ])
+    expect(finished).toBe(true)
+    expect(events(page.reply).some((e) => e.event === 'plan')).toBe(false)
+    expect(started()).not.toContain('by-address.bin')
+    expect(existsSync(file('by-address.bin'))).toBe(false)
+  }, 10_000)
+})
+
+describe('the plans the status lists', () => {
+  const job = (state: string) => ({
+    id: 'j1', filename: 'a.bin', fileIndex: 1, fileCount: 2, state, done: 5, total: 10, speed: 1, etaSec: 5,
+  })
+  const plan = (over: Record<string, unknown>) => ({
+    family: 'F', state: 'done', files: [], current: null, finished: [], error: null, startedAt: 1000, endedAt: 2000, ...over,
+  })
+  const NOW = 3000
+
+  it('shows the running plan of a family over one that ended', () => {
+    const out = publicPlans([plan({ state: 'done', startedAt: 5 }), plan({ state: 'running', startedAt: 1, endedAt: null })], NOW)
+    expect(out).toHaveLength(1)
+    expect(out[0].state).toBe('running')
+  })
+
+  it('shows the one started last when every plan of a family has ended', () => {
+    const out = publicPlans([plan({ state: 'error', startedAt: 900 }), plan({ state: 'cancelled', startedAt: 1500 })], NOW)
+    expect(out.map((p) => p.state)).toEqual(['cancelled'])
+  })
+
+  it('leaves out a fetch that has no family, and one that ended over ten minutes ago', () => {
+    expect(publicPlans([plan({ family: null })], NOW)).toEqual([])
+    expect(publicPlans([plan({ endedAt: 0 })], 10 * 60 * 1000 + 1)).toEqual([])
+    expect(publicPlans([plan({ endedAt: 0 })], 10 * 60 * 1000)).toHaveLength(1)
+  })
+
+  it('names the file in hand only while the plan runs and the file is being fetched', () => {
+    const [live] = publicPlans([plan({ state: 'running', endedAt: null, current: job('downloading') })], NOW)
+    expect(live.current).toMatchObject({ jobId: 'j1', filename: 'a.bin', index: 1, count: 2, pct: 0.5 })
+    expect(publicPlans([plan({ state: 'running', endedAt: null, current: job('starting') })], NOW)[0].current).not.toBeNull()
+    expect(publicPlans([plan({ state: 'running', endedAt: null, current: job('done') })], NOW)[0].current).toBeNull()
+    expect(publicPlans([plan({ state: 'cancelled', current: job('downloading') })], NOW)[0].current).toBeNull()
+  })
 })

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clipMemory, waitForIdleComfy } from '../src/lib/clipMemory'
+import { clipMemory, releaseIfOthersAhead, waitForIdleComfy } from '../src/lib/clipMemory'
 import { feasibility, type Hardware, type ModelFile } from '../src/lib/hardware'
 import { withVideoLoras } from '../src/lib/refine'
 import { FAMILIES } from '../src/lib/workflows'
@@ -17,18 +17,21 @@ function machine(ramGiB: number): Hardware {
   }
 }
 
-/** Roughly the 32 GB machine the two points were measured on, as the OS reports it. */
+/** Roughly the 32 GB machine the record was taken on, as the OS reports it. */
 const MEASURED_MACHINE = machine(31)
 const at = (frames: number, width = 832, height = 480) => ({ width, height, frames })
 
-describe('clipMemory: the 14B pairs against the two measured points', () => {
+describe('clipMemory: the text-to-video 14B pair against its record', () => {
+  // registry.ts records one size that came through (49 frames at 832 × 480,
+  // near 20 GB) and where the machine kills ComfyUI (about 28.1 GB used). The
+  // line at the family's default of 81 frames is an estimate, not a peak.
   const pair = family('wan22-14b-t2v')
 
   it('lets the size that survived through, and still frees memory first', () => {
     expect(clipMemory(pair, at(49), MEASURED_MACHINE)).toEqual({ level: 'ok', reason: null, release: true })
   })
 
-  it('cautions between the two points, up to and including the edge', () => {
+  it('cautions between the size that came through and the line, up to and including the line', () => {
     for (const frames of [53, 81]) {
       const v = clipMemory(pair, at(frames), MEASURED_MACHINE)
       expect(v.level).toBe('caution')
@@ -37,7 +40,7 @@ describe('clipMemory: the 14B pairs against the two measured points', () => {
     }
   })
 
-  it('refuses above the measured edge, with or without a memory reading', () => {
+  it('refuses above the line, with or without a memory reading', () => {
     for (const hw of [MEASURED_MACHINE, null]) {
       const v = clipMemory(pair, at(85), hw)
       expect(v.level).toBe('refuse')
@@ -48,11 +51,25 @@ describe('clipMemory: the 14B pairs against the two measured points', () => {
     expect(clipMemory(pair, at(81, 1280, 720), MEASURED_MACHINE).level).toBe('refuse')
   })
 
+  it('names 28.1 GB as where the machine kills ComfyUI, never as a peak the pair was measured at', () => {
+    const v = clipMemory(pair, at(49, 1280, 720), MEASURED_MACHINE)
+    expect(v.level).toBe('refuse')
+    expect(v.reason).not.toMatch(/measured to peak at 28\.1|peaked at 28\.1/)
+    expect(v.reason).toMatch(/kills ComfyUI at about 28\.1 GB used/)
+  })
+
+  it('does not say the default clip has been killed, which the record does not show', () => {
+    const v = clipMemory(pair, at(81), MEASURED_MACHINE)
+    expect(v.level).toBe('caution')
+    expect(v.reason).not.toContain('A clip this size has been killed')
+  })
+
   it('refuses nothing on a machine with clearly more memory, which nobody measured', () => {
     const roomy = machine(64)
     const v = clipMemory(pair, at(121), roomy)
     expect(v.level).toBe('caution')
     expect(v.reason).toContain('which was not measured')
+    expect(v.reason).toContain('49 frames at 832 × 480 measured near 20 GB')
     expect(clipMemory(pair, at(81, 1280, 720), roomy).level).not.toBe('refuse')
   })
 
@@ -174,6 +191,84 @@ describe('waiting for an idle ComfyUI before a release', () => {
     await vi.advanceTimersByTimeAsync(10)
     expect(settled).toBe(false)
     expect(heard).toEqual([])
+  })
+})
+
+describe('waiting through a ComfyUI that is not answering', () => {
+  // earlyoom kills ComfyUI and systemd brings it back, empty, five seconds
+  // later. The proxy answers an empty 502 meanwhile, or the read fails.
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+  const queue = (running: unknown[][], pending: unknown[][] = []) =>
+    new Response(JSON.stringify({ queue_running: running, queue_pending: pending }), { headers: { 'content-type': 'application/json' } })
+  const down = () => new Response('', { status: 502, headers: { 'content-type': 'text/plain' } })
+
+  it('keeps waiting, says so, and goes once a read shows the queue empty', async () => {
+    vi.useFakeTimers()
+    const answers: (() => Response)[] = [
+      down,
+      () => {
+        throw new TypeError('Failed to fetch')
+      },
+      () => queue([[1, 'other']]),
+      () => queue([]),
+    ]
+    vi.stubGlobal('fetch', vi.fn(async () => answers.shift()!()))
+    const heard: number[] = []
+    let settled: boolean | null = null
+    void waitForIdleComfy(undefined, (n) => heard.push(n)).then((v) => {
+      settled = v
+    })
+    await vi.advanceTimersByTimeAsync(7000)
+    expect(settled).toBe(true)
+    expect(heard).toEqual([-1, -1, 1])
+  })
+
+  it('never takes a ComfyUI that stays down for an idle one', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn(async () => down()))
+    let settled: boolean | null = null
+    const stop = new AbortController()
+    void waitForIdleComfy(stop.signal).then((v) => {
+      settled = v
+    })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(settled).toBeNull()
+    stop.abort()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(settled).toBe(false)
+  })
+
+  describe('releasing again when other work got in first', () => {
+    const frees = (calls: [string, RequestInit?][]) => calls.filter(([u, init]) => u === '/comfy/free' && init?.method === 'POST')
+    const answering = (q: () => Response) => {
+      const calls: [string, RequestInit?][] = []
+      vi.stubGlobal('fetch', vi.fn(async (u: string, init?: RequestInit) => {
+        calls.push([u, init])
+        return u === '/comfy/queue' ? q() : new Response('{}', { headers: { 'content-type': 'application/json' } })
+      }))
+      return calls
+    }
+
+    it('releases once more when another prompt is running or waiting', async () => {
+      const calls = answering(() => queue([[1, 'other']], [[2, 'mine']]))
+      await releaseIfOthersAhead('mine')
+      expect(frees(calls)).toHaveLength(1)
+    })
+
+    it('leaves it when the clip is all there is', async () => {
+      const calls = answering(() => queue([[2, 'mine']]))
+      await releaseIfOthersAhead('mine')
+      expect(frees(calls)).toHaveLength(0)
+    })
+
+    it('leaves it when the queue cannot be read', async () => {
+      const calls = answering(down)
+      await releaseIfOthersAhead('mine')
+      expect(frees(calls)).toHaveLength(0)
+    })
   })
 })
 
