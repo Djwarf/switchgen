@@ -106,9 +106,12 @@ describe('the Video desk', () => {
     expect(reason.indexOf('if (offline)')).toBeGreaterThan(reason.indexOf("'Describe the shot first.'"))
   })
 
-  it('asks the socket at every place it decides, the press as well as what the button shows', () => {
+  it('asks the socket at every place it decides, the press as well as what the button shows, unless the server\'s queue takes the clip', () => {
+    // The queue on the server sends the clip once ComfyUI answers, so a
+    // closed socket refuses Make only where the page would send it itself.
     const calls = page.split('\n').filter((l) => l.includes('reasonFor(') && !l.includes('function reasonFor'))
     expect(calls.length).toBeGreaterThanOrEqual(2)
-    for (const c of calls) expect(c).toMatch(/reasonFor\([^\n]*, connection(State\(\))? === 'closed'\)/)
+    for (const c of calls) expect(c).toMatch(/reasonFor\([^\n]*, connection(State\(\))? === 'closed' && !(onQueue|queueTakesClips\(capsRef\.current\))\)/)
+    expect(page).toMatch(/const onQueue = [^\n]*queueTakesClips\(caps\)/)
   })
 })

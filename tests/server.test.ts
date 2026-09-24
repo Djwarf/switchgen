@@ -655,3 +655,70 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
     expect(r.json.error).toContain(`process ${process.pid}`)
   }, 20_000)
 })
+
+describe('the queue on the server in /api/capabilities', () => {
+  // The queue's word comes from the registry its plugin keeps; none is
+  // mounted here, so each case puts its own word there and takes it away.
+  const KEY = Symbol.for('switchgen.runner')
+  const registry = globalThis as Record<symbol, unknown>
+  const caps = async () => {
+    const r = await call(handlers.api!, { url: '/api/capabilities' })
+    expect(r.status).toBe(200)
+    return r.json()
+  }
+  afterEach(() => {
+    delete registry[KEY]
+    vi.restoreAllMocks()
+  })
+
+  it('says there is no queue when none is mounted, and every other field as before', async () => {
+    expect(await caps()).toMatchObject({ server: 'switchgen', deleteFiles: true, archive: true, runner: false, runnerDesks: [], runnerReason: 'The queue on the server is not running.' })
+  })
+
+  it('passes on the queue\'s own word, desks only while it runs and a reason only while it does not', async () => {
+    registry[KEY] = { current: { status: () => ({ active: true, desks: ['video', 'reel'], reason: null }) } }
+    expect(await caps()).toMatchObject({ runner: true, runnerDesks: ['video', 'reel'], runnerReason: null })
+    registry[KEY] = { current: { status: () => ({ active: false, desks: ['video'], reason: 'Turned off with SWITCHGEN_RUNNER=off.' }) } }
+    expect(await caps()).toMatchObject({ runner: false, runnerDesks: [], runnerReason: 'Turned off with SWITCHGEN_RUNNER=off.' })
+    registry[KEY] = { current: { status: () => ({ active: false, desks: [], reason: '' }) } }
+    expect((await caps()).runnerReason).toBe('The queue on the server is not running.')
+  })
+
+  it('still answers, with no queue, when the queue cannot say how it stands', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    registry[KEY] = { current: { status: () => { throw new Error('broken') } } }
+    expect(await caps()).toMatchObject({ deleteFiles: true, runner: false, runnerDesks: [], runnerReason: 'The queue on the server is not running.' })
+  })
+})
+
+describe('files the queue on the server is filing', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('are listed as filed while it files them, and not once it lets them go', async () => {
+    const { archiveApi } = await import('../server/archive.mjs')
+    mkdirSync(path.join(outputs, 'queue'), { recursive: true })
+    writeFileSync(path.join(outputs, 'queue', 'filing.webm'), 'x')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    // The listing is kept for a few seconds; each look here is a later one,
+    // after any the tests above made on a clock of their own.
+    let clock = Date.now() + 3_600_000
+    const filed = async () => {
+      clock += 5000
+      vi.setSystemTime(clock)
+      return (await call(handlers.archive!, { url: '/api/outputs' })).json().files.find((f: { rel: string }) => f.rel === 'queue/filing.webm')?.filed
+    }
+    const listed = async () => {
+      clock += 5000
+      vi.setSystemTime(clock)
+      return (await call(handlers.archive!, { url: '/api/outputs' })).json().files.map((f: { rel: string }) => f.rel)
+    }
+    expect(await listed()).toContain('queue/filing.webm')
+    expect(await filed()).toBeUndefined()
+    archiveApi.claim(['queue/filing.webm'])
+    expect(await filed()).toBe(true)
+    archiveApi.unclaim(['queue/filing.webm'])
+    expect(await filed()).toBeUndefined()
+  })
+})

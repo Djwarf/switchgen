@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -240,5 +240,59 @@ describe('an event on a stream whose reader has gone', () => {
     const res = { destroyed: false, writableEnded: false, write: vi.fn(() => true) }
     sse(res, 'file', { id: 'a' })
     expect(res.write).toHaveBeenCalledWith('event: file\ndata: {"id":"a"}\n\n')
+  })
+})
+
+describe('the queue\'s writes', () => {
+  // Every POST under /api/runner goes through the same guard as the other
+  // routes, before a byte of its body is read, and never reaches the queue.
+  const touched: string[] = []
+  const rt = {
+    subscribe: () => () => {},
+    status: () => ({ active: true, desks: ['video', 'images', 'reel'], reason: null }),
+    ensureActive: () => true,
+    snapshot: () => ({}),
+    state: () => ({ groups: {}, jobs: {}, rev: 0 }),
+    desks: ['video', 'images', 'reel'],
+    stopJob: async () => void touched.push('stopJob'),
+    stopGroup: async () => void touched.push('stopGroup'),
+    laneWord: () => void touched.push('laneWord'),
+    dismiss: () => void touched.push('dismiss'),
+    commit: () => void touched.push('commit'),
+    store: { writePayload: () => void touched.push('writePayload') },
+  }
+  let handler: (req: unknown, res: unknown, next: () => void) => Promise<unknown>
+  let close = () => {}
+  beforeAll(async () => {
+    // @ts-expect-error the queue's parts are plain ESM without a declaration of their own
+    const { createRoutes } = await import('../server/runner/routes.mjs')
+    const routes = createRoutes(rt)
+    handler = routes.handler
+    close = routes.close
+  })
+  afterAll(() => close())
+
+  const POSTS = ['/api/runner/groups', '/api/runner/groups/g/stop', '/api/runner/jobs/j/stop', '/api/runner/lane', '/api/runner/dismiss']
+
+  it('refuses another site with 403 and a body that is not JSON with 415, and does nothing', async () => {
+    for (const url of POSTS) {
+      const cross = await call(handler as never, { method: 'POST', url, headers: { 'sec-fetch-site': 'cross-site', origin: 'http://evil.example', host: '127.0.0.1:5273' }, body: { action: 'send' } })
+      expect(cross.status, url).toBe(403)
+      const typed = await call(handler as never, { method: 'POST', url, headers: { 'content-type': 'text/plain' }, body: { action: 'send' } })
+      expect(typed.status, url).toBe(415)
+    }
+    expect(touched).toEqual([])
+  })
+
+  it('reads the body only after the guard, in every one of them', () => {
+    const source = readFileSync(path.resolve(import.meta.dirname, '..', 'server', 'runner', 'routes.mjs'), 'utf8')
+    const post = /async function post\([\s\S]*?\n {2}\}\n/.exec(source)?.[0] ?? ''
+    expect(post.indexOf('guardMutation(req, res)')).toBeGreaterThan(-1)
+    expect(post.indexOf('guardMutation(req, res)')).toBeLessThan(post.indexOf('readBody('))
+    // readBody is called nowhere else.
+    expect(source.split('readBody(').length - 1).toBe(1)
+    for (const name of ['submit', 'stopJob', 'stopGroup', 'lane', 'dismiss']) {
+      expect(new RegExp(`case '${name}':\\s*\\n\\s*return post\\(req, res`).test(source), name).toBe(true)
+    }
   })
 })

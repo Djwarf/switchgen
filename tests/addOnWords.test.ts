@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { LoraIndexEntry } from '../src/lib/loraIndex'
 import { MEASURED_SINGLES } from '../src/components/loras/measured'
@@ -155,5 +157,94 @@ describe('the line under a measured add-on in the rack', () => {
     const line = measuredText(MEASURED_SINGLES[MICRO_DETAILS]!, true)
     expect(line.endsWith(', without its word')).toBe(true)
     plain(line, MICRO_DETAILS)
+  })
+})
+
+describe('what the queue on the server says', () => {
+  // Every sentence the queue and the desks say about work it holds, run as
+  // the desks run them, and the copy that only exists as text in a page.
+  const read = (...p: string[]) => readFileSync(path.resolve(import.meta.dirname, '..', ...p), 'utf8')
+
+  /** The prose a file carries in its string literals: anything with two words in it that is not code. */
+  const prose = (source: string) =>
+    [...source.matchAll(/'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\]|\\.)*)`/g)]
+      .map((m) => m[1] ?? m[2] ?? '')
+      .filter((s) => /[A-Za-z]+ [A-Za-z]+/.test(s) && !s.includes('${base'))
+
+  it('says every wait, ending and hold in plain words, on every desk', async () => {
+    const r = await import('../src/lib/runner')
+    const statuses = ['waiting', 'releasing', 'sending', 'queued', 'running', 'filing', 'done', 'failed', 'stopped', 'lost', 'unsent', 'skipped'] as const
+    const waits = [null, 'turn', 'before', 'heavy', 'queue', 'comfy', 'held', 'disk'] as const
+    for (const desk of ['video', 'images', 'reel'] as const) {
+      for (const status of statuses) {
+        for (const w of waits) {
+          for (const heavy of [true, false]) {
+            const job = { id: 'j', desk, status, heavy, stopRequested: false, wait: w ? { for: w, ahead: 2 } : null } as unknown as Parameters<typeof r.waitLine>[0]
+            const line = r.waitLine(job, desk)
+            plain(`${line.stage} ${line.note ?? ''}`, `${desk} ${status} ${w} ${heavy}`)
+          }
+        }
+      }
+    }
+    for (const s of [r.WAITS_ON_SERVER, r.RUNNER_LOST, r.RUNNER_UNSENT, r.OUTBOX_GIVEN_UP, r.OUTBOX_NOT_TAKEN, r.HELD_AFTER_LOSS, r.HELD_AFTER_UNSENT, r.HELD_AFTER_RESTART, r.HELD_AFTER_PAUSE]) plain(s, s)
+    const codes = ['refused', 'failed', 'lost', 'unsent', 'ended-unsent', 'no-file', 'no-frame', 'stopped', 'skipped', 'internal'] as const
+    for (const code of codes) {
+      for (const sent of [true, false]) {
+        const job = { id: 'j', status: 'failed', promptId: 'p', error: { code, message: null, node: null, nodeType: null, nodeErrors: null, mayExist: false, sent, after: null } } as unknown as Parameters<typeof r.runnerFault>[0]
+        plain(r.runnerFault(job).message, code)
+      }
+    }
+  })
+
+  it('says why a page sends its own work, and why the server would not take it, in plain words', async () => {
+    // @ts-expect-error the queue's parts are plain ESM without a declaration of their own
+    const { REASONS } = await import('../server/runner/engine.mjs')
+    const r = await import('../src/lib/runner')
+    for (const reason of [REASONS.off, REASONS.held, REASONS.folder, REASONS.tripped, REASONS.stopped, REASONS.unwritable(new Error('EACCES: permission denied'))]) {
+      expect(reason, 'a reason the queue gives').toEqual(expect.any(String))
+      plain(reason, reason)
+      plain(r.fallbackLine(reason), reason)
+    }
+    for (const file of ['server/runner.mjs', 'server/runner/engine.mjs', 'server/runner/routes.mjs', 'server/runner/filing.mjs', 'src/lib/runner.ts']) {
+      const said = prose(read(...file.split('/')))
+      expect(said.length, file).toBeGreaterThan(3)
+      for (const s of said) plain(s, `${file}: ${s}`)
+    }
+  })
+
+  it('says the desks\' own lines for the queue in plain words', async () => {
+    const pictures = await import('../src/routes/Pictures')
+    const { REEL_BUSY } = await import('../src/components/reel/engine')
+    plain(pictures.BATCH_BUSY, 'BATCH_BUSY')
+    plain(REEL_BUSY, 'REEL_BUSY')
+    for (const [first, last, at] of [[2, 2, 1], [2, 3, 1], [3, 7, 2]]) plain(pictures.serverRestLine(first!, last!, at!)!, 'serverRestLine')
+    const holds = [null, { press: true, rest: 0 }, { press: true, rest: 2 }, { press: false, rest: 1 }, { press: false, rest: 2 }]
+    for (const stage of ['Handing it to the server', 'Waiting its turn', 'Queued', 'Drawing · step 3 of 20']) {
+      for (const index of [1, 2, 3]) {
+        for (const onHold of holds) {
+          const status = stage === 'Queued' ? 'queued' : stage.startsWith('Drawing') ? 'running' : 'submitting'
+          const line = pictures.serverWaitingLine({ status, stage, index, total: 3, runner: true, note: 'A note.', onHold })
+          if (line) plain(line, `serverWaitingLine ${stage} ${index} ${JSON.stringify(onHold)}`)
+        }
+      }
+    }
+    // Copy the desks keep to themselves, read as the page carries it.
+    const video = read('src', 'routes', 'Video.tsx')
+    for (const name of ['HANDING', 'NOT_ANSWERED', 'BEHIND_HERE']) {
+      const text = new RegExp(`const ${name} =\\s*'([^']*)'`).exec(video)?.[1]
+      expect(text, name).toBeTruthy()
+      plain(text!, name)
+    }
+    const handing = /const HANDING_LINE =\s*'([^']*)'/.exec(read('src', 'routes', 'Pictures.tsx'))?.[1]
+    expect(handing).toMatch(/has not answered yet/)
+    plain(handing!, 'HANDING_LINE')
+    // The shell's notice about held work, on every room: its sentences, and the page it draws.
+    plain(read('src', 'components', 'shell', 'RunnerHold.tsx').replace(/className="[^"]*"/g, '').replace(/const CONTROL =[^\n]*/, ''), 'RunnerHold')
+    const reel = read('src', 'routes', 'Reel.tsx')
+    for (const fn of ['HeldOnServer', 'OtherPass']) {
+      const body = new RegExp(`function ${fn}\\([\\s\\S]*?\\n\\}\\n`).exec(reel)?.[0]
+      expect(body, fn).toBeTruthy()
+      plain(body!.replace(/className="[^"]*"/g, ''), fn)
+    }
   })
 })

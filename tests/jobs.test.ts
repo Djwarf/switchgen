@@ -433,6 +433,73 @@ describe('the mirror between a desk and the ledger', () => {
     stop()
   })
 
+  describe('a desk\'s stop that says whether it got through', () => {
+    // As the queue on the server's bridge stops: a job waiting there has no
+    // prompt id and sends no steps, so only the word's own answer can say it
+    // did not reach the server.
+    const rail = () => renderToString(createElement(notice.NoticeRail))
+    const answering = (stop: (key: string) => void | Promise<boolean>) => {
+      const bridge: Mirror.Bridge = {
+        desk: 'images',
+        kind: 'image',
+        subscribe: () => () => {},
+        read: () => [row({ key: 'k', status: 'submitting', label: 'A picture', stage: 'Held' })],
+        stop,
+        seen: new Map(),
+      }
+      const off = mirror(bridge)
+      return { id: bridge.seen.get('k')!, off }
+    }
+
+    it('gives Stop back and says so when the word did not get through', async () => {
+      const { id, off } = answering(() => Promise.resolve(false))
+      await jobs.cancel(id)
+      expect(jobs.get(id)).toMatchObject({ status: 'submitting', cancelling: false })
+      expect(rail()).toContain('Could not stop that job')
+      expect(rail()).toContain('Hold Stop again')
+      off()
+    })
+
+    it('takes a word that failed outright as one that did not get through', async () => {
+      const { id, off } = answering(() => Promise.reject(new Error('offline')))
+      await jobs.cancel(id)
+      expect(jobs.get(id)?.cancelling).toBe(false)
+      expect(rail()).toContain('Could not stop that job')
+      off()
+    })
+
+    it('keeps the job stopping once a word gets through, and takes the earlier refusal away', async () => {
+      let answer = false
+      const { id, off } = answering(() => Promise.resolve(answer))
+      await jobs.cancel(id)
+      expect(rail()).toContain('Could not stop that job')
+      answer = true
+      await jobs.cancel(id)
+      expect(jobs.get(id)?.cancelling).toBe(true)
+      expect(rail()).not.toContain('Could not stop that job')
+      off()
+    })
+
+    it('leaves a stop that says nothing stopping, as the desks\' own stops always have', async () => {
+      const { id, off } = answering(() => undefined)
+      await jobs.cancel(id)
+      expect(jobs.get(id)?.cancelling).toBe(true)
+      expect(rail()).not.toContain('Could not stop that job')
+      off()
+    })
+
+    it('says nothing of a late no for a job that ended meanwhile', async () => {
+      let settle: (v: boolean) => void = () => {}
+      const { id, off } = answering(() => new Promise<boolean>((res) => (settle = res)))
+      const asked = jobs.cancel(id)
+      jobs.fail(id, 'Stopped.', { cancelled: true })
+      settle(false)
+      await asked
+      expect(rail()).not.toContain('Could not stop that job')
+      off()
+    })
+  })
+
   describe('and what the slug says of it', () => {
     beforeEach(() => {
       vi.stubGlobal('window', { addEventListener() {}, removeEventListener() {}, location: { hash: '' }, history: {} })

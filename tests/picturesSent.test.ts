@@ -105,6 +105,8 @@ describe('a picture sent from this page', () => {
     const desk = await import('../src/routes/Pictures')
     const run = queued('p1')
     desk.startRuns([plan()])
+    // The page asks first whether the queue on the server has come back.
+    await vi.waitFor(() => expect(m.run).toHaveBeenCalledTimes(1), WAIT)
     // Ten seconds behind other work in ComfyUI's queue, then thirty ms to make.
     vi.setSystemTime(110_000)
     run.emit({ phase: 'running', node: null, value: 1, max: 20 })
