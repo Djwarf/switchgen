@@ -736,6 +736,22 @@ export function detailSentence(target: DetailTarget): string {
  * graphs and the edit family, whose conditioning carries reference latents that
  * a detached crop pass would misread.
  */
+/**
+ * Families whose decoder hands back a picture with a transparency channel
+ * (Qwen-Image 2.1 decodes RGBA). Impact Pack's FaceDetailer drops that channel
+ * with a call a torch tensor does not have (utils.tensor_convert_rgb calls
+ * `.copy()` where it means `.clone()`), and the pass fails with "'Tensor'
+ * object has no attribute 'copy'". For these families the picture goes through
+ * ComfyUI's own Split Image with Alpha first, which keeps only the colour. Other
+ * families are left exactly as they were, so their graphs do not change.
+ */
+const DECODES_WITH_ALPHA: ReadonlySet<string> = new Set(['qwen-image-21'])
+
+/** True when this family, or the family a derived pass was built from, decodes with alpha. */
+export function decodesWithAlpha(def: Pick<FamilyDef, 'id'>): boolean {
+  return DECODES_WITH_ALPHA.has(def.id.split('__')[0])
+}
+
 export function deriveAutoDetail(
   def: FamilyDef | DerivedDef,
   target: DetailTarget,
@@ -766,10 +782,19 @@ export function deriveAutoDetail(
   // See DETAIL_TUNING for why a hand and a face are tuned apart.
   const tuned = DETAIL_TUNING[target]
 
+  // A picture with a transparency channel reaches the detailer as colour only
+  // (see DECODES_WITH_ALPHA).
+  let picture: Ref = [sink.source[0], sink.source[1]]
+  if (decodesWithAlpha(def)) {
+    const RGB = uniqueId(graph, `__ad_${target}_rgb`)
+    graph[RGB] = { class_type: 'SplitImageWithAlpha', inputs: { image: picture } }
+    picture = [RGB, 0]
+  }
+
   graph[FD] = {
     class_type: 'FaceDetailer',
     inputs: {
-      image: [sink.source[0], sink.source[1]] as Ref,
+      image: picture,
       model,
       clip,
       vae,
